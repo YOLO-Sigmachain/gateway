@@ -2,7 +2,7 @@
  * JSON at the node boundary, without losing integer precision.
  *
  * `JSON.parse` turns every number into an IEEE double, so a token amount above 2^53 comes
- * back rounded; a change box built from the rounded amount burns the difference (D7). Node
+ * back rounded; a change box built from the rounded amount burns the difference. Node
  * 22's `JSON.parse` hands a reviver the source text of each primitive, so an integer that
  * does not fit a double exactly is rebuilt from its own digits as a `bigint`. No parser
  * dependency is needed.

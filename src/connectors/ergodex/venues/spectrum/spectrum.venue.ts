@@ -2,7 +2,8 @@
  * Spectrum-style constant-product pools on Ergo: ERG/token (`n2t`) and token/token (`t2t`).
  * A trader's own transaction spends the pool box and creates its successor at OUTPUTS(0).
  *
- * Layout, from the live trees (VENUES.md, NOTES Q6; source `cfmm/v1/{n2t,t2t}/Pool.sc`):
+ * Layout, from the live mainnet pool trees and `spectrum-finance/ergo-dex`
+ * `contracts/amm/cfmm/v1/{n2t,t2t}/Pool.sc`:
  * - n2t: tokens [pool NFT (1), LP reserve, Y]; reserve X is the box value. Successor:
  *   same tree, same R4, exactly 3 tokens with the same ids, same LP amount, value strictly
  *   above the storage floor (`n2tMinSuccessorValue`).

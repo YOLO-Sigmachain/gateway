@@ -10,7 +10,7 @@
  * - Outputs: the caller's outputs first, in the caller's order, with registers written
  *   exactly as given; then change; then the miner fee box last.
  * - Change: carries every token not otherwise spent and meets the node's minimum box value.
- * - Fee box: ERG only, never a token or register (T-16).
+ * - Fee box: ERG only, never a token or register.
  * - Creation heights: at or above the highest input creation height, from a fresh height.
  * - `assertTransactionBalanced` runs on the finished transaction and refuses one where
  *   tokens or ERG do not balance.

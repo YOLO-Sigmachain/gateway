@@ -91,7 +91,7 @@ describe('Ergo wallet routes', () => {
     expect(JSON.parse(res.body).address).toBe(deriveErgoAddress(MNEMONIC_B, 16));
   });
 
-  it('refuses a secret that is not a mnemonic, and never echoes it (D18)', async () => {
+  it('refuses a secret that is not a mnemonic, and never echoes it', async () => {
     const notMnemonic =
       'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon';
     const res = await app.inject({ method: 'POST', url: '/add', payload: { chain: 'ergo', privateKey: notMnemonic } });

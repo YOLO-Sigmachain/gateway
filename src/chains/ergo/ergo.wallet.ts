@@ -2,7 +2,7 @@
  * Ergo wallets. The keystore field is called `privateKey` upstream, but an Ergo wallet is a
  * BIP-39 mnemonic. It is validated as one, the address is derived from it for the network's
  * prefix, and on every unlock the derived address must equal the address the file is
- * stored under (D18): a wrong key file or a corrupted one is refused, not signed with.
+ * stored under: a wrong key file or a corrupted one is refused, not signed with.
  *
  * No message, log line or error here contains any part of a mnemonic.
  */

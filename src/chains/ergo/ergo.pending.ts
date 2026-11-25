@@ -1,5 +1,5 @@
 /**
- * Boxes our own unconfirmed transactions spend and create (T-5, D12).
+ * Boxes our own unconfirmed transactions spend and create.
  *
  * The node's mempool-aware box query (`includeUnconfirmed`, `excludeMempoolSpent`) covers
  * a transaction once the node holds it. This tracker covers the rest: the moment between
@@ -18,9 +18,20 @@
  */
 import { ErgoBox } from './ergo.types';
 
+/** A fixed input (a contract box such as a pool) and the transaction that created it. */
+export interface PendingFixedInput {
+  boxId: string;
+  transactionId: string;
+}
+
 export interface PendingTransaction {
   txId: string;
   inputBoxIds: string[];
+  /**
+   * The inputs the caller fixed (contract boxes), a subset of `inputBoxIds`. They are not
+   * at the wallet's address, so the node's wallet listing never shows them either way.
+   */
+  fixedInputs: PendingFixedInput[];
   outputs: ErgoBox[];
   /** The signed transaction as submitted, for a rebroadcast. */
   json: string;
@@ -46,11 +57,18 @@ export class ErgoPendingTracker {
   }
 
   /** Record a transaction about to be submitted, or one the node accepted. */
-  record(txId: string, inputBoxIds: string[], outputs: ErgoBox[], json: string): void {
+  record(
+    txId: string,
+    inputBoxIds: string[],
+    outputs: ErgoBox[],
+    json: string,
+    fixedInputs: PendingFixedInput[] = [],
+  ): void {
     this.expire();
     this.txs.set(txId, {
       txId,
       inputBoxIds: [...inputBoxIds],
+      fixedInputs: fixedInputs.map((f) => ({ ...f })),
       outputs: outputs.map((o) => ({ ...o })),
       json,
       submittedAt: this.now(),
@@ -116,7 +134,9 @@ export class ErgoPendingTracker {
    * its inputs as spent. An input that is the output of a tracked parent never counts as
    * "the node shows it spent" on its own: the node never listed it, so its absence says
    * nothing. So when the node has forgotten a chain of our transactions, none of the
-   * chain's outputs is offered, not only the first transaction's.
+   * chain's outputs is offered, not only the first transaction's. A fixed input (a
+   * contract box) never counts either: `nodeListed` is the wallet's own listing, which
+   * never holds a contract box, so its absence there says nothing.
    */
   private offeredTransactions(nodeListed: Set<string>): Set<string> {
     const producer = new Map<string, string>();
@@ -130,11 +150,12 @@ export class ErgoPendingTracker {
       memo.set(txId, false); // a cycle cannot happen (ids are hashes); guard anyway
       let ok = true;
       let nodeSeesASpend = false;
+      const fixed = new Set(tx.fixedInputs.map((f) => f.boxId));
       for (const boxId of tx.inputBoxIds) {
         const parent = producer.get(boxId);
         if (parent !== undefined && parent !== txId) {
           if (!visit(parent, depth + 1)) ok = false;
-        } else if (!nodeListed.has(boxId)) {
+        } else if (!fixed.has(boxId) && !nodeListed.has(boxId)) {
           nodeSeesASpend = true;
         }
       }

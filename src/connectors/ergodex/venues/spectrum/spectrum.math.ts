@@ -1,5 +1,5 @@
 /**
- * Constant-product math for Spectrum-style pools, in bigint only (T-12). The pool keeps
+ * Constant-product math for Spectrum-style pools, in bigint only. The pool keeps
  * `feeNum / feeDenom` of the input on the curve; the rest is its fee. The contract's swap
  * rule, for a trader paying `amountIn` of the side with reserve `reserveIn` and taking
  * `amountOut` of the other side (reserve `reserveOut`), is

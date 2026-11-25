@@ -2,6 +2,7 @@
  * Helper functions for fetching pool info from connectors
  */
 
+import { Ergo } from '../chains/ergo/ergo';
 import { Ethereum } from '../chains/ethereum/ethereum';
 import { Solana } from '../chains/solana/solana';
 import { connectorsConfig } from '../config/routes/getConnectors';
@@ -17,12 +18,12 @@ interface PoolInfoResult {
 /**
  * Get chain type for a connector from config
  */
-function getConnectorChain(connector: string): 'solana' | 'ethereum' | null {
+function getConnectorChain(connector: string): 'solana' | 'ethereum' | 'ergo' | null {
   const config = connectorsConfig.find((c) => c.name === connector);
   if (!config) {
     return null;
   }
-  return config.chain as 'solana' | 'ethereum';
+  return config.chain as 'solana' | 'ethereum' | 'ergo';
 }
 
 /**
@@ -53,7 +54,7 @@ export async function fetchPoolInfo(
 }
 
 async function readPoolInfo(
-  chain: 'solana' | 'ethereum',
+  chain: 'solana' | 'ethereum' | 'ergo',
   connector: string,
   type: 'amm' | 'clmm',
   network: string,
@@ -135,6 +136,14 @@ async function readPoolInfo(
         feePct: feePct,
       };
     }
+  } else if (chain === 'ergo' && type === 'amm') {
+    const { getAmmPoolInfo } = await import('../trading/trading-amm-routes/pool-info');
+    try {
+      poolInfo = await getAmmPoolInfo(connector, network, poolAddress);
+    } catch (e: any) {
+      if (e?.statusCode === 404) return null;
+      throw e;
+    }
   }
 
   if (!poolInfo) {
@@ -164,6 +173,14 @@ export async function resolveTokenSymbols(
 
     if (!chainType) {
       throw new Error(`Unsupported connector: ${connector}`);
+    }
+
+    if (chainType === 'ergo') {
+      const ergo = await Ergo.getInstance(network);
+      const list = await ergo.getTokenList();
+      const sym = (a: string) =>
+        /^0{64}$/.test(a) ? ergo.config.nativeCurrencySymbol : list.find((t) => t.address === a.toLowerCase())?.symbol;
+      return { baseSymbol: sym(baseTokenAddress), quoteSymbol: sym(quoteTokenAddress) };
     }
 
     // Get chain instance and tokens from local list only

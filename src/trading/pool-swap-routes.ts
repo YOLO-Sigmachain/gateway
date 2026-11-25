@@ -86,6 +86,24 @@ const executeSwapRequestSchema = (type: PoolType) =>
       }),
       poolAddress: poolAddressField(),
       slippagePct: slippagePctField(),
+      minAmountOut: Type.Optional(
+        Type.Number({
+          format: 'decimal',
+          minimum: 0,
+          description:
+            'SELL only, optional: the least tokenOut (whole units) the swap may give; the swap is refused below it. ' +
+            'Honoured by connectors that support it (ergodex); ignored by the others.',
+        }),
+      ),
+      maxAmountIn: Type.Optional(
+        Type.Number({
+          format: 'decimal',
+          minimum: 0,
+          description:
+            'BUY only, optional: the most tokenIn (whole units) the swap may take; the swap is refused above it. ' +
+            'Honoured by connectors that support it (ergodex); ignored by the others.',
+        }),
+      ),
     },
     { $id: type === 'amm' ? 'AmmExecuteSwapRequest' : 'ClmmExecuteSwapRequest' },
   );
@@ -186,6 +204,8 @@ export const makeExecuteSwapRoute = (type: PoolType): FastifyPluginAsync => {
           side,
           poolAddress,
           slippagePct,
+          minAmountOut,
+          maxAmountIn,
         } = request.body as Static<ReturnType<typeof executeSwapRequestSchema>>;
 
         try {
@@ -211,8 +231,11 @@ export const makeExecuteSwapRoute = (type: PoolType): FastifyPluginAsync => {
             side: side as 'BUY' | 'SELL',
             amount,
             slippagePct,
+            minAmountOut,
+            maxAmountIn,
           });
-          await learnPool(fastify, type, chain, network, name, chainNetwork, pool);
+          // A connector that chooses its own pool does not read the pool list, so there is nothing to learn.
+          if (!ops.resolvePool) await learnPool(fastify, type, chain, network, name, chainNetwork, pool);
 
           // This route resolved exactly one pool, so name it in the confirmed result.
           // Connectors report token flow but not the venue, which leaves a settled fill

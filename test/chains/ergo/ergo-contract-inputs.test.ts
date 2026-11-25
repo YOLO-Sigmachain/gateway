@@ -1,5 +1,5 @@
 /**
- * The four chain-layer items carried over from the WS-1 fix pass, each with its regression:
+ * Chain-layer behaviours for connectors that spend contract boxes:
  * 1. a fixed-input transaction goes through the locked path, so two wallets cannot race
  *    for the same contract box in this process, and a rejected submit caused by an
  *    already-spent fixed input is a distinct, retryable error with the node's text;
@@ -7,7 +7,10 @@
  *    reads them), not only the `changeErgoTree` field;
  * 3. what the tracker records comes from the posted JSON, the same source the post-signing
  *    check reads;
- * 4. outputs of a chained transaction whose parent is no longer offered are not offered.
+ * 4. outputs of a pending transaction the node has forgotten are not offered: for a chain
+ *    of transactions, and for one with a fixed contract input;
+ * 5. poll reports FAILED for a transaction whose fixed input was an unconfirmed box that
+ *    will never exist.
  * Real fleet-sdk and real ergo-lib-wasm; the node is a stand-in.
  */
 import { SInt } from '@fleet-sdk/core';
@@ -24,6 +27,7 @@ import {
   ErgoTransactionAssertionError,
 } from '../../../src/chains/ergo/ergo.tx-builder';
 import { addressFromPublicKey } from '../../../src/chains/ergo/ergo.utils';
+import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 
 import {
   fakeNode,
@@ -144,19 +148,41 @@ describe('1. fixed inputs: one locked path, and a distinct error for an input sp
     expect(ergo.pending.isSpent(boxA.boxId)).toBe(false);
   });
 
-  it('a 400 that says double spend, with no index evidence yet: still ErgoInputSpentError', async () => {
-    const { ergo } = setup({
+  const noEvidence = (detail: string) =>
+    setup({
       wallets: { [ADDR_A]: [boxA] },
-      submit: () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail: 'Double spending attempt' } }),
+      submit: () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail } }),
       other: (method, path) =>
         method === 'GET' &&
         (path.startsWith('/transactions/unconfirmed/inputs/') || path.startsWith('/blockchain/box/byId/'))
           ? notFound()
           : undefined,
     });
+
+  it('a 400 that says an input is missing, with no index evidence yet: the node error, not the fixed input', async () => {
+    // "an input is missing" alone may be a wallet input; it is not read as the contract box spent
+    for (const detail of [
+      'Double spending attempt',
+      'Malformed transaction: Every input of the transaction should be in UTXO. Input 1 not found',
+    ]) {
+      const { ergo, posted } = noEvidence(detail);
+      const error = await errorOf(ergo.sendTransaction(request(ADDR_A), signerA));
+      expect(posted.length).toBe(1);
+      expect(error).not.toBeInstanceOf(ErgoInputSpentError);
+      expect(error).toBeInstanceOf(ErgoNodeError);
+      expect(error.status).toBe(400);
+      expect(error.detail).toBe(detail);
+      expect(ergo.pending.isSpent(pool.boxId)).toBe(false);
+    }
+  });
+
+  it('a 400 that names the fixed input as missing, with no index evidence yet: ErgoInputSpentError', async () => {
+    const detail = `Double spending attempt: input ${pool.boxId} is already spent`;
+    const { ergo } = noEvidence(detail);
     const error = await errorOf(ergo.sendTransaction(request(ADDR_A), signerA));
     expect(error).toBeInstanceOf(ErgoInputSpentError);
-    expect(error.nodeText).toBe('Double spending attempt');
+    expect(error.boxIds).toEqual([pool.boxId]);
+    expect(error.nodeText).toBe(detail);
   });
 
   it('a 400 for another reason stays the node error it was', async () => {
@@ -293,5 +319,92 @@ describe('4. chained transactions the node has forgotten offer no outputs', () =
     expect(tracker.available([], TREE_A).map((b) => b.boxId)).toEqual([change2.boxId]);
     // the node has the first but forgot the second: change1 listed, change2 not offered
     expect(tracker.available([change1], TREE_A)).toEqual([]);
+  });
+
+  it('a forgotten transaction with a fixed contract input offers no phantom change', () => {
+    let now = 0;
+    const tracker = new ErgoPendingTracker(30 * 60_000, () => now, 120_000);
+    const pool = makeBox({ ergoTree: OPEN_TREE, value: 10n * ERG });
+    const funding = makeBox({ ergoTree: TREE_A, value: 5n * ERG });
+    const tx1 = 'f1'.repeat(32);
+    const change1 = makeBox({ ergoTree: TREE_A, value: 3n * ERG, transactionId: tx1, index: 1, inclusionHeight: null });
+    tracker.record(tx1, [pool.boxId, funding.boxId], [change1], '{}', [
+      { boxId: pool.boxId, transactionId: pool.transactionId },
+    ]);
+    // just recorded: offered, funding hidden
+    expect(tracker.available([funding], TREE_A).map((b) => b.boxId)).toEqual([change1.boxId]);
+    now = 120_000;
+    // the node lists the funding box as unspent: it never got the transaction, or lost it.
+    // The contract box is never in the wallet listing, so its absence there proves nothing.
+    expect(tracker.available([funding], TREE_A).map((b) => b.boxId)).toEqual([]);
+    // the node shows the funding box spent: the change is offered
+    expect(tracker.available([], TREE_A).map((b) => b.boxId)).toEqual([change1.boxId]);
+  });
+
+  it('a sent transaction records its fixed inputs and the transactions that created them', async () => {
+    const pool = makeBox({ ergoTree: OPEN_TREE, value: 10n * ERG, creationHeight: TIP - 3 });
+    const funding = makeBox({ ergoTree: TREE_A, value: 5n * ERG, creationHeight: TIP - 30 });
+    const { ergo } = setup({ wallets: { [ADDR_A]: [funding] }, submit: accept });
+    const { txId } = await ergo.sendTransaction(
+      { changeAddress: ADDR_A, inputs: [{ box: pool }], outputs: [{ ergoTree: OPEN_TREE, value: 11n * ERG }] },
+      signerA,
+    );
+    expect(ergo.pending.get(txId)!.fixedInputs).toEqual([{ boxId: pool.boxId, transactionId: pool.transactionId }]);
+  });
+});
+
+describe('5. a fixed input built on an unconfirmed box whose creator is gone', () => {
+  // the contract box is an output of someone else's unconfirmed transaction
+  const pool = makeBox({ ergoTree: OPEN_TREE, value: 10n * ERG, creationHeight: TIP, inclusionHeight: null });
+  const funding = makeBox({ ergoTree: TREE_A, value: 5n * ERG, creationHeight: TIP - 30 });
+
+  async function sentThenPolled(opts: { parentInMempool?: boolean; indexedHeight?: number }) {
+    const { ergo, node } = setup({
+      wallets: { [ADDR_A]: [funding] },
+      submit: accept,
+      other: (method, path) => {
+        if (method !== 'GET') return undefined;
+        if (path === '/blockchain/indexedHeight') {
+          return { body: { indexedHeight: opts.indexedHeight ?? TIP, fullHeight: TIP } };
+        }
+        if (path === `/transactions/unconfirmed/byTransactionId/${pool.transactionId}`) {
+          return opts.parentInMempool ? { body: { id: pool.transactionId, inputs: [], outputs: [] } } : notFound();
+        }
+        if (path === `/blockchain/box/byId/${funding.boxId}`) return { body: nodeBoxJson(funding) }; // unspent
+        if (
+          path.startsWith('/transactions/unconfirmed/') ||
+          path.startsWith('/blockchain/transaction/byId/') ||
+          path.startsWith('/blockchain/box/byId/')
+        ) {
+          return notFound(); // our transaction is gone, and the pool box was never indexed
+        }
+        return undefined;
+      },
+    });
+    const { txId } = await ergo.sendTransaction(
+      { changeAddress: ADDR_A, inputs: [{ box: pool }], outputs: [{ ergoTree: OPEN_TREE, value: 11n * ERG }] },
+      signerA,
+    );
+    return { ergo, node, txId, result: await ergo.pollTransaction(txId) };
+  }
+
+  it('creator neither confirmed nor in the mempool: FAILED, and the wallet box is spendable again', async () => {
+    const { ergo, txId, result } = await sentThenPolled({});
+    expect(result.txStatus).toBe(TransactionStatusCode.FAILED);
+    expect(result.error).toContain(`fixed input ${pool.boxId} no longer exists`);
+    expect(ergo.pending.get(txId)).toBeUndefined();
+    expect((await ergo.getSpendableBoxes(ADDR_A)).map((b) => b.boxId)).toEqual([funding.boxId]);
+  });
+
+  it('creator still in the mempool: not FAILED, still tracked', async () => {
+    const { ergo, txId, result } = await sentThenPolled({ parentInMempool: true });
+    expect(result.txStatus).not.toBe(TransactionStatusCode.FAILED);
+    expect(ergo.pending.get(txId)).toBeDefined();
+  });
+
+  it('the index is behind: PENDING, still tracked', async () => {
+    const { ergo, txId, result } = await sentThenPolled({ indexedHeight: TIP - 1 });
+    expect(result.txStatus).toBe(TransactionStatusCode.PENDING);
+    expect(ergo.pending.get(txId)).toBeDefined();
   });
 });

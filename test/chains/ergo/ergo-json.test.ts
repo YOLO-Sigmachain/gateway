@@ -14,7 +14,7 @@ import {
   tokenId,
 } from './ergo-test-helpers';
 
-describe('bigint-safe JSON at the node boundary (T-1)', () => {
+describe('bigint-safe JSON at the node boundary', () => {
   const text = '{"a":9007199254740993,"b":9223372036854775807,"c":0,"d":1,"e":1.5,"f":-9223372036854775808,"g":"7"}';
 
   it('JSON.parse itself loses these values (the trap)', () => {
@@ -150,7 +150,7 @@ describe('whole-unit conversion at the edge', () => {
     expect(() => parseUnits('-1', 9)).toThrow();
   });
 
-  it('parseUnits refuses a number with more significant digits than a double holds exactly (M6)', () => {
+  it('parseUnits refuses a number with more significant digits than a double holds exactly', () => {
     // both would otherwise come back one unit off, silently
     // written as Number('...') so the literal reaches parseUnits as the double it rounds to
     expect(() => parseUnits(Number('12345678.123456789'), 9)).toThrow('send it as a string');

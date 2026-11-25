@@ -65,7 +65,7 @@ const errorOf = <T>(p: Promise<T>) =>
     (e) => e,
   );
 
-describe('two sends at once from one wallet (M4)', () => {
+describe('two sends at once from one wallet', () => {
   it('spend disjoint boxes', async () => {
     const { ergo, posted } = setup({ listing: () => [nodeBoxJson(big), nodeBoxJson(small)], submit: acceptWithId });
     const [a, b] = await Promise.all([ergo.transfer(ME, OTHER, ERG), ergo.transfer(ME, OTHER, 2n * ERG)]);
@@ -90,7 +90,7 @@ describe('two sends at once from one wallet (M4)', () => {
   });
 });
 
-describe('a submit whose answer is lost (M1)', () => {
+describe('a submit whose answer is lost', () => {
   it('200 without an id: the transaction stays tracked, the error carries its id, a retry does not pay twice', async () => {
     let accepted = false;
     const { ergo, posted } = setup({
@@ -162,7 +162,7 @@ describe('a submit whose answer is lost (M1)', () => {
   });
 });
 
-describe('a transaction the node dropped (M3)', () => {
+describe('a transaction the node dropped', () => {
   const dropped = (submit: (body: string) => FakeResponse, now?: () => number) =>
     setup({
       listing: () => [nodeBoxJson(big)], // the node lists the input as unspent again
@@ -214,7 +214,7 @@ describe('a transaction the node dropped (M3)', () => {
   });
 });
 
-describe('change goes back to the signer (M2)', () => {
+describe('change goes back to the signer', () => {
   it('walletBoxes not at the change address: refused at build, nothing signed or posted', async () => {
     const { ergo, posted } = setup({ listing: () => [nodeBoxJson(big)], submit: acceptWithId });
     const error = await errorOf(
@@ -242,7 +242,7 @@ describe('change goes back to the signer (M2)', () => {
   });
 });
 
-describe('the node answers with a different id (M8)', () => {
+describe('the node answers with a different id', () => {
   it("tracks and returns the node's id", async () => {
     const nodeId = 'cd'.repeat(32);
     const { ergo, posted } = setup({

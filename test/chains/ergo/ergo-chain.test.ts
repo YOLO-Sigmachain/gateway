@@ -112,7 +112,7 @@ describe('poll', () => {
     );
   });
 
-  it('pending: in the mempool (not failed, D5)', async () => {
+  it('pending: in the mempool (not failed)', async () => {
     const { ergo } = chain((_m, p) => {
       if (p === `/blockchain/transaction/byId/${TX}`) return notFound();
       if (p === `/transactions/unconfirmed/byTransactionId/${TX}`) return { body: tx };
@@ -165,7 +165,7 @@ describe('poll', () => {
     expect(ergo.pending.isSpent(input.boxId)).toBe(false);
   });
 
-  it('surfaces a node error rather than turning it into a status (D13)', async () => {
+  it('surfaces a node error rather than turning it into a status', async () => {
     const { ergo } = chain((_m, p) => {
       if (p.startsWith('/transactions/unconfirmed/')) return notFound();
       return p.startsWith('/blockchain/transaction/byId/')
@@ -199,7 +199,7 @@ describe('submit and the pending-box view', () => {
       return undefined;
     };
 
-  it('passes the node rejection text to the caller and tracks nothing (T-2)', async () => {
+  it('passes the node rejection text to the caller and tracks nothing', async () => {
     const detail = 'Malformed transaction: Scripts of all transaction inputs should pass verification';
     const { ergo } = chain(routes(() => ({ status: 400, body: { error: 400, reason: 'bad.request', detail } })));
     const built = await ergo.buildTransfer(ME, OTHER, ERG);
@@ -278,7 +278,7 @@ describe('fixed inputs and our own pending transactions', () => {
     expect(calls.length).toBe(0);
   });
 
-  it('refuses a data input that one of our pending transactions already spends (M9)', async () => {
+  it('refuses a data input that one of our pending transactions already spends', async () => {
     const lp = makeBox({ ergoTree: ME_TREE, value: 3n * ERG });
     const { ergo, calls } = chain(() => undefined);
     ergo.pending.record(TX, [lp.boxId], [], '{}');
@@ -294,7 +294,7 @@ describe('fixed inputs and our own pending transactions', () => {
   });
 });
 
-describe('miner fee limits (M7)', () => {
+describe('miner fee limits', () => {
   const funding = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
   const node = (method: string, path: string) => {
     if (method === 'GET' && path === '/blocks/lastHeaders/10') return { body: HEADERS };
@@ -333,7 +333,7 @@ describe('miner fee limits (M7)', () => {
   });
 });
 
-describe('box listing limit (A8)', () => {
+describe('box listing limit', () => {
   it('refuses a partial set when every page it may read is full', async () => {
     const box = makeBox({ ergoTree: ME_TREE, value: ERG });
     const { ergo, calls } = chain(
@@ -388,7 +388,7 @@ describe('balances and tokens', () => {
     return undefined;
   };
 
-  // The token list is fixed here, not read from this machine's untracked conf/ (A9).
+  // The token list is fixed here, not read from this machine's untracked conf/.
   let listSpy: jest.SpyInstance;
   beforeEach(() => {
     listSpy = jest
@@ -453,7 +453,7 @@ describe('balances and tokens', () => {
     ]);
   });
 
-  it('a symbol two tokens share is refused, never silently picked (D19)', async () => {
+  it('a symbol two tokens share is refused, never silently picked', async () => {
     const { ergo } = chain(route);
     jest.spyOn(ergo, 'getTokenList').mockResolvedValue([
       { address: tokenId(1), symbol: 'USD', name: 'one', decimals: 2 },

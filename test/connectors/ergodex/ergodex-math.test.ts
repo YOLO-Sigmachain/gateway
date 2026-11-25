@@ -1,5 +1,6 @@
 /**
- * T-9 amount semantics and the constant-product math, against hand-computed numbers.
+ * Amount semantics (SELL and BUY, base ERG and base token) and the constant-product math,
+ * against hand-computed numbers.
  *
  * Pool for the table: X = 1,000 ERG (1,000,000,000,000 nanoERG), Y = 5,000.000 TKN
  * (5,000,000 raw, 3 decimals). Gateway `amount` is in base units: SELL is an exact input of
@@ -35,8 +36,9 @@ interface Row {
   side: 'BUY' | 'SELL';
   base: 'ERG' | 'TKN';
   amount: bigint;
-  amountIn: number;
-  amountOut: number;
+  /** Whole units as the exact decimal string the response carries. */
+  amountIn: string;
+  amountOut: string;
   tokenIn: string;
   tokenOut: string;
   rawIn: bigint;
@@ -53,8 +55,8 @@ const TABLE: Row[] = [
     amount: 10n * ERG,
     rawIn: 10n * ERG,
     rawOut: 49357n,
-    amountIn: 10,
-    amountOut: 49.357,
+    amountIn: '10',
+    amountOut: '49.357',
     tokenIn: ZERO,
     tokenOut: TKN,
   },
@@ -65,8 +67,8 @@ const TABLE: Row[] = [
     amount: 50000n,
     rawIn: 50000n,
     rawOut: 9871580343n,
-    amountIn: 50,
-    amountOut: 9.871580343,
+    amountIn: '50',
+    amountOut: '9.871580343',
     tokenIn: TKN,
     tokenOut: ZERO,
   },
@@ -77,8 +79,8 @@ const TABLE: Row[] = [
     amount: 10n * ERG,
     rawIn: 50658n,
     rawOut: 10n * ERG,
-    amountIn: 50.658,
-    amountOut: 10,
+    amountIn: '50.658',
+    amountOut: '10',
     tokenIn: TKN,
     tokenOut: ZERO,
   },
@@ -89,8 +91,8 @@ const TABLE: Row[] = [
     amount: 50000n,
     rawIn: 10131404314n,
     rawOut: 50000n,
-    amountIn: 10.131404314,
-    amountOut: 50,
+    amountIn: '10.131404314',
+    amountOut: '50',
     tokenIn: ZERO,
     tokenOut: TKN,
   },
@@ -102,8 +104,8 @@ const TABLE: Row[] = [
     amount: 10n * ERG,
     rawIn: 10n * ERG,
     rawOut: 49014n,
-    amountIn: 10,
-    amountOut: 49.014,
+    amountIn: '10',
+    amountOut: '49.014',
     tokenIn: ZERO,
     tokenOut: TKN,
   },
@@ -114,8 +116,8 @@ const TABLE: Row[] = [
     amount: 50000n,
     rawIn: 50000n,
     rawOut: 9802950787n,
-    amountIn: 50,
-    amountOut: 9.802950787,
+    amountIn: '50',
+    amountOut: '9.802950787',
     tokenIn: TKN,
     tokenOut: ZERO,
   },
@@ -126,8 +128,8 @@ const TABLE: Row[] = [
     amount: 10n * ERG,
     rawIn: 51016n,
     rawOut: 10n * ERG,
-    amountIn: 51.016,
-    amountOut: 10,
+    amountIn: '51.016',
+    amountOut: '10',
     tokenIn: TKN,
     tokenOut: ZERO,
   },
@@ -138,14 +140,14 @@ const TABLE: Row[] = [
     amount: 50000n,
     rawIn: 10203040507n,
     rawOut: 50000n,
-    amountIn: 10.203040507,
-    amountOut: 50,
+    amountIn: '10.203040507',
+    amountOut: '50',
     tokenIn: ZERO,
     tokenOut: TKN,
   },
 ];
 
-describe('T-9: SELL/BUY x base ERG/token, hand-computed', () => {
+describe('SELL/BUY x base ERG/token, hand-computed', () => {
   const dex: Ergodex = makeDex(newNodeState());
 
   it.each(TABLE)('fee $fee: $side $amount raw of base $base', (row) => {

@@ -52,6 +52,12 @@
       "maximum": 10,
       "description": "Rebuilds after a rejection because the pool box was already spent"
     },
+    "rebuildWaitMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000,
+      "description": "Milliseconds to wait before rebuild n (times n) when our own pending swap spent the pool box"
+    },
     "networks": {
       "type": "object",
       "additionalProperties": { "$ref": "#/definitions/network" }

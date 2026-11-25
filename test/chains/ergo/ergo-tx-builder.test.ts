@@ -157,7 +157,7 @@ describe('box selection and change', () => {
     ).toThrow('box id does not match');
   });
 
-  it('refuses a wallet box that is not at the change address (M2)', () => {
+  it('refuses a wallet box that is not at the change address', () => {
     const elsewhere = makeBox({ ergoTree: OTHER, value: 3n * ERG });
     expect(() =>
       buildUnsignedTransaction(base({ walletBoxes: [elsewhere], outputs: [{ ergoTree: OTHER, value: ERG }] })),
@@ -168,7 +168,7 @@ describe('box selection and change', () => {
   });
 });
 
-describe('pending boxes and chained spends (T-5)', () => {
+describe('pending boxes and chained spends', () => {
   it('two builds in a row do not pick the same boxes', () => {
     const tracker = new ErgoPendingTracker(60_000);
     const boxes = [makeBox({ ergoTree: ME, value: 2n * ERG }), makeBox({ ergoTree: ME, value: 2n * ERG })];
@@ -239,7 +239,7 @@ describe('pending boxes and chained spends (T-5)', () => {
     expect(tokenTotal(change, tokenId(7))).toBe(ABOVE_2_53);
   });
 
-  it('offers no phantom outputs for a transaction the node has forgotten, once a block time has passed (M3)', () => {
+  it('offers no phantom outputs for a transaction the node has forgotten, once a block time has passed', () => {
     let now = 0;
     const tracker = new ErgoPendingTracker(30 * 60_000, () => now, 120_000);
     const funding = makeBox({ ergoTree: ME, value: 5n * ERG });
@@ -389,7 +389,7 @@ describe('fee box and creation heights', () => {
     expect(built2.unsigned.outputs.every((o) => o.creationHeight === HEIGHT + 1)).toBe(true);
   });
 
-  it('a fixed input created for the next block (a mempool pool box) lifts outputs to that height (M12)', () => {
+  it('a fixed input created for the next block (a mempool pool box) lifts outputs to that height', () => {
     const pool = makeBox({ ergoTree: POOL_TREE, value: 100n * ERG, creationHeight: HEIGHT + 1, inclusionHeight: null });
     const wallet = [makeBox({ ergoTree: ME, value: 3n * ERG, creationHeight: HEIGHT - 5 })];
     const built = buildUnsignedTransaction(
@@ -438,7 +438,7 @@ describe('conservation assertion before signing', () => {
     expect(() => assertTransactionBalanced(good)).not.toThrow();
   });
 
-  it('refuses a change box short by one token unit (the D7 burn)', () => {
+  it('refuses a change box short by one token unit (the amount would be burned)', () => {
     const bad = clone(good);
     const asset = bad.unsigned.outputs[changeIndex].assets[0];
     asset.amount = (BigInt(asset.amount) - 1n).toString();
@@ -452,7 +452,7 @@ describe('conservation assertion before signing', () => {
     expect(() => assertTransactionBalanced(bad)).toThrow('ERG in');
   });
 
-  it('refuses a fee box that holds tokens (T-16)', () => {
+  it('refuses a fee box that holds tokens', () => {
     const bad = clone(good);
     const feeBox = bad.unsigned.outputs[bad.unsigned.outputs.length - 1];
     const moved = bad.unsigned.outputs[changeIndex].assets[0];

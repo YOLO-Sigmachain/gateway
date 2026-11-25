@@ -134,7 +134,7 @@ export function dexConfig(
   };
 }
 
-export const ROOT: ErgodexRootConfig = { slippagePct: 1, maxRebuilds: 2 };
+export const ROOT: ErgodexRootConfig = { slippagePct: 1, maxRebuilds: 2, rebuildWaitMs: 0 };
 
 export interface NodeState {
   /** Confirmed unspent pool boxes, by pool NFT (what byTokenId returns). */

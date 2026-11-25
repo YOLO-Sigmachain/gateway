@@ -104,7 +104,7 @@ describe('sign a transfer with the real wasm signer', () => {
     expect(() => assertSignedMatches(built, { ...signed, json: tampered })).toThrow(ErgoTransactionAssertionError);
   });
 
-  it('checks the JSON that is submitted, not the parsed copy beside it (M8)', () => {
+  it('checks the JSON that is submitted, not the parsed copy beside it', () => {
     // the parsed copy is untouched; only the submitted bytes say 1 nanoERG
     const tampered = rewriteJson(signed, (tx) => {
       tx.outputs[0].value = 1;
@@ -174,7 +174,7 @@ describe('context variables, data inputs and registers survive signing', () => {
     expect(() => assertSignedMatches(built, signed)).not.toThrow();
   });
 
-  it('refuses a signed transaction whose context extension differs from the checked one (M8)', () => {
+  it('refuses a signed transaction whose context extension differs from the checked one', () => {
     const changed = rewriteJson(signed, (tx) => {
       tx.inputs[0].spendingProof.extension = { '0': SByte(1).toHex(), '1': SInt(1).toHex() };
     });
@@ -190,7 +190,7 @@ describe('context variables, data inputs and registers survive signing', () => {
   });
 });
 
-describe('the signing context is the upcoming block, as the node checks it (M5)', () => {
+describe('the signing context is the upcoming block, as the node checks it', () => {
   // sigmaProp(HEIGHT <op> c), a constant-segregated v0 tree
   const heightTree = (op: string, c: number) => `1001${SInt(c).toHex()}d1${op}a37300`;
   const OP = { LE: '90', GT: '91', GE: '92', EQ: '93' };
@@ -258,7 +258,7 @@ describe('Ergo.signTransaction runs the check before the signer', () => {
     expect(spy.signTransaction).not.toHaveBeenCalled();
   });
 
-  it("refuses a transaction whose change goes to a tree that is not the signer's, without calling it (M2)", async () => {
+  it("refuses a transaction whose change goes to a tree that is not the signer's, without calling it", async () => {
     const elsewhere = buildTransfer({
       height: TIP,
       minValuePerByte: PER_BYTE,

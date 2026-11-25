@@ -4,9 +4,11 @@
  */
 import { getPoolInfo } from '../../../src/connectors/ergodex/amm-routes/poolInfo';
 import { quoteSwap } from '../../../src/connectors/ergodex/amm-routes/quoteSwap';
-import { Ergodex, NATIVE_TOKEN_ID } from '../../../src/connectors/ergodex/ergodex';
+import { resolvePool } from '../../../src/connectors/ergodex/amm-routes/resolvePool';
+import { Ergodex, NATIVE_TOKEN_ID, TokenRef } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { logger } from '../../../src/services/logger';
 
 import {
   dexConfig,
@@ -22,7 +24,6 @@ import {
   RSN_POOL,
   T2T_POOL,
   T2T_TREE,
-  t2tPool,
   tokenId,
   TOKENS,
   TIP,
@@ -110,7 +111,7 @@ describe('venue matching by exact tree', () => {
     state.byTree.set(T2T_TREE, [longR4, T2T_POOL]);
     const dex = makeDex(state);
     const found = await dex.discoverPools();
-    expect(found.map((f) => f.pool.poolId).sort()).toEqual([good.assets[0].tokenId, T2T_POOL.assets[0].tokenId].sort());
+    expect(found.map((f) => f.poolId).sort()).toEqual([good.assets[0].tokenId, T2T_POOL.assets[0].tokenId].sort());
   });
 
   it('reads pages of 100 or fewer from the node', async () => {
@@ -218,7 +219,38 @@ describe('guards from config', () => {
   });
 });
 
-describe('choosing a pool for a pair (T-13)', () => {
+describe('a native-coin output must cover the miner fee', () => {
+  const ERG_REF: TokenRef = { tokenId: null, symbol: 'ERG', decimals: 9 };
+  const RSN_REF: TokenRef = { tokenId: RSN, symbol: 'RSN', decimals: 3 };
+
+  it('selling 1 raw RSN for 41,364 nanoERG is refused: the trader would pay 1,100,000 in fee', () => {
+    const dex = makeDex(newNodeState());
+    const venue = dex.venueForTree(RSN_POOL.ergoTree)!;
+    const pool = venue.parsePool(RSN_POOL)!;
+    expect(venue.amountOut(pool, 'y', 1n)).toBe(41364n);
+    expect(() => dex.plan({ pool, venue, source: 'confirmed' }, RSN_REF, ERG_REF, 'SELL', 1n)).toThrow(
+      /does not cover the miner fee of 0\.0011 ERG/,
+    );
+    // the same pool still pays a token output of any size, and a native output above the fee
+    expect(dex.plan({ pool, venue, source: 'confirmed' }, ERG_REF, RSN_REF, 'SELL', 100000n).swap.amountOut > 0n).toBe(
+      true,
+    );
+    expect(
+      dex.plan({ pool, venue, source: 'confirmed' }, RSN_REF, ERG_REF, 'SELL', 1000n).swap.amountOut > 1100000n,
+    ).toBe(true);
+  });
+
+  it('a BUY of less native coin than the fee is refused too', () => {
+    const dex = makeDex(newNodeState());
+    const venue = dex.venueForTree(RSN_POOL.ergoTree)!;
+    const pool = venue.parsePool(RSN_POOL)!;
+    expect(() => dex.plan({ pool, venue, source: 'confirmed' }, ERG_REF, RSN_REF, 'BUY', 1100000n)).toThrow(
+      /does not cover the miner fee/,
+    );
+  });
+});
+
+describe('choosing a pool for a pair', () => {
   const nft = (n: number) => n.toString(16).padStart(64, 'e');
   const pools = [
     n2tPool({ x: 1000n * ERG, y: 5000000n, fee: 990, token: TKN, nft: nft(1) }), // deep, 1%
@@ -260,9 +292,76 @@ describe('choosing a pool for a pair (T-13)', () => {
     const err = await statusOf(dex.bestPool('TKN', 'ERG', 'BUY', 1000000));
     expect(err?.statusCode).toBe(404);
   });
+
+  it('scores each pool on the box a swap would trade, not on the confirmed box discovery listed', async () => {
+    const state = newNodeState();
+    const a = 'a1'.repeat(32);
+    const b = 'be'.repeat(32);
+    const poolA = n2tPool({ x: 1000n * ERG, y: 6000000n, fee: 997, token: TKN, nft: a });
+    const poolB = n2tPool({ x: 1000n * ERG, y: 5000000n, fee: 997, token: TKN, nft: b });
+    // someone's large trade on A is in the mempool: A now holds 2000 ERG and 3000 TKN
+    const aNext = n2tPool({ x: 2000n * ERG, y: 3000000n, fee: 997, token: TKN, nft: a, creationHeight: TIP });
+    state.byTree.set(N2T_TREE, [poolA, poolB]);
+    state.pools.set(a, [poolA]);
+    state.pools.set(b, [poolB]);
+    state.mempool.set(a, [aNext]);
+    const dex = makeDex(state, dexConfig(), undefined, TOKEN_LIST);
+    jest.spyOn(Ergodex, 'getInstance').mockResolvedValue(dex);
+    const chosen = await resolvePool({
+      network: 'mainnet',
+      baseToken: 'ERG',
+      quoteToken: 'TKN',
+      side: 'SELL',
+      amount: 10,
+    });
+    expect(chosen).toBe(b);
+    expect((await quoteSwap('mainnet', b, 'ERG', 'SELL', 10, 1)).amountOut).toBe('49.357');
+    expect((await quoteSwap('mainnet', a, 'ERG', 'SELL', 10, 1)).amountOut).toBe('14.88');
+  });
+
+  it('more boxes at a pool tree than maxDiscoveredBoxes: chooses among those read, with a warning', async () => {
+    const state = newNodeState();
+    const nft = 'cd'.repeat(32);
+    const pool = n2tPool({ x: 1000n * ERG, y: 5000000n, fee: 997, token: TKN, nft });
+    // boxes with no tokens at the pool tree: cheap to create, never spendable
+    const junk = Array.from({ length: 200 }, (_, i) =>
+      makeBox({ ergoTree: N2T_TREE, value: 200000n + BigInt(i), assets: [], creationHeight: TIP - 1 }),
+    );
+    state.byTree.set(N2T_TREE, [pool, ...junk]);
+    state.pools.set(nft, [pool]);
+    const dex = makeDex(state, dexConfig({ maxDiscoveredBoxes: 200 }), undefined, TOKEN_LIST);
+    jest.spyOn(Ergodex, 'getInstance').mockResolvedValue(dex);
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const chosen = await resolvePool({
+      network: 'mainnet',
+      baseToken: 'ERG',
+      quoteToken: 'TKN',
+      side: 'SELL',
+      amount: 1,
+    });
+    expect(chosen).toBe(nft);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('more than 200 unspent boxes'));
+  });
+
+  it('discovery is read once per node height and block time, not on every pair-only call', async () => {
+    const state = newNodeState();
+    state.byTree.set(N2T_TREE, pools);
+    for (const p of pools) state.pools.set(p.assets[0].tokenId, [p]);
+    const dex = makeDex(state, dexConfig(), undefined, TOKEN_LIST);
+    const treeReads = () => state.calls.filter((c) => c.path.startsWith('/blockchain/box/unspent/byErgoTree')).length;
+    expect(await dex.bestPool('ERG', 'TKN', 'SELL', 1)).toBe(nft(2));
+    const first = treeReads();
+    expect(first).toBeGreaterThan(0);
+    expect(await dex.bestPool('ERG', 'TKN', 'SELL', 100)).toBe(nft(1));
+    expect(treeReads()).toBe(first);
+    // a second connector object on the same chain instance (one per request) shares the list
+    const again = new Ergodex('mainnet', dex.ergo, dexConfig(), dex.root);
+    await again.bestPool('ERG', 'TKN', 'SELL', 1);
+    expect(treeReads()).toBe(first);
+  });
 });
 
-describe('quote fields (T-10, T-17) and the box used', () => {
+describe('quote fields and the box used', () => {
   function setup(useMempoolSuccessor: boolean) {
     const state = newNodeState();
     const box = withPool(state, n2tPool({ x: 1000n * ERG, y: 5000000n, fee: 997, token: TKN }));
@@ -274,30 +373,32 @@ describe('quote fields (T-10, T-17) and the box used', () => {
   it('price is from the expected amounts, the slipped bound is apart, amounts in whole units', async () => {
     const { box } = setup(true);
     const q = await quoteSwap('mainnet', box.assets[0].tokenId, 'ERG', 'SELL', 10, 2);
-    expect(q.amountIn).toBe(10);
-    expect(q.amountOut).toBe(49.357);
+    // amounts are the exact decimal digits, which the response writes as decimal strings
+    expect(q.amountIn).toBe('10');
+    expect(q.amountOut).toBe('49.357');
     expect(q.price).toBe(4.9357);
     // 2% below 49,357 raw = floor(48,369.86) = 48,369
-    expect(q.minAmountOut).toBe(48.369);
-    expect(q.maxAmountIn).toBe(10);
+    expect(q.minAmountOut).toBe('48.369');
+    expect(q.maxAmountIn).toBe('10');
     expect(q.slippagePct).toBe(2);
     expect(q.tokenIn).toBe(NATIVE_TOKEN_ID);
     expect(q.tokenOut).toBe(TKN);
     expect(q.priceImpactPct).toBeCloseTo((49357 / 5000000) * 100, 12);
     expect(q.poolAddress).toBe(box.assets[0].tokenId);
     expect(q.routePath).toBe(`spectrum:n2t pool ${box.assets[0].tokenId} box ${box.boxId} (confirmed)`);
-    for (const v of [q.amountIn, q.amountOut, q.price, q.minAmountOut, q.maxAmountIn]) expect(v).toBeGreaterThan(0);
+    for (const v of [q.amountIn, q.amountOut, q.price, q.minAmountOut, q.maxAmountIn])
+      expect(Number(v)).toBeGreaterThan(0);
   });
 
   it('BUY: price is quote per base, maxAmountIn carries the slippage', async () => {
     const { box } = setup(true);
     const q = await quoteSwap('mainnet', box.assets[0].tokenId, 'TKN', 'BUY', 50, 1);
-    expect(q.amountOut).toBe(50);
-    expect(q.amountIn).toBe(10.131404314);
+    expect(q.amountOut).toBe('50');
+    expect(q.amountIn).toBe('10.131404314');
     expect(q.price).toBe(0.20262808628);
-    expect(q.minAmountOut).toBe(50);
+    expect(q.minAmountOut).toBe('50');
     // 1% above 10,131,404,314 = ceil(10,232,718,357.14) = 10,232,718,358
-    expect(q.maxAmountIn).toBe(10.232718358);
+    expect(q.maxAmountIn).toBe('10.232718358');
   });
 
   it('builds on the mempool successor when configured, and says so; otherwise on the confirmed box', async () => {
@@ -340,13 +441,13 @@ describe('quote fields (T-10, T-17) and the box used', () => {
       quoteTokenAddress: TKN,
       feePct: 0.3,
       price: 5,
-      baseTokenAmount: 1000,
-      quoteTokenAmount: 5000,
+      baseTokenAmount: '1000',
+      quoteTokenAmount: '5000',
     });
   });
 });
 
-describe('token identity is the token id (T-14)', () => {
+describe('token identity is the token id', () => {
   it('a symbol two listed tokens share is refused; each is reachable by id', async () => {
     const state = newNodeState();
     const twin = tokenId(0xf1);
@@ -404,7 +505,11 @@ describe('a network with no pool trees', () => {
   it('a network missing from ergodex.networks reads as no trees, without throwing', () => {
     const values: Record<string, unknown> = {
       'ergodex.networks': {
-        mainnet: { spectrum: { n2tPoolTrees: [N2T_TREE], t2tPoolTrees: [], feeDenominator: 1000 } },
+        mainnet: {
+          maxPoolFeePct: 3,
+          minPoolNativeReserve: 0,
+          spectrum: { n2tPoolTrees: [N2T_TREE], t2tPoolTrees: [], feeDenominator: 1000 },
+        },
       },
     };
     jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({ get: (k: string) => values[k] } as never);
@@ -414,7 +519,28 @@ describe('a network with no pool trees', () => {
     const main = ErgodexConfig.network('mainnet');
     expect(main.spectrum.n2tPoolTrees).toEqual([N2T_TREE]);
     expect(main.useMempoolSuccessor).toBe(true);
-    expect(ErgodexConfig.root()).toEqual({ slippagePct: 1, maxRebuilds: 2 });
+    expect(ErgodexConfig.root()).toEqual({ slippagePct: 1, maxRebuilds: 2, rebuildWaitMs: 500 });
+  });
+
+  it.each([
+    ['maxPoolFeePct', { minPoolNativeReserve: 0 }],
+    ['minPoolNativeReserve', { maxPoolFeePct: 3 }],
+  ])('refuses trees configured without %s: the guards fail closed', (_missing, guards) => {
+    const values: Record<string, unknown> = {
+      'ergodex.networks': {
+        mainnet: { ...guards, spectrum: { n2tPoolTrees: [N2T_TREE], t2tPoolTrees: [], feeDenominator: 1000 } },
+      },
+    };
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({ get: (k: string) => values[k] } as never);
+    expect(() => ErgodexConfig.network('mainnet')).toThrow(
+      'ergodex.networks.mainnet.maxPoolFeePct and minPoolNativeReserve must be set when pool trees are configured',
+    );
+  });
+
+  it('a network without trees needs no guards, and the fee ceiling defaults to 3%', () => {
+    const values: Record<string, unknown> = { 'ergodex.networks': { later: {} } };
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({ get: (k: string) => values[k] } as never);
+    expect(ErgodexConfig.network('later').maxPoolFeePct).toBe('3');
   });
 
   it('refuses trees configured without a fee denominator', () => {
@@ -424,9 +550,4 @@ describe('a network with no pool trees', () => {
     jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({ get: (k: string) => values[k] } as never);
     expect(() => ErgodexConfig.network('mainnet')).toThrow(/feeDenominator/);
   });
-});
-
-it('uses t2tPool helper consistently', () => {
-  const box = t2tPool({ x: 5n, y: 7n, fee: 990 });
-  expect(makeDex(newNodeState()).venueForTree(box.ergoTree)!.parsePool(box)!.feeNum).toBe(990n);
 });

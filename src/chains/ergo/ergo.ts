@@ -422,6 +422,9 @@ export class Ergo {
 
   private async submitSigned(signed: SignedErgoTransaction, built: BuiltErgoTransaction): Promise<string> {
     const inputBoxIds = built.inputBoxes.map((b) => b.boxId);
+    const fixedInputs = built.inputBoxes
+      .slice(0, built.fixedInputCount)
+      .map((b) => ({ boxId: b.boxId, transactionId: b.transactionId }));
     // One source for what is tracked: the JSON that is posted (and that assertSignedMatches
     // read), not the signer's parallel parsed object.
     const posted = parseNodeJson<SignedErgoTransaction['parsed']>(signed.json);
@@ -431,7 +434,7 @@ export class Ergo {
     const outputs = posted.outputs.map((o, index) =>
       normalizeNodeBox({ ...o, transactionId: posted.id, index } as Record<string, unknown>),
     );
-    this.pending.record(signed.id, inputBoxIds, outputs, signed.json);
+    this.pending.record(signed.id, inputBoxIds, outputs, signed.json, fixedInputs);
     let txId: string;
     try {
       txId = await this.node.submitTransaction(signed.json);
@@ -456,7 +459,7 @@ export class Ergo {
       // so they are not offered as spendable; the inputs stay hidden under the node's id.
       logger.error(`Ergo node returned id ${txId} for transaction ${signed.id}; tracking the node's id`);
       this.pending.release(signed.id);
-      this.pending.record(txId, inputBoxIds, [], signed.json);
+      this.pending.record(txId, inputBoxIds, [], signed.json, fixedInputs);
     }
     logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
     return txId;
@@ -464,9 +467,11 @@ export class Ergo {
 
   /**
    * Which of a rejected transaction's fixed inputs are gone: spent by a mempool
-   * transaction, or shown spent by the index. If the node's text says an input is missing
-   * and no lookup could say which, every fixed input is named. The lookups are best
-   * effort; a failed lookup is not evidence either way.
+   * transaction, or shown spent by the index. If no lookup could say so, only a fixed input
+   * the node's text names by its box id, in a text that says an input is missing, counts:
+   * "an input is missing" alone may mean a wallet input, and must not be read as the
+   * contract box being spent. The lookups are best effort; a failed lookup is not
+   * evidence either way.
    */
   private async spentFixedInputs(boxIds: string[], rejection: ErgoNodeError): Promise<string[]> {
     const gone: string[] = [];
@@ -482,10 +487,11 @@ export class Ergo {
         // no evidence from this lookup
       }
     }
-    if (gone.length === 0 && INPUT_GONE_TEXT.test(`${rejection.reason ?? ''} ${rejection.detail ?? ''}`)) {
-      return [...boxIds];
-    }
-    return gone;
+    if (gone.length > 0) return gone;
+    const text = `${rejection.reason ?? ''} ${rejection.detail ?? ''}`;
+    if (!INPUT_GONE_TEXT.test(text)) return [];
+    const lower = text.toLowerCase();
+    return boxIds.filter((boxId) => lower.includes(boxId.toLowerCase()));
   }
 
   /**
@@ -628,10 +634,12 @@ export class Ergo {
     // by a different transaction, which we can check for transactions we submitted.
     const tracked = this.pending.get(id);
     let inputsUnspent = false;
+    const unindexed = new Set<string>();
     if (tracked) {
       inputsUnspent = true;
       for (const boxId of tracked.inputBoxIds) {
         const box = await this.node.getBox(boxId);
+        if (!box) unindexed.add(boxId);
         if (box?.spentTransactionId && box.spentTransactionId !== id) {
           this.pending.release(id);
           return {
@@ -653,6 +661,29 @@ export class Ergo {
         txStatus: TransactionStatusCode.PENDING,
         txData: { note: `node index at ${indexed.indexedHeight}, chain at ${chainHeight}; status not yet known` },
       };
+    }
+
+    // Ours, with a fixed input (a contract box) that was an unconfirmed output: not indexed
+    // on an index that has caught up, not spent in the mempool, and the transaction that
+    // created it is not in the mempool either. That box will never exist, so this
+    // transaction can never confirm. Not when that creator is one of our own pending
+    // transactions: its own poll may still post it again.
+    if (tracked) {
+      for (const fixed of tracked.fixedInputs) {
+        if (!unindexed.has(fixed.boxId) || this.pending.get(fixed.transactionId)) continue;
+        if (await this.node.isSpentInMempool(fixed.boxId)) continue;
+        if (await this.node.getUnconfirmedTransaction(fixed.transactionId)) continue;
+        this.pending.release(id);
+        return {
+          ...base,
+          txBlock: null,
+          txStatus: TransactionStatusCode.FAILED,
+          error:
+            `Its fixed input ${fixed.boxId} no longer exists: transaction ${fixed.transactionId}, which created it, ` +
+            'is neither confirmed nor in the mempool; this transaction can no longer confirm',
+          txData: null,
+        };
+      }
     }
 
     // Ours, every input still unspent on an index that has caught up, and the node holds

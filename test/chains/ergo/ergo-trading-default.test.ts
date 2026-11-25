@@ -1,6 +1,6 @@
 /**
  * The unified trading routes, asked for chain `ergo` with no connector, read Ergo's own
- * swapProvider (A7), not Ethereum's.
+ * swapProvider, not Ethereum's.
  */
 import '../../mocks/app-mocks';
 

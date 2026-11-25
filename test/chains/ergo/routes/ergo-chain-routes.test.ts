@@ -166,7 +166,7 @@ describe('/chains/ergo routes', () => {
     expect(JSON.parse(res.body).message).toContain('Invalid Ergo address');
   });
 
-  it('a mnemonic pasted into the address field is neither echoed nor logged (A6)', async () => {
+  it('a mnemonic pasted into the address field is neither echoed nor logged', async () => {
     const spy = jest.spyOn(logger, 'error').mockImplementation(() => undefined as never);
     try {
       const res = await fastify.inject({

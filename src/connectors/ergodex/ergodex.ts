@@ -9,7 +9,7 @@
  * submit, locks and pending tracking are `src/chains/ergo`'s.
  *
  * A pool is addressed by its pool NFT id, which is stable; box ids change at every swap.
- * Every quote and every execute reads the pool box fresh (T-8).
+ * Every quote and every execute reads the pool box fresh.
  */
 import { Ergo } from '../../chains/ergo/ergo';
 import { ErgoNodeError } from '../../chains/ergo/ergo.node-client';
@@ -17,6 +17,7 @@ import { ErgoOutputSpec } from '../../chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../chains/ergo/ergo.types';
 import { formatUnits, isErgoId, parseUnits } from '../../chains/ergo/ergo.utils';
 import { httpErrors } from '../../services/error-handler';
+import { logger } from '../../services/logger';
 
 import { ErgodexConfig, ErgodexNetworkConfig, ErgodexRootConfig } from './ergodex.config';
 import { SpectrumVenue } from './venues/spectrum/spectrum.venue';
@@ -37,6 +38,21 @@ export interface TokenRef {
 }
 
 export type PoolBoxSource = 'confirmed' | 'mempool';
+
+/** A pool as discovery lists it: enough to choose candidates, never enough to price. */
+export interface DiscoveredPool {
+  poolId: string;
+  venue: string;
+  kind: string;
+  tokenIds: [string | null, string | null];
+}
+
+/** Discovery results per chain instance (one per network), by trees and limit. */
+const discoveryCache = new WeakMap<Ergo, Map<string, { height: number; at: number; pools: DiscoveredPool[] }>>();
+
+function holdsPairIds(ids: Array<string | null>, a: TokenRef, b: TokenRef): boolean {
+  return a.tokenId !== b.tokenId && ids.includes(a.tokenId) && ids.includes(b.tokenId);
+}
 
 export interface FreshPool {
   pool: VenuePool;
@@ -59,8 +75,13 @@ export interface SwapPlan extends FreshPool {
 const PCT_SCALE = 10n ** 8n;
 const HUNDRED_PCT = 100n * PCT_SCALE;
 
+/** A caller's percentage as an exact integer; a form that is not a plain decimal is a 400. */
 export function pctToScaled(pct: number | string): bigint {
-  return parseUnits(typeof pct === 'number' ? pct : pct.trim(), 8);
+  try {
+    return parseUnits(typeof pct === 'number' ? pct : pct.trim(), 8);
+  } catch (error) {
+    throw httpErrors.badRequest(`slippagePct: ${(error as Error).message}`);
+  }
 }
 
 /** floor(amount * (100% - slippage)) */
@@ -73,9 +94,14 @@ export function slipUp(amount: bigint, slippageScaled: bigint): bigint {
   return (amount * (HUNDRED_PCT + slippageScaled) + HUNDRED_PCT - 1n) / HUNDRED_PCT;
 }
 
-/** A whole-unit number for the response schemas (T-17), from exact digits. */
+/**
+ * A whole-unit amount for the response schemas, as its exact decimal digits. Every caller
+ * writes it into a decimal-string field (or a message), whose serializer passes a string
+ * through as it is; going through a JS number would round amounts of 17 or more
+ * significant digits. Typed `number` because the shared schemas declare it so.
+ */
 export function units(amount: bigint, decimals: number): number {
-  return Number(formatUnits(amount, decimals));
+  return formatUnits(amount, decimals) as unknown as number;
 }
 
 /** num / den as a number, from bigints, with `digits` decimal places of exact division. */
@@ -127,7 +153,7 @@ export class Ergodex {
   }
 
   // ------------------------------------------------------------------------------------
-  // Tokens: identity is the token id (T-14). The native coin is named by its symbol or
+  // Tokens: identity is the token id. The native coin is named by its symbol or
   // NATIVE_TOKEN_ID; a listed token sharing the native symbol must be named by id.
 
   async resolveToken(name: string): Promise<TokenRef> {
@@ -171,8 +197,12 @@ export class Ergodex {
    * `useMempoolSuccessor`) the newest unconfirmed successor in the node's mempool, i.e.
    * the mempool output holding the NFT that no mempool transaction spends. Only boxes at a
    * configured pool tree count; the NFT held anywhere else is not this connector's pool.
+   * With `confirmedOnly` the mempool is not read, whatever `useMempoolSuccessor` says.
    */
-  async fetchPoolBox(poolId: string): Promise<{ box: ErgoBox; source: PoolBoxSource }> {
+  async fetchPoolBox(
+    poolId: string,
+    options: { confirmedOnly?: boolean } = {},
+  ): Promise<{ box: ErgoBox; source: PoolBoxSource }> {
     this.assertConfigured();
     if (!isErgoId(poolId)) {
       throw httpErrors.badRequest('A pool is addressed by its pool NFT id (64 hex characters)');
@@ -189,7 +219,7 @@ export class Ergodex {
     if (confirmed.length > 1) {
       throw httpErrors.createError(409, `${confirmed.length} unspent boxes hold pool NFT ${id}; refusing to guess`);
     }
-    if (this.config.useMempoolSuccessor) {
+    if (this.config.useMempoolSuccessor && !options.confirmedOnly) {
       const pending = (await node.getUnconfirmedOutputsByTokenId(id)).filter(
         (b) => holdsNft(b) && this.venueForTree(b.ergoTree),
       );
@@ -213,8 +243,8 @@ export class Ergodex {
   }
 
   /** The pool, fresh from the node, with its venue. No guards applied. */
-  async getFreshPool(poolId: string): Promise<FreshPool> {
-    const { box, source } = await this.fetchPoolBox(poolId);
+  async getFreshPool(poolId: string, options: { confirmedOnly?: boolean } = {}): Promise<FreshPool> {
+    const { box, source } = await this.fetchPoolBox(poolId, options);
     const venue = this.venueForTree(box.ergoTree)!;
     const pool = venue.parsePool(box);
     if (!pool) {
@@ -249,23 +279,53 @@ export class Ergodex {
   }
 
   /**
-   * Every pool at the configured trees, from the node's index (confirmed boxes). Boxes at
-   * a pool tree that are not pools (wrong token count, no R4) are skipped.
+   * Every pool at the configured trees, from the node's index (confirmed boxes): its id,
+   * kind and tokens only, for choosing candidates; a candidate is always read live before
+   * it is priced. Boxes at a pool tree that are not pools (wrong token count, no R4) are
+   * skipped. A tree holding more than `maxDiscoveredBoxes` boxes is read in part, with a
+   * warning: a partial list can only miss a pool, and the pool used is still read fresh.
+   * The list is kept for one block time at one node height, so quotes do not re-read
+   * every pool box.
    */
-  async discoverPools(): Promise<FreshPool[]> {
+  async discoverPools(): Promise<DiscoveredPool[]> {
     this.assertConfigured();
-    const found: FreshPool[] = [];
+    const trees = this.venues.flatMap((venue) => (venue === this.spectrum ? this.spectrum.trees : []));
+    const key = `${this.config.maxDiscoveredBoxes}:${trees.join(',')}`;
+    const { fullHeight } = await this.ergo.node.getInfo();
+    let cache = discoveryCache.get(this.ergo);
+    if (!cache) discoveryCache.set(this.ergo, (cache = new Map()));
+    const hit = cache.get(key);
+    const ttlMs = this.ergo.config.blockTimeSeconds * 1000;
+    if (hit && hit.height === fullHeight && Date.now() - hit.at < ttlMs) return hit.pools;
+    const found: DiscoveredPool[] = [];
     for (const venue of this.venues) {
-      const trees = venue === this.spectrum ? this.spectrum.trees : [];
-      for (const tree of trees) {
-        const boxes = await this.ergo.node.getUnspentBoxesByErgoTree(tree, this.config.maxDiscoveredBoxes);
+      const venueTrees = venue === this.spectrum ? this.spectrum.trees : [];
+      for (const tree of venueTrees) {
+        const { boxes, complete } = await this.ergo.node.readUnspentBoxesByErgoTree(
+          tree,
+          this.config.maxDiscoveredBoxes,
+        );
+        if (!complete) {
+          logger.warn(
+            `ergodex: more than ${this.config.maxDiscoveredBoxes} unspent boxes at a ${venue.name} pool tree on ` +
+              `${this.network}; choosing among the ${boxes.length} read. Raise maxDiscoveredBoxes or set poolAllowlist.`,
+          );
+        }
         for (const box of boxes) {
           if (box.ergoTree.toLowerCase() !== tree) continue;
           const pool = venue.parsePool(box);
-          if (pool) found.push({ pool, venue, source: 'confirmed' });
+          if (pool) {
+            found.push({
+              poolId: pool.poolId,
+              venue: pool.venue,
+              kind: pool.kind,
+              tokenIds: [pool.x.tokenId, pool.y.tokenId],
+            });
+          }
         }
       }
     }
+    cache.set(key, { height: fullHeight, at: Date.now(), pools: found });
     return found;
   }
 
@@ -273,7 +333,7 @@ export class Ergodex {
   // Pricing
 
   /**
-   * Price a swap on a fresh pool. `amount` is in base units (T-9): SELL is an exact input
+   * Price a swap on a fresh pool. `amount` is in base units: SELL is an exact input
    * of base, BUY an exact output of base. Throws a 400 for a swap the pool cannot do.
    */
   plan(fresh: FreshPool, base: TokenRef, quote: TokenRef, side: 'BUY' | 'SELL', amount: bigint): SwapPlan {
@@ -302,6 +362,16 @@ export class Ergodex {
       }
       swap = { input: quoteSide, amountIn: needed, amountOut: amount };
     }
+    const outSide: SideName = swap.input === 'x' ? 'y' : 'x';
+    const minerFee = this.ergo.config.minerFee;
+    if (pool[outSide].tokenId === null && swap.amountOut <= minerFee) {
+      const native = this.ergo.config.nativeCurrencySymbol;
+      const decimals = this.ergo.config.nativeDecimals;
+      throw httpErrors.badRequest(
+        `The output of ${formatUnits(swap.amountOut, decimals)} ${native} from pool ${pool.poolId} does not cover ` +
+          `the miner fee of ${formatUnits(minerFee, decimals)} ${native}; trade a larger amount`,
+      );
+    }
     let successor: ErgoOutputSpec;
     try {
       successor = venue.successor(pool, swap);
@@ -321,8 +391,14 @@ export class Ergodex {
   }
 
   /** Read the pool fresh, apply the guards, and price the swap. */
-  async freshPlan(poolId: string, base: TokenRef, side: 'BUY' | 'SELL', amount: bigint): Promise<SwapPlan> {
-    const fresh = await this.getFreshPool(poolId);
+  async freshPlan(
+    poolId: string,
+    base: TokenRef,
+    side: 'BUY' | 'SELL',
+    amount: bigint,
+    options: { confirmedOnly?: boolean } = {},
+  ): Promise<SwapPlan> {
+    const fresh = await this.getFreshPool(poolId, options);
     this.assertAllowed(fresh.pool);
     const quote = await this.counterToken(fresh.pool, base);
     return this.plan(fresh, base, quote, side, amount);
@@ -331,17 +407,21 @@ export class Ergodex {
   /**
    * The allowed pool for a pair that gives the best result for this size: the most out
    * for a SELL, the least in for a BUY. Pools the guards refuse, and pools too small for
-   * the size (dust, rounding to zero, storage floor), are skipped, never thrown on (T-13).
+   * the size (dust, rounding to zero, storage floor), are skipped, never thrown on.
+   * Every candidate is scored on the box a swap would trade: each is read live, as quote
+   * and execute read it (the mempool successor when `useMempoolSuccessor`), never on the
+   * confirmed box discovery listed.
    */
   async bestPool(baseName: string, quoteName: string, side: 'BUY' | 'SELL', amount: number): Promise<string> {
     this.assertConfigured();
     const base = await this.resolveToken(baseName);
     const quote = await this.resolveToken(quoteName);
     const raw = toRaw(amount, base);
-    const candidates =
+    const ids =
       this.config.poolAllowlist.length > 0
-        ? await this.allowlistedPools()
-        : (await this.discoverPools()).filter((p) => this.holdsPair(p.pool, base, quote));
+        ? this.config.poolAllowlist
+        : (await this.discoverPools()).filter((p) => holdsPairIds(p.tokenIds, base, quote)).map((p) => p.poolId);
+    const candidates = await this.livePools(ids);
     let best: { poolId: string; score: bigint } | null = null;
     for (const fresh of candidates) {
       if (!this.holdsPair(fresh.pool, base, quote) || this.guardFailure(fresh.pool)) continue;
@@ -366,18 +446,17 @@ export class Ergodex {
   }
 
   private holdsPair(pool: VenuePool, a: TokenRef, b: TokenRef): boolean {
-    const ids = [pool.x.tokenId, pool.y.tokenId];
-    return a.tokenId !== b.tokenId && ids.includes(a.tokenId) && ids.includes(b.tokenId);
+    return holdsPairIds([pool.x.tokenId, pool.y.tokenId], a, b);
   }
 
-  private async allowlistedPools(): Promise<FreshPool[]> {
+  /** Each pool read live; a pool that is gone, invalid or ambiguous right now is skipped. */
+  private async livePools(ids: string[]): Promise<FreshPool[]> {
     const pools: FreshPool[] = [];
-    for (const id of this.config.poolAllowlist) {
+    for (const id of ids) {
       try {
         pools.push(await this.getFreshPool(id));
       } catch (error) {
         if ((error as { statusCode?: number }).statusCode === undefined) throw error;
-        // an allowlisted pool that is gone or invalid is skipped
       }
     }
     return pools;
@@ -385,10 +464,10 @@ export class Ergodex {
 }
 
 /** The caller's whole-unit amount in the token's smallest unit; refuses anything inexact. */
-export function toRaw(amount: number | string, token: TokenRef): bigint {
+export function toRaw(amount: number | string, token: TokenRef, field = 'amount'): bigint {
   try {
     return parseUnits(amount, token.decimals);
   } catch (error) {
-    throw httpErrors.badRequest(`amount: ${error instanceof Error ? error.message : String(error)}`);
+    throw httpErrors.badRequest(`${field}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

@@ -50,13 +50,12 @@ describeLive('live node, read-only', () => {
 
   it('discovers pools by exact tree, skipping non-pools', async () => {
     const found = await dex.discoverPools();
-    const n2t = found.filter((f) => f.pool.kind === 'n2t').length;
-    const t2t = found.filter((f) => f.pool.kind === 't2t').length;
-    const allowed = found.filter((f) => dex.guardFailure(f.pool) === null).length;
-    console.log(`[live] pools: n2t ${n2t}, t2t ${t2t}, passing the mainnet guards ${allowed}`);
+    const n2t = found.filter((f) => f.kind === 'n2t').length;
+    const t2t = found.filter((f) => f.kind === 't2t').length;
+    console.log(`[live] pools: n2t ${n2t}, t2t ${t2t}`);
     expect(n2t).toBeGreaterThan(200);
     expect(t2t).toBeGreaterThan(200);
-    for (const p of PAIRS) expect(found.some((f) => f.pool.poolId === p.nft)).toBe(true);
+    for (const p of PAIRS) expect(found.some((f) => f.poolId === p.nft)).toBe(true);
   }, 120000);
 
   it.each(PAIRS)(
@@ -100,8 +99,4 @@ describeLive('live node, read-only', () => {
       `[live] node requests: ${requests.length} (${new Set(requests.map((r) => r.split(' ')[0])).size} methods)`,
     );
   });
-});
-
-it('the live check is opt-in (ERGO_LIVE_NODE=1)', () => {
-  expect(typeof LIVE).toBe('boolean');
 });

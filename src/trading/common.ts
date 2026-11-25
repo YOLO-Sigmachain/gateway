@@ -166,7 +166,8 @@ export const poolAddressField = () =>
     Type.String({
       description:
         "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; " +
-        'pass an address to pin a pool that is not in that list.',
+        'pass an address to pin a pool that is not in that list. A connector may choose the pool itself ' +
+        'instead (ergodex: the allowed pool with the best result for this size).',
     }),
   );
 

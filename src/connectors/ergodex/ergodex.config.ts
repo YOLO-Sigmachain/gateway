@@ -45,9 +45,14 @@ export interface ErgodexRootConfig {
   slippagePct: number;
   /** After a definite rejection because the pool box was already spent: how many times to re-read, re-quote and rebuild. */
   maxRebuilds: number;
+  /**
+   * When the pool box is spent by one of our own pending transactions: milliseconds to wait
+   * before rebuild n (times n), so the node can list that transaction's successor.
+   */
+  rebuildWaitMs: number;
 }
 
-const DEFAULT_MAX_DISCOVERED_BOXES = 1000;
+const DEFAULT_MAX_DISCOVERED_BOXES = 5000;
 
 function get(key: string): unknown {
   return ConfigManagerV2.getInstance().get(`ergodex.${key}`);
@@ -91,13 +96,17 @@ export namespace ErgodexConfig {
   export function root(): ErgodexRootConfig {
     const slippage = Number(get('slippagePct') ?? 1);
     const rebuilds = Number(get('maxRebuilds') ?? 2);
+    const waitMs = Number(get('rebuildWaitMs') ?? 500);
     if (!Number.isFinite(slippage) || slippage < 0 || slippage > 100) {
       throw new Error('ergodex.slippagePct must be between 0 and 100');
     }
     if (!Number.isInteger(rebuilds) || rebuilds < 0 || rebuilds > 10) {
       throw new Error('ergodex.maxRebuilds must be an integer from 0 to 10');
     }
-    return { slippagePct: slippage, maxRebuilds: rebuilds };
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 10000) {
+      throw new Error('ergodex.rebuildWaitMs must be an integer from 0 to 10000');
+    }
+    return { slippagePct: slippage, maxRebuilds: rebuilds, rebuildWaitMs: waitMs };
   }
 
   /** The network's settings; an absent network entry gives a config with no pool trees. */
@@ -109,8 +118,14 @@ export namespace ErgodexConfig {
     const feeDenominator = amount(spectrum.feeDenominator, 0n, `${where}.spectrum.feeDenominator`);
     const n2tPoolTrees = trees(spectrum.n2tPoolTrees, `${where}.spectrum.n2tPoolTrees`);
     const t2tPoolTrees = trees(spectrum.t2tPoolTrees, `${where}.spectrum.t2tPoolTrees`);
-    if ((n2tPoolTrees.length > 0 || t2tPoolTrees.length > 0) && feeDenominator <= 0n) {
+    const hasTrees = n2tPoolTrees.length > 0 || t2tPoolTrees.length > 0;
+    if (hasTrees && feeDenominator <= 0n) {
       throw new Error(`${where}.spectrum.feeDenominator must be set and positive when pool trees are configured`);
+    }
+    // The guards fail closed: a network that can trade must state its fee ceiling and size floor.
+    const unset = (v: unknown) => v === undefined || v === null || v === '';
+    if (hasTrees && (unset(raw.maxPoolFeePct) || unset(raw.minPoolNativeReserve))) {
+      throw new Error(`${where}.maxPoolFeePct and minPoolNativeReserve must be set when pool trees are configured`);
     }
     const allowlist = raw.poolAllowlist ?? [];
     if (!Array.isArray(allowlist) || allowlist.some((id) => !isErgoId(id))) {
@@ -121,7 +136,7 @@ export namespace ErgodexConfig {
       throw new Error(`${where}.maxDiscoveredBoxes must be a positive integer`);
     return {
       useMempoolSuccessor: raw.useMempoolSuccessor === undefined ? true : raw.useMempoolSuccessor === true,
-      maxPoolFeePct: percent(raw.maxPoolFeePct, '100', `${where}.maxPoolFeePct`),
+      maxPoolFeePct: percent(raw.maxPoolFeePct, '3', `${where}.maxPoolFeePct`),
       minPoolNativeReserve: amount(raw.minPoolNativeReserve, 0n, `${where}.minPoolNativeReserve`),
       minPoolTokenReserve: amount(raw.minPoolTokenReserve, 1n, `${where}.minPoolTokenReserve`),
       poolAllowlist: (allowlist as string[]).map((id) => id.toLowerCase()),

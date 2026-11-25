@@ -22,7 +22,6 @@ import { executeQuote as dflowExecuteQuote } from '../connectors/dflow/router-ro
 import { executeSwap as dflowExecuteSwap } from '../connectors/dflow/router-routes/executeSwap';
 import { quoteSwap as dflowQuoteSwap } from '../connectors/dflow/router-routes/quoteSwap';
 import { executeSwap as ergodexExecuteSwap } from '../connectors/ergodex/amm-routes/executeSwap';
-import { fetchPools as ergodexFetchPools } from '../connectors/ergodex/amm-routes/fetchPools';
 import { quoteSwap as ergodexQuoteSwap } from '../connectors/ergodex/amm-routes/quoteSwap';
 import { resolvePool as ergodexResolvePool } from '../connectors/ergodex/amm-routes/resolvePool';
 import { executeQuote as jupiterExecuteQuote } from '../connectors/jupiter/router-routes/executeQuote';
@@ -104,6 +103,10 @@ export interface PoolQuoteArgs {
 
 export interface PoolExecuteArgs extends PoolQuoteArgs {
   walletAddress: string;
+  /** Optional caller limit for a SELL, in whole units of tokenOut. Only ergodex reads it. */
+  minAmountOut?: number;
+  /** Optional caller limit for a BUY, in whole units of tokenIn. Only ergodex reads it. */
+  maxAmountIn?: number;
 }
 
 export interface FetchPoolsArgs {
@@ -394,8 +397,17 @@ const AMM_REGISTRY: Record<string, PoolOps> = {
     chain: 'ergo',
     quoteSwap: (a) => ergodexQuoteSwap(a.network, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct),
     executeSwap: (a) =>
-      ergodexExecuteSwap(a.network, a.walletAddress, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct),
-    fetchPools: (a) => ergodexFetchPools({ network: a.network, limit: a.limit, query: a.query }),
+      ergodexExecuteSwap(
+        a.network,
+        a.walletAddress,
+        a.poolAddress,
+        a.baseToken,
+        a.side,
+        a.amount,
+        a.slippagePct,
+        a.minAmountOut,
+        a.maxAmountIn,
+      ),
     resolvePool: ergodexResolvePool,
   },
 };

@@ -2,11 +2,24 @@
  * /trading/amm/* for connector `ergodex` through Fastify inject, with the real chain
  * layer, real fleet-sdk and real wasm signing, and a node stand-in. Covers: a direct swap
  * returned as PENDING with its id; the pool spent between quote and execute (rebuild, or
- * a retryable 409); an unknown submit outcome (one POST, the id, poll); a pair-only quote
- * choosing the best pool; and the liquidity routes answering 501.
+ * a retryable 409); the price bound at execute (the caller's limit, and the confirmed
+ * pool when the box traded is someone else's unconfirmed one); an unknown submit outcome
+ * (one POST, the id, poll); a rejection that does not name the pool box; a pair-only
+ * quote choosing the best pool; and the liquidity routes answering 501. Also the shipped
+ * ergodex template as the connector reads it.
  */
+import * as fs from 'fs';
+import * as path from 'path';
+
+import * as yaml from 'js-yaml';
+
+import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
+import { normalizeNodeBox } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
+import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
+import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { learnPool } from '../../../src/trading/learn-pool';
 import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
 
@@ -23,6 +36,7 @@ import {
   ROOT,
   RSN,
   RSN_POOL,
+  T2T_TREE,
   TIP,
   walletBox,
 } from './ergodex-test-helpers';
@@ -57,6 +71,12 @@ function othersSwap(dex: Ergodex, box: ErgoBox, ergIn: bigint): ErgoBox {
     creationHeight: TIP,
     inclusionHeight: null,
   });
+}
+
+/** The pool successor our posted transaction creates, read bigint-safe as the node lists it. */
+function ourSuccessor(txJson: string): ErgoBox {
+  const tx = parseNodeJson<{ id: string; outputs: Array<Record<string, unknown>> }>(txJson);
+  return normalizeNodeBox({ ...tx.outputs[0], transactionId: tx.id, index: 0 });
 }
 
 const rejectSpent = { status: 400, body: { error: 400, reason: 'bad.request', detail: 'Double spending attempt' } };
@@ -101,7 +121,7 @@ describe('ergodex through /trading/amm', () => {
     expect(tx.outputs[0].ergoTree).toBe(RSN_POOL.ergoTree);
     expect(tx.outputs[0].additionalRegisters).toEqual({ R4: '04bc0f' });
     expect(BigInt(tx.outputs[0].value)).toBe(RSN_POOL.value + ERG);
-    // the fee box carries no token (T-16); the received RSN is in the change at our address
+    // the fee box carries no token; the received RSN is in the change at our address
     const fee = tx.outputs[tx.outputs.length - 1];
     expect(fee.assets).toEqual([]);
     const change = tx.outputs.slice(1, -1);
@@ -109,6 +129,13 @@ describe('ergodex through /trading/amm', () => {
       true,
     );
     expect(dex.ergo.pending.get(tx.id)).toBeDefined();
+  });
+
+  it('execute-swap does not try to learn the pool into the pool list: ergodex never reads that list', async () => {
+    (learnPool as jest.Mock).mockClear();
+    const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(res.statusCode).toBe(200);
+    expect(learnPool).not.toHaveBeenCalled();
   });
 
   it('pool spent first, bound still holds: re-reads the successor, rebuilds and submits again', async () => {
@@ -178,6 +205,155 @@ describe('ergodex through /trading/amm', () => {
     const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
     expect(res.statusCode).toBe(504);
     expect(posts()).toBe(1);
+  });
+
+  describe('the price is bound at execute', () => {
+    const quoteUrl = (over: Record<string, string> = {}) =>
+      '/trading/amm/quote-swap?' +
+      new URLSearchParams({
+        chainNetwork: 'ergo-mainnet',
+        connector: 'ergodex',
+        baseToken: 'ERG',
+        quoteToken: 'RSN',
+        amount: '1',
+        side: 'SELL',
+        poolAddress: NFT,
+        slippagePct: '1',
+        ...over,
+      });
+    const execute = (over: Record<string, unknown> = {}) =>
+      app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody(over) });
+    /** RSN received by the swap in a posted transaction, from the pool's side. */
+    const rsnOut = (txJson: string, before: ErgoBox) =>
+      before.assets[2].amount - BigInt(JSON.parse(txJson).outputs[0].assets[2].amount);
+
+    it("the pool moved (confirmed) between quote and execute: the caller's minAmountOut refuses it, nothing posted", async () => {
+      const q = JSON.parse((await app.inject({ method: 'GET', url: quoteUrl() })).body);
+      expect(q.amountOut).toBe('23.693');
+      expect(q.minAmountOut).toBe('23.456');
+      // someone else's 20,000 ERG buy of RSN confirms before our execute
+      const moved = othersSwap(dex, RSN_POOL, 20000n * ERG);
+      state.pools.set(NFT, [moved]);
+      const res = await execute({ minAmountOut: Number(q.minAmountOut) });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body).message).toMatch(/The pool moved.*at least 23\.456 RSN out/);
+      expect(posts()).toBe(0);
+    });
+
+    it('without minAmountOut the same execute still succeeds at the new price (back-compatible)', async () => {
+      const moved = othersSwap(dex, RSN_POOL, 20000n * ERG);
+      state.pools.set(NFT, [moved]);
+      const res = await execute();
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+      expect(JSON.parse(state.posted[0]).inputs[0].boxId).toBe(moved.boxId);
+      expect(rsnOut(state.posted[0], moved)).toBe(20211n);
+    });
+
+    it("someone else's unconfirmed swap moved the pool: bound by the confirmed pool box, a 409, nothing posted", async () => {
+      const moved = othersSwap(dex, RSN_POOL, 20000n * ERG);
+      state.mempool.set(NFT, [moved]);
+      state.mempoolSpent.add(RSN_POOL.boxId);
+      const res = await execute();
+      expect(res.statusCode).toBe(409);
+      // 1% under the confirmed box's 23.693 RSN; the unconfirmed box gives 20.211
+      expect(JSON.parse(res.body).message).toContain('now gives 20.211 RSN');
+      expect(JSON.parse(res.body).message).toContain('at least 23.456 RSN out');
+      expect(posts()).toBe(0);
+    });
+
+    it('an unconfirmed pool box from our own pending swap is traded on its own price', async () => {
+      state.wallet = [walletBox(30000n * ERG)];
+      const first = await execute({ amount: 20000 });
+      expect(first.statusCode).toBe(200);
+      const ours = ourSuccessor(state.posted[0]);
+      state.mempool.set(NFT, [ours]);
+      state.mempoolSpent.add(RSN_POOL.boxId);
+      const second = await execute();
+      expect(second.statusCode).toBe(200);
+      expect(posts()).toBe(2);
+      expect(JSON.parse(state.posted[1]).inputs[0].boxId).toBe(ours.boxId);
+    });
+
+    it("BUY: the caller's maxAmountIn refuses a swap that would take more, nothing posted", async () => {
+      const res = await execute({ side: 'BUY', maxAmountIn: 0.001 });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body).message).toContain('at most 0.001 RSN in');
+      expect(posts()).toBe(0);
+    });
+
+    it('a limit for the other side, or finer than the token, is a 400', async () => {
+      const wrong = [
+        await execute({ side: 'BUY', minAmountOut: 1 }),
+        await execute({ side: 'SELL', maxAmountIn: 1 }),
+        await execute({ minAmountOut: 23.4567 }),
+      ];
+      for (const r of wrong) expect(r.statusCode).toBe(400);
+      expect(JSON.parse(wrong[2].body).message).toContain('minAmountOut');
+      expect(posts()).toBe(0);
+    });
+  });
+
+  it('a rejection that names a missing wallet input is not read as the pool spent: one POST, the node text', async () => {
+    const detail = 'Malformed transaction: Every input of the transaction should be in UTXO. Input 1 not found';
+    state.submit = () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail } });
+    const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(posts()).toBe(1);
+    expect(res.statusCode).not.toBe(409);
+    expect(JSON.parse(res.body).message).toContain(detail);
+  });
+
+  it('the pool box spent by our own pending swap: waits for its successor before rebuilding', async () => {
+    const WAIT_MS = 137;
+    dex = makeDex(state, dexConfig(), { ...ROOT, rebuildWaitMs: WAIT_MS });
+    const first = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(first.statusCode).toBe(200);
+    const ours = ourSuccessor(state.posted[0]);
+    // The node lists our successor only once some time has passed: here, once the connector
+    // waits. Without a wait, every rebuild re-reads the spent box and the swap ends in a 409.
+    const realSetTimeout = global.setTimeout;
+    const waits: number[] = [];
+    jest.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      if (ms === WAIT_MS) {
+        waits.push(ms);
+        state.mempool.set(NFT, [ours]);
+        state.mempoolSpent.add(RSN_POOL.boxId);
+      }
+      return realSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    const second = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(waits).toEqual([WAIT_MS]);
+    expect(second.statusCode).toBe(200);
+    expect(posts()).toBe(2);
+    expect(JSON.parse(state.posted[1]).inputs[0].boxId).toBe(ours.boxId);
+  });
+
+  it('a slippage that is not a plain decimal of at most 8 places is a 400', async () => {
+    const quote = await app.inject({
+      method: 'GET',
+      url:
+        '/trading/amm/quote-swap?' +
+        new URLSearchParams({
+          chainNetwork: 'ergo-mainnet',
+          connector: 'ergodex',
+          baseToken: 'ERG',
+          quoteToken: 'RSN',
+          amount: '1',
+          side: 'SELL',
+          poolAddress: NFT,
+          slippagePct: '0.123456789',
+        }),
+    });
+    expect(quote.statusCode).toBe(400);
+    expect(JSON.parse(quote.body).message).toContain('slippagePct');
+    const exec = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ slippagePct: 1e-7 }),
+    });
+    expect(exec.statusCode).toBe(400);
+    expect(JSON.parse(exec.body).message).toContain('slippagePct');
+    expect(posts()).toBe(0);
   });
 
   it('a pool above the fee ceiling is refused before anything is built', async () => {
@@ -271,6 +447,21 @@ describe('ergodex through /trading/amm', () => {
   });
 });
 
-it('the shipped ergodex config reaches the connector (config wiring)', () => {
-  expect(dexConfig().spectrum.n2tPoolTrees[0]).toBe(N2T_TREE);
+it('the shipped ergodex template, read as the connector reads it', () => {
+  const template = yaml.load(
+    fs.readFileSync(path.join(__dirname, '../../../src/templates/connectors/ergodex.yml'), 'utf8'),
+  ) as Record<string, unknown>;
+  jest
+    .spyOn(ConfigManagerV2, 'getInstance')
+    .mockReturnValue({ get: (k: string) => template[k.replace(/^ergodex\./, '')] } as never);
+  const main = ErgodexConfig.network('mainnet');
+  expect(main.spectrum.n2tPoolTrees).toEqual([N2T_TREE]);
+  expect(main.spectrum.t2tPoolTrees).toEqual([T2T_TREE]);
+  expect(main.spectrum.feeDenominator).toBe(1000n);
+  expect(main.spectrum.n2tMinSuccessorValue).toBe(10000000n);
+  expect(main.maxPoolFeePct).toBe('3');
+  expect(main.minPoolNativeReserve).toBe(100000000000n);
+  expect(main.maxDiscoveredBoxes).toBe(5000);
+  expect(ErgodexConfig.root()).toEqual({ slippagePct: 1, maxRebuilds: 2, rebuildWaitMs: 500 });
+  jest.restoreAllMocks();
 });

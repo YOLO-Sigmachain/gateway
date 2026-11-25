@@ -9,9 +9,9 @@ export function describeRoute(plan: SwapPlan): string {
 }
 
 /**
- * The quote response, with field meanings as in the Raydium AMM connector (T-17): amounts
+ * The quote response, with field meanings as in the Raydium AMM connector: amounts
  * in whole units and positive; `price` is quote per base from the pool's expected amounts
- * (T-10); the slipped bound is apart, in `minAmountOut` (SELL) or `maxAmountIn` (BUY).
+ *; the slipped bound is apart, in `minAmountOut` (SELL) or `maxAmountIn` (BUY).
  */
 export function quoteResponse(plan: SwapPlan, slippagePct: number): ChainQuoteSwapResponseType {
   const { swap, tokenIn, tokenOut, side } = plan;

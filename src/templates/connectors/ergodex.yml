@@ -10,6 +10,14 @@ slippagePct: 1
 # re-read the pool, re-quote and rebuild (only while the slippage bound still holds).
 maxRebuilds: 2
 
+# When the pool box is spent by one of this gateway's own pending swaps: milliseconds to
+# wait before rebuild n (times n), so the node can list that swap's successor box.
+rebuildWaitMs: 500
+
+# The swap routes never read Gateway's pool list (pools/ergo/<network>.json) for ergodex:
+# without a pool address, ergodex chooses the allowed pool with the best result for the
+# size. The pool list serves /pools lookups only.
+
 # Per network. A network with no entry, or with empty tree lists, has no pools.
 networks:
   mainnet:
@@ -20,12 +28,16 @@ networks:
     maxPoolFeePct: 3
     # Pools with less native coin (nanoERG) than this are refused or skipped (100 ERG).
     minPoolNativeReserve: 100000000000
-    # Pools with any token reserve below this (raw units) are refused or skipped.
+    # Pools with any token reserve below this are refused or skipped. In raw units (the
+    # token's smallest unit), and the same number for every token whatever its decimals.
+    # This is the only size guard on a token/token pool: minPoolNativeReserve never
+    # applies there.
     minPoolTokenReserve: 1
     # If not empty, only these pools (pool NFT ids) may be traded.
     poolAllowlist: []
-    # Most boxes read per pool tree when discovering pools.
-    maxDiscoveredBoxes: 1000
+    # Most boxes read per pool tree when discovering pools. A tree holding more is read in
+    # part, with a warning in the log.
+    maxDiscoveredBoxes: 5000
     spectrum:
       # Exact ErgoTrees of the live pools (read from the node 2026-11-25). A box is a pool
       # only at one of these trees.
@@ -43,7 +55,7 @@ networks:
     minPoolNativeReserve: 0
     minPoolTokenReserve: 1
     poolAllowlist: []
-    maxDiscoveredBoxes: 1000
+    maxDiscoveredBoxes: 5000
     spectrum:
       # No pool trees are known for this network.
       n2tPoolTrees: []

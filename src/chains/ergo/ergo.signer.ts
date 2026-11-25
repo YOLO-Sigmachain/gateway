@@ -26,7 +26,7 @@ import { Eip12DataInput, Eip12UnsignedInput, Eip12UnsignedTransaction, NodeHeade
 
 /** What a signer needs beyond the transaction: the chain's recent headers, from the node. */
 export interface ErgoSigningContext {
-  /** At least 10 recent headers from the same node that gave the height (T-6). Any order. */
+  /** At least 10 recent headers from the same node that gave the height. Any order. */
   headers: NodeHeaderJson[];
 }
 

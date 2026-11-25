@@ -3435,7 +3435,7 @@
             "type": "string"
           },
           "poolAddress": {
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list.",
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size).",
             "type": "string"
           },
           "slippagePct": {
@@ -3522,7 +3522,7 @@
             "type": "string"
           },
           "poolAddress": {
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list.",
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size).",
             "type": "string"
           },
           "slippagePct": {
@@ -3612,7 +3612,7 @@
             "type": "string"
           },
           "poolAddress": {
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list.",
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size).",
             "type": "string"
           },
           "slippagePct": {
@@ -3622,6 +3622,18 @@
             "description": "Maximum acceptable slippage percentage. Defaults to the connector's configured slippagePct.",
             "type": "number",
             "example": 1
+          },
+          "minAmountOut": {
+            "format": "decimal",
+            "minimum": 0,
+            "description": "SELL only, optional: the least tokenOut (whole units) the swap may give; the swap is refused below it. Honoured by connectors that support it (ergodex); ignored by the others.",
+            "type": "number"
+          },
+          "maxAmountIn": {
+            "format": "decimal",
+            "minimum": 0,
+            "description": "BUY only, optional: the most tokenIn (whole units) the swap may take; the swap is refused above it. Honoured by connectors that support it (ergodex); ignored by the others.",
+            "type": "number"
           }
         },
         "required": [
@@ -3703,7 +3715,7 @@
             "type": "string"
           },
           "poolAddress": {
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list.",
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size).",
             "type": "string"
           },
           "slippagePct": {
@@ -3713,6 +3725,18 @@
             "description": "Maximum acceptable slippage percentage. Defaults to the connector's configured slippagePct.",
             "type": "number",
             "example": 1
+          },
+          "minAmountOut": {
+            "format": "decimal",
+            "minimum": 0,
+            "description": "SELL only, optional: the least tokenOut (whole units) the swap may give; the swap is refused below it. Honoured by connectors that support it (ergodex); ignored by the others.",
+            "type": "number"
+          },
+          "maxAmountIn": {
+            "format": "decimal",
+            "minimum": 0,
+            "description": "BUY only, optional: the most tokenIn (whole units) the swap may take; the swap is refused above it. Honoured by connectors that support it (ergodex); ignored by the others.",
+            "type": "number"
           }
         },
         "required": [
@@ -7601,7 +7625,7 @@
             "in": "query",
             "name": "poolAddress",
             "required": false,
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list."
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size)."
           },
           {
             "schema": {
@@ -8549,7 +8573,7 @@
             "in": "query",
             "name": "poolAddress",
             "required": false,
-            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list."
+            "description": "Pool to trade against. Omit to resolve it from Gateway's configured pool list by token pair; pass an address to pin a pool that is not in that list. A connector may choose the pool itself instead (ergodex: the allowed pool with the best result for this size)."
           },
           {
             "schema": {

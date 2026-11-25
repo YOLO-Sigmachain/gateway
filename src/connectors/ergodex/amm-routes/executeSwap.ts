@@ -2,8 +2,14 @@
  * Direct swap: the trader's own transaction spends the pool box (input 0, fixed) and
  * creates its successor at output 0; what the trader receives is in the change, at the
  * wallet's own address. Amounts are fixed in the transaction, so there is no slippage
- * band on chain: the caller's slippage is applied once, to the first fresh quote, and
- * every rebuild must still meet that bound.
+ * band on chain. The price is bound once, before the first build, and every build
+ * (the first and each rebuild) must meet that bound:
+ * - the caller's own limit, when given: `minAmountOut` for a SELL, `maxAmountIn` for a BUY;
+ * - the slippage applied to the first fresh quote;
+ * - when that quote is on an unconfirmed pool box created by someone else's transaction,
+ *   the slippage applied to the confirmed pool box too, so a price no block has agreed on
+ *   cannot move the bound against the trader.
+ * The strictest of these binds.
  *
  * At submit:
  * - the node rejects it because the pool box is already spent: read the pool again,
@@ -14,7 +20,7 @@
  *   the transaction id and says to poll it.
  *
  * The response is the submitted transaction as PENDING; a fill is reported only by poll,
- * after confirmation (T-11). No order box is ever placed, before or after.
+ * after confirmation. No order box is ever placed, before or after.
  */
 import { ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
@@ -72,7 +78,12 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
   if (pool[outSide].reserve - reserveOf(outSide) !== swap.amountOut) fail('the pool does not pay the output');
 }
 
-function meetsBound(plan: SwapPlan, bound: { minOut?: bigint; maxIn?: bigint }): boolean {
+interface SwapBound {
+  minOut?: bigint;
+  maxIn?: bigint;
+}
+
+function meetsBound(plan: SwapPlan, bound: SwapBound): boolean {
   if (bound.minOut !== undefined && plan.swap.amountOut < bound.minOut) return false;
   if (bound.maxIn !== undefined && plan.swap.amountIn > bound.maxIn) return false;
   return true;
@@ -86,8 +97,16 @@ export async function executeSwap(
   side: 'BUY' | 'SELL',
   amount: number,
   slippagePct?: number,
+  minAmountOut?: number,
+  maxAmountIn?: number,
 ): Promise<ChainExecuteSwapResponseType> {
   try {
+    if (side === 'BUY' && minAmountOut !== undefined) {
+      throw httpErrors.badRequest('minAmountOut applies to a SELL (exact input); a BUY is limited by maxAmountIn');
+    }
+    if (side === 'SELL' && maxAmountIn !== undefined) {
+      throw httpErrors.badRequest('maxAmountIn applies to a BUY (exact output); a SELL is limited by minAmountOut');
+    }
     const dex = await Ergodex.getInstance(network);
     const ergo = dex.ergo;
     const slip = pctToScaled(slippagePct ?? dex.root.slippagePct);
@@ -96,8 +115,22 @@ export async function executeSwap(
     const raw = toRaw(amount, base);
 
     let plan = await dex.freshPlan(poolAddress, base, side, raw);
-    const bound =
-      side === 'SELL' ? { minOut: slipDown(plan.swap.amountOut, slip) } : { maxIn: slipUp(plan.swap.amountIn, slip) };
+    // The plans the slippage applies to: the first fresh quote, and the confirmed pool box
+    // when that quote is on an unconfirmed box that none of our own transactions created.
+    const priced = [plan];
+    if (plan.source === 'mempool' && !ergo.pending.get(plan.pool.box.transactionId)) {
+      priced.push(await dex.freshPlan(poolAddress, base, side, raw, { confirmedOnly: true }));
+    }
+    const bound: SwapBound = {};
+    if (side === 'SELL') {
+      const limits = priced.map((p) => slipDown(p.swap.amountOut, slip));
+      if (minAmountOut !== undefined) limits.push(toRaw(minAmountOut, plan.tokenOut, 'minAmountOut'));
+      bound.minOut = limits.reduce((a, b) => (b > a ? b : a));
+    } else {
+      const limits = priced.map((p) => slipUp(p.swap.amountIn, slip));
+      if (maxAmountIn !== undefined) limits.push(toRaw(maxAmountIn, plan.tokenIn, 'maxAmountIn'));
+      bound.maxIn = limits.reduce((a, b) => (b < a ? b : a));
+    }
     const boundText =
       side === 'SELL'
         ? `at least ${units(bound.minOut!, plan.tokenOut.decimals)} ${plan.tokenOut.symbol} out`
@@ -140,6 +173,12 @@ export async function executeSwap(
               `Pool ${plan.pool.poolId} changed under ${attempt + 1} attempt(s); nothing that can still execute was ` +
                 `submitted. Retry. Last rejection: ${error.message}`,
             );
+          }
+          if (error.nodeText === undefined) {
+            // Spent by one of our own pending transactions, found before any POST: the node
+            // may not list that transaction's successor box yet. Give it a moment.
+            const waitMs = dex.root.rebuildWaitMs * (attempt + 1);
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
           }
           continue;
         }

@@ -1,10 +1,10 @@
 /**
  * Ergo node REST client. Node-only: heights, headers, boxes, transactions, tokens and
- * submission all come from one node (T-6), which must run the extra indexer for the
+ * submission all come from one node, which must run the extra indexer for the
  * /blockchain routes.
  *
- * Every response is parsed bigint-safe (T-1). A failed request raises `ErgoNodeError`
- * carrying the node's own reason and detail, never a swallowed or generic code (T-2).
+ * Every response is parsed bigint-safe. A failed request raises `ErgoNodeError`
+ * carrying the node's own reason and detail, never a swallowed or generic code.
  */
 import { parseNodeJson, toAmount } from './ergo.json';
 import { ErgoBox, ErgoRegisters, NodeHeaderJson, REGISTER_IDS } from './ergo.types';
@@ -273,11 +273,31 @@ export class ErgoNodeClient {
 
   /**
    * Every confirmed unspent box at an exact ErgoTree, paged at the client's page size.
-   * The node answers with a list (or, on some versions, `{ items, total }`).
+   * The node answers with a list (or, on some versions, `{ items, total }`). Refuses a
+   * partial set: more than `maxBoxes` boxes throws.
    */
   async getUnspentBoxesByErgoTree(ergoTree: string, maxBoxes: number): Promise<ErgoBox[]> {
+    const { boxes, complete } = await this.readUnspentBoxesByErgoTree(ergoTree, maxBoxes);
+    if (!complete) {
+      throw new ErgoNodeError(200, `More than ${maxBoxes} unspent boxes at this ErgoTree; refusing a partial set`);
+    }
+    return boxes;
+  }
+
+  /**
+   * The same read, for a caller that can use a partial set: at most about `maxBoxes`
+   * boxes (oldest first), and `complete` false when the tree holds more than were read.
+   */
+  async readUnspentBoxesByErgoTree(
+    ergoTree: string,
+    maxBoxes: number,
+  ): Promise<{ boxes: ErgoBox[]; complete: boolean }> {
     if (!/^([0-9a-fA-F]{2})+$/.test(ergoTree)) throw new Error('ergoTree must be hex');
     const boxes: ErgoBox[] = [];
+    const unique = () => {
+      const seen = new Set<string>();
+      return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
+    };
     for (let offset = 0; offset < maxBoxes; offset += this.pageSize) {
       const params = new URLSearchParams({
         offset: String(offset),
@@ -293,12 +313,9 @@ export class ErgoNodeClient {
       );
       const batch = Array.isArray(body) ? body : (body?.items ?? []);
       boxes.push(...batch.map(normalizeNodeBox));
-      if (batch.length < this.pageSize) {
-        const seen = new Set<string>();
-        return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
-      }
+      if (batch.length < this.pageSize) return { boxes: unique(), complete: true };
     }
-    throw new ErgoNodeError(200, `More than ${maxBoxes} unspent boxes at this ErgoTree; refusing a partial set`);
+    return { boxes: unique(), complete: false };
   }
 
   /** Outputs of mempool transactions that hold a token (boxes not yet confirmed). */
