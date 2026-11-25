@@ -6,6 +6,7 @@
  * Nothing here logs, returns or puts into an error any part of a mnemonic or key.
  */
 import {
+  BlockHeader,
   BlockHeaders,
   DerivationPath,
   ErgoBoxes,
@@ -160,8 +161,23 @@ export class WasmErgoSigner implements ErgoSigner {
     const toFree: Array<{ free(): void }> = [];
     try {
       const blockHeaders = BlockHeaders.from_json(headers);
-      const preHeader = PreHeader.from_block_header(blockHeaders.get(0));
+      // The node checks a transaction against the next block (HEIGHT = tip + 1, parent =
+      // tip), so the pre-header is that upcoming block, not the tip itself. The real headers
+      // stay as CONTEXT.headers. from_json does not check the id of the synthesized header.
+      const tip = headers[0];
+      const upcoming = BlockHeader.from_json(
+        JSON.stringify({
+          ...tip,
+          height: tip.height + 1,
+          parentId: tip.id,
+          timestamp: Math.max(Date.now(), Number(tip.timestamp) + 1),
+        }),
+      );
+      const preHeader = PreHeader.from_block_header(upcoming); // takes ownership of the header
       // Parameters: 0.28.0 offers only the genesis defaults, not the node's current ones.
+      // These defaults lack maxBlockCost (max_block_cost() panics inside wasm), so they must
+      // never be passed to a validation or cost-counting call; signing does not consult it.
+      // When a wasm release exposes parameter construction, build them from node /info.parameters.
       const stateContext = new ErgoStateContext(preHeader, blockHeaders, Parameters.default_parameters());
       toFree.push(stateContext);
 

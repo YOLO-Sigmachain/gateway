@@ -15,6 +15,8 @@ export interface ErgoNetworkConfig {
   nativeDecimals: number;
   /** In the smallest native unit. */
   minerFee: bigint;
+  /** Highest miner fee a transaction may pay, in the smallest native unit. Default 10 x minerFee. */
+  maxMinerFee: bigint;
   minerFeeErgoTree: string;
   tokenListSource: string;
   blockTimeSeconds: number;
@@ -35,6 +37,8 @@ export const networks = getAvailableErgoNetworks();
 
 const DEFAULT_NODE_TIMEOUT_MS = 10000;
 const DEFAULT_BOX_PAGE_SIZE = 100;
+/** maxMinerFee when the network config leaves it out: a multiple of that network's minerFee. */
+const DEFAULT_MAX_FEE_MULTIPLE = 10n;
 
 function required<T>(namespaceId: string, key: string): T {
   const value = ConfigManagerV2.getInstance().get(`${namespaceId}.${key}`);
@@ -59,12 +63,21 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
   if (minerFee <= 0n) {
     throw new Error(`${namespaceId}.minerFee must be positive`);
   }
+  const configuredMaxFee = optional(namespaceId, 'maxMinerFee');
+  const maxMinerFee =
+    configuredMaxFee === undefined
+      ? DEFAULT_MAX_FEE_MULTIPLE * minerFee
+      : toAmount(configuredMaxFee, `${namespaceId}.maxMinerFee`);
+  if (maxMinerFee < minerFee) {
+    throw new Error(`${namespaceId}.maxMinerFee must be at least minerFee`);
+  }
   return {
     nodeURL: String(required<string>(namespaceId, 'nodeURL')).trim().replace(/\/+$/, ''),
     addressPrefix,
     nativeCurrencySymbol: required<string>(namespaceId, 'nativeCurrencySymbol'),
     nativeDecimals: Number(required<number>(namespaceId, 'nativeDecimals')),
     minerFee,
+    maxMinerFee,
     minerFeeErgoTree: String(required<string>(namespaceId, 'minerFeeErgoTree')).toLowerCase(),
     tokenListSource: required<string>(namespaceId, 'tokenListSource'),
     blockTimeSeconds: Number(required<number>(namespaceId, 'blockTimeSeconds')),

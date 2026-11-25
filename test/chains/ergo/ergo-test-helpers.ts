@@ -110,6 +110,7 @@ export function testConfig(overrides: Partial<ErgoNetworkConfig> = {}): ErgoNetw
     nativeCurrencySymbol: 'ERG',
     nativeDecimals: 9,
     minerFee: 1100000n,
+    maxMinerFee: 11000000n,
     minerFeeErgoTree: FEE_TREE,
     tokenListSource: 'tokens/ergo/mainnet.json',
     blockTimeSeconds: 120,

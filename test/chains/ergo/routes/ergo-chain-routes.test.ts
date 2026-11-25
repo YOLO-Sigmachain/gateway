@@ -10,6 +10,7 @@ import { gatewayApp } from '../../../../src/app';
 import { Ergo } from '../../../../src/chains/ergo/ergo';
 import { encodeErgoAddress } from '../../../../src/chains/ergo/ergo.utils';
 import { TransactionStatusCode } from '../../../../src/schemas/chain-schema';
+import { logger } from '../../../../src/services/logger';
 import { mockConfigStorage } from '../../../mocks/shared-mocks';
 import {
   fakeNode,
@@ -20,6 +21,7 @@ import {
   infoBody,
   makeBox,
   MAX_LONG,
+  MNEMONIC_A,
   nodeBoxJson,
   notFound,
   p2pk,
@@ -164,9 +166,32 @@ describe('/chains/ergo routes', () => {
     expect(JSON.parse(res.body).message).toContain('Invalid Ergo address');
   });
 
+  it('a mnemonic pasted into the address field is neither echoed nor logged (A6)', async () => {
+    const spy = jest.spyOn(logger, 'error').mockImplementation(() => undefined as never);
+    try {
+      const res = await fastify.inject({
+        method: 'POST',
+        url: '/chains/ergo/balances',
+        payload: { network: 'mainnet', address: MNEMONIC_A },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toBe('Invalid Ergo address (not base58)');
+      expect(res.body).not.toContain('abandon');
+      const logged = spy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('Invalid Ergo address');
+      expect(logged).not.toContain('abandon');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('POST /chains/ergo/poll: confirmed, pending, not found', async () => {
-    const tx = { id: TX, inputs: [], outputs: [], inclusionHeight: TIP, numConfirmations: 1 };
-    route = (_m, path) => (path === `/blockchain/transaction/byId/${TX}` ? { body: tx } : undefined);
+    // what the node sends for a transaction in the tip block: 0 blocks after it
+    const tx = { id: TX, inputs: [], outputs: [], inclusionHeight: TIP, numConfirmations: 0 };
+    route = (_m, path) => {
+      if (path.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      return path === `/blockchain/transaction/byId/${TX}` ? { body: tx } : undefined;
+    };
     let res = await fastify.inject({
       method: 'POST',
       url: '/chains/ergo/poll',

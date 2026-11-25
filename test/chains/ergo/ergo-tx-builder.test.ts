@@ -156,6 +156,16 @@ describe('box selection and change', () => {
       buildUnsignedTransaction(base({ walletBoxes: [tampered], outputs: [{ ergoTree: OTHER, value: ERG }] })),
     ).toThrow('box id does not match');
   });
+
+  it('refuses a wallet box that is not at the change address (M2)', () => {
+    const elsewhere = makeBox({ ergoTree: OTHER, value: 3n * ERG });
+    expect(() =>
+      buildUnsignedTransaction(base({ walletBoxes: [elsewhere], outputs: [{ ergoTree: OTHER, value: ERG }] })),
+    ).toThrow(`wallet box ${elsewhere.boxId} is not at the change address`);
+    expect(() =>
+      buildUnsignedTransaction(base({ walletBoxes: [elsewhere], outputs: [{ ergoTree: OTHER, value: ERG }] })),
+    ).toThrow(ErgoBuildError);
+  });
 });
 
 describe('pending boxes and chained spends (T-5)', () => {
@@ -173,6 +183,7 @@ describe('pending boxes and chained spends (T-5)', () => {
       'aa'.repeat(32),
       first.inputBoxes.map((b) => b.boxId),
       [],
+      '{}',
     );
     // the node still lists both boxes: the first transaction is not indexed yet
     const second = buildUnsignedTransaction(
@@ -187,7 +198,7 @@ describe('pending boxes and chained spends (T-5)', () => {
   });
 
   it('spends the unconfirmed change of our own previous transaction', () => {
-    const tracker = new ErgoPendingTracker(60_000);
+    const tracker = new ErgoPendingTracker(60_000, Date.now, 60_000);
     const funding = makeBox({ ergoTree: ME, value: 5n * ERG, assets: [{ tokenId: tokenId(7), amount: ABOVE_2_53 }] });
     const first = buildUnsignedTransaction(
       base({ walletBoxes: [funding], outputs: [{ ergoTree: OTHER, value: ERG }] }),
@@ -209,6 +220,7 @@ describe('pending boxes and chained spends (T-5)', () => {
       firstTxId,
       first.inputBoxes.map((b) => b.boxId),
       firstOutputs,
+      '{}',
     );
 
     // The node still shows the funding box as unspent and does not list the change yet.
@@ -227,15 +239,30 @@ describe('pending boxes and chained spends (T-5)', () => {
     expect(tokenTotal(change, tokenId(7))).toBe(ABOVE_2_53);
   });
 
+  it('offers no phantom outputs for a transaction the node has forgotten, once a block time has passed (M3)', () => {
+    let now = 0;
+    const tracker = new ErgoPendingTracker(30 * 60_000, () => now, 120_000);
+    const funding = makeBox({ ergoTree: ME, value: 5n * ERG });
+    const change = makeBox({ ergoTree: ME, value: 3n * ERG, transactionId: 'ee'.repeat(32), inclusionHeight: null });
+    tracker.record('ee'.repeat(32), [funding.boxId], [change], '{}');
+    // just submitted: the node may not show the spend yet, so the change is offered
+    expect(tracker.available([funding], ME).map((b) => b.boxId)).toEqual([change.boxId]);
+    now = 120_000;
+    // the node still lists the input as unspent: no phantom change, and the input stays hidden
+    expect(tracker.available([funding], ME)).toEqual([]);
+    // the node shows the input spent (it no longer lists it): the change is offered again
+    expect(tracker.available([], ME).map((b) => b.boxId)).toEqual([change.boxId]);
+  });
+
   it('a released or timed-out transaction frees its boxes', () => {
     let now = 0;
     const tracker = new ErgoPendingTracker(1000, () => now);
     const box = makeBox({ ergoTree: ME, value: ERG });
-    tracker.record('cc'.repeat(32), [box.boxId], []);
+    tracker.record('cc'.repeat(32), [box.boxId], [], '{}');
     expect(tracker.available([box], ME)).toEqual([]);
     now = 2000;
     expect(tracker.available([box], ME).map((b) => b.boxId)).toEqual([box.boxId]);
-    tracker.record('dd'.repeat(32), [box.boxId], []);
+    tracker.record('dd'.repeat(32), [box.boxId], [], '{}');
     tracker.release('dd'.repeat(32));
     expect(tracker.isSpent(box.boxId)).toBe(false);
   });
@@ -360,6 +387,26 @@ describe('fee box and creation heights', () => {
     const ahead = makeBox({ ergoTree: ME, value: 3n * ERG, creationHeight: HEIGHT + 1, inclusionHeight: null });
     const built2 = buildUnsignedTransaction(base({ walletBoxes: [ahead], outputs: [{ ergoTree: OTHER, value: ERG }] }));
     expect(built2.unsigned.outputs.every((o) => o.creationHeight === HEIGHT + 1)).toBe(true);
+  });
+
+  it('a fixed input created for the next block (a mempool pool box) lifts outputs to that height (M12)', () => {
+    const pool = makeBox({ ergoTree: POOL_TREE, value: 100n * ERG, creationHeight: HEIGHT + 1, inclusionHeight: null });
+    const wallet = [makeBox({ ergoTree: ME, value: 3n * ERG, creationHeight: HEIGHT - 5 })];
+    const built = buildUnsignedTransaction(
+      base({ inputs: [{ box: pool }], walletBoxes: wallet, outputs: [{ ergoTree: POOL_TREE, value: 100n * ERG }] }),
+    );
+    expect(built.unsigned.inputs[0].boxId).toBe(pool.boxId);
+    expect(built.unsigned.outputs.every((o) => o.creationHeight === HEIGHT + 1)).toBe(true);
+    expect(built.nextHeight).toBe(HEIGHT + 1);
+    expect(() =>
+      buildUnsignedTransaction(
+        base({
+          inputs: [{ box: pool }],
+          walletBoxes: wallet,
+          outputs: [{ ergoTree: POOL_TREE, value: 100n * ERG, creationHeight: HEIGHT + 2 }],
+        }),
+      ),
+    ).toThrow('above the next block height');
   });
 
   it('keeps a caller creation height at or above the input height and refuses one below', () => {

@@ -6,7 +6,7 @@ import { SByte, SColl, SInt, SLong } from '@fleet-sdk/core';
 import { Transaction } from 'ergo-lib-wasm-nodejs';
 
 import { assertSignedMatches, Ergo } from '../../../src/chains/ergo/ergo';
-import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
+import { parseNodeJson, stringifyWithBigInt } from '../../../src/chains/ergo/ergo.json';
 import { ErgoSigner, SignedErgoTransaction, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { buildTransfer } from '../../../src/chains/ergo/ergo.transfer';
 import { buildUnsignedTransaction, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
@@ -97,12 +97,36 @@ describe('sign a transfer with the real wasm signer', () => {
     expect(() => assertSignedMatches(built, signed)).not.toThrow();
   });
 
-  it('a signer that changes an output is caught', () => {
-    const tampered = JSON.parse(JSON.stringify(signed.parsed, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
-    tampered.outputs[0].value = String(BigInt(tampered.outputs[0].value) - 1n);
-    expect(() => assertSignedMatches(built, { ...signed, parsed: tampered })).toThrow(ErgoTransactionAssertionError);
+  it('a signer that changes an output in the JSON it submits is caught', () => {
+    const tampered = rewriteJson(signed, (tx) => {
+      tx.outputs[0].value = BigInt(tx.outputs[0].value) - 1n;
+    });
+    expect(() => assertSignedMatches(built, { ...signed, json: tampered })).toThrow(ErgoTransactionAssertionError);
+  });
+
+  it('checks the JSON that is submitted, not the parsed copy beside it (M8)', () => {
+    // the parsed copy is untouched; only the submitted bytes say 1 nanoERG
+    const tampered = rewriteJson(signed, (tx) => {
+      tx.outputs[0].value = 1;
+    });
+    expect(tampered).not.toBe(signed.json);
+    expect(() => assertSignedMatches(built, { ...signed, json: tampered })).toThrow('output 0 value');
+  });
+
+  it('an input with no context extension matches one whose extension is left out or {}', () => {
+    const missing = rewriteJson(signed, (tx) => {
+      delete tx.inputs[0].spendingProof.extension;
+    });
+    expect(() => assertSignedMatches(built, { ...signed, json: missing })).not.toThrow();
   });
 });
+
+/** The signer's JSON, parsed bigint-safe, changed, and written back as node JSON. */
+function rewriteJson(signed: SignedErgoTransaction, change: (tx: any) => void): string {
+  const tx = parseNodeJson<any>(signed.json);
+  change(tx);
+  return stringifyWithBigInt(tx);
+}
 
 describe('context variables, data inputs and registers survive signing', () => {
   const fixed = makeBox({ ergoTree: ME, value: 4n * ERG, creationHeight: TIP - 2 });
@@ -149,6 +173,59 @@ describe('context variables, data inputs and registers survive signing', () => {
     expect((signed.parsed.outputs[0] as { additionalRegisters: unknown }).additionalRegisters).toEqual(registers);
     expect(() => assertSignedMatches(built, signed)).not.toThrow();
   });
+
+  it('refuses a signed transaction whose context extension differs from the checked one (M8)', () => {
+    const changed = rewriteJson(signed, (tx) => {
+      tx.inputs[0].spendingProof.extension = { '0': SByte(1).toHex(), '1': SInt(1).toHex() };
+    });
+    expect(() => assertSignedMatches(built, { ...signed, json: changed })).toThrow('input 0 context variable 0');
+    const added = rewriteJson(signed, (tx) => {
+      tx.inputs[0].spendingProof.extension = { ...tx.inputs[0].spendingProof.extension, '7': '0400' };
+    });
+    expect(() => assertSignedMatches(built, { ...signed, json: added })).toThrow('input 0 context variable 7');
+    const dropped = rewriteJson(signed, (tx) => {
+      tx.inputs[0].spendingProof.extension = {};
+    });
+    expect(() => assertSignedMatches(built, { ...signed, json: dropped })).toThrow(ErgoTransactionAssertionError);
+  });
+});
+
+describe('the signing context is the upcoming block, as the node checks it (M5)', () => {
+  // sigmaProp(HEIGHT <op> c), a constant-segregated v0 tree
+  const heightTree = (op: string, c: number) => `1001${SInt(c).toHex()}d1${op}a37300`;
+  const OP = { LE: '90', GT: '91', GE: '92', EQ: '93' };
+
+  async function trySign(tree: string): Promise<{ ok: boolean; err?: string }> {
+    const box = makeBox({ ergoTree: tree, value: 2n * ERG, creationHeight: TIP - 10 });
+    const built = buildUnsignedTransaction({
+      height: TIP,
+      minValuePerByte: PER_BYTE,
+      fee: FEE,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME,
+      inputs: [{ box }],
+      walletBoxes: [],
+      outputs: [{ ergoTree: ME, value: ERG }],
+    });
+    try {
+      await signer.signTransaction(built.unsigned, built.unsigned.inputs, built.unsigned.dataInputs, {
+        headers: HEADERS,
+      });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, err: (e as Error).message };
+    }
+  }
+
+  it('HEIGHT is tip + 1: a timelock opening next block signs, a deadline at the tip does not', async () => {
+    expect((await trySign(heightTree(OP.EQ, TIP + 1))).ok).toBe(true);
+    expect((await trySign(heightTree(OP.GT, TIP))).ok).toBe(true);
+    expect((await trySign(heightTree(OP.GE, TIP + 1))).ok).toBe(true);
+    expect((await trySign(heightTree(OP.EQ, TIP))).ok).toBe(false);
+    const deadline = await trySign(heightTree(OP.LE, TIP));
+    expect(deadline.ok).toBe(false);
+    expect(deadline.err).toContain('Signing failed');
+  });
 });
 
 describe('Ergo.signTransaction runs the check before the signer', () => {
@@ -178,6 +255,22 @@ describe('Ergo.signTransaction runs the check before the signer', () => {
     change.value = (BigInt(change.value) - 1n).toString();
     const spy: ErgoSigner = { publicKeys: [], signTransaction: jest.fn() };
     await expect(ergo.signTransaction(bad, spy)).rejects.toThrow(ErgoTransactionAssertionError);
+    expect(spy.signTransaction).not.toHaveBeenCalled();
+  });
+
+  it("refuses a transaction whose change goes to a tree that is not the signer's, without calling it (M2)", async () => {
+    const elsewhere = buildTransfer({
+      height: TIP,
+      minValuePerByte: PER_BYTE,
+      fee: FEE,
+      feeErgoTree: FEE_TREE,
+      fromErgoTree: OTHER,
+      toErgoTree: ME,
+      nanoErgs: ERG,
+      walletBoxes: [makeBox({ ergoTree: OTHER, value: 3n * ERG, creationHeight: TIP - 5 })],
+    });
+    const spy: ErgoSigner = { publicKeys: signer.publicKeys, signTransaction: jest.fn() };
+    await expect(ergo.signTransaction(elsewhere, spy)).rejects.toThrow("not the signer's address");
     expect(spy.signTransaction).not.toHaveBeenCalled();
   });
 

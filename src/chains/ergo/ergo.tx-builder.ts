@@ -85,6 +85,13 @@ export interface BuiltErgoTransaction {
   burn: ErgoTokenAmount[];
   minValuePerByte: bigint;
   height: number;
+  /**
+   * `height + 1`: the height of the block the transaction can first be mined in, and the
+   * HEIGHT the signer's context and the node's mempool check both evaluate scripts at. A
+   * connector writing a HEIGHT-dependent register (a Dexy free-mint reset, a payout R4, a
+   * tracker R7) must compute it for `nextHeight`; it holds only if mined at that height.
+   */
+  nextHeight: number;
 }
 
 export class ErgoBuildError extends Error {
@@ -325,6 +332,10 @@ export function buildUnsignedTransaction(params: ErgoBuildParams): BuiltErgoTran
   const selected: ErgoBox[] = [];
   const take = (box: ErgoBox) => {
     if (!boxIdIsValid(box)) throw new ErgoBuildError(`wallet box ${box.boxId}: box id does not match its content`);
+    // the remainder of every selected box goes to change, so change must be the boxes' owner
+    if (box.ergoTree.toLowerCase() !== changeErgoTree) {
+      throw new ErgoBuildError(`wallet box ${box.boxId} is not at the change address`);
+    }
     selected.push(box);
     candidates.splice(candidates.indexOf(box), 1);
   };
@@ -469,6 +480,7 @@ export function buildUnsignedTransaction(params: ErgoBuildParams): BuiltErgoTran
     burn: burn.map((b) => ({ tokenId: b.tokenId.toLowerCase(), amount: b.amount })),
     minValuePerByte,
     height,
+    nextHeight: height + 1,
   };
   // The caller's outputs must meet the minimum too; the assertion reports which one fails.
   assertTransactionBalanced(built);

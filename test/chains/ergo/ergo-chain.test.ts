@@ -5,8 +5,10 @@
  */
 import { AmbiguousTokenError, Ergo } from '../../../src/chains/ergo/ergo';
 import { ErgoNodeError } from '../../../src/chains/ergo/ergo.node-client';
-import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
+import { ErgoSigner, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
+import { buildUnsignedTransaction, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
 import { addressFromPublicKey, encodeErgoAddress } from '../../../src/chains/ergo/ergo.utils';
+import { balanceResponse } from '../../../src/chains/wallet-balances';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 
 import {
@@ -54,12 +56,15 @@ describe('poll', () => {
     outputs: [{ boxId: 'ef'.repeat(32), ergoTree: FEE_TREE, value: 1100000 }],
   };
 
+  // The node's numConfirmations counts blocks after the inclusion block: 0 at the tip.
+  const indexedAs = (inclusionHeight: number, numConfirmations: number) => (_m: string, p: string) => {
+    if (p === `/transactions/unconfirmed/byTransactionId/${TX}`) return notFound();
+    if (p === `/blockchain/transaction/byId/${TX}`) return { body: { ...tx, inclusionHeight, numConfirmations } };
+    return undefined;
+  };
+
   it('confirmed: indexed with enough confirmations', async () => {
-    const { ergo } = chain((_m, p) =>
-      p === `/blockchain/transaction/byId/${TX}`
-        ? { body: { ...tx, inclusionHeight: TIP - 2, numConfirmations: 3 } }
-        : undefined,
-    );
+    const { ergo } = chain(indexedAs(TIP - 2, 2));
     const r = await ergo.pollTransaction(TX);
     expect(r.txStatus).toBe(TransactionStatusCode.CONFIRMED);
     expect(r.txBlock).toBe(TIP - 2);
@@ -67,17 +72,44 @@ describe('poll', () => {
     expect(r.currentBlock).toBe(TIP);
   });
 
+  it('confirmed with confirmations 1 when included in the tip block (node says 0)', async () => {
+    const { ergo } = chain(indexedAs(TIP, 0), { confirmations: 1 });
+    const r = await ergo.pollTransaction(TX);
+    expect(r.txStatus).toBe(TransactionStatusCode.CONFIRMED);
+    expect(r.txBlock).toBe(TIP);
+  });
+
   it('pending: indexed but fewer confirmations than the network config asks for', async () => {
-    const { ergo } = chain(
-      (_m, p) =>
-        p === `/blockchain/transaction/byId/${TX}`
-          ? { body: { ...tx, inclusionHeight: TIP, numConfirmations: 1 } }
-          : undefined,
-      { confirmations: 3 },
-    );
+    const { ergo } = chain(indexedAs(TIP, 0), { confirmations: 3 });
     const r = await ergo.pollTransaction(TX);
     expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
     expect(r.txBlock).toBe(TIP);
+  });
+
+  it('pending, not "not found", when a block lands mid-poll and the index has not taken it yet', async () => {
+    // /info said TIP; the transaction left the mempool for block TIP+1, which the index lacks
+    const { ergo } = chain((_m, p) => {
+      if (p.startsWith('/blockchain/transaction/byId/') || p.startsWith('/transactions/unconfirmed/'))
+        return notFound();
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP + 1 } };
+      return undefined;
+    });
+    const r = await ergo.pollTransaction(TX);
+    expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+  });
+
+  it('asks the mempool before the index, so a transaction moving into a block is not missed', async () => {
+    const { ergo, calls } = chain((_m, p) => {
+      if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+      if (p === `/blockchain/transaction/byId/${TX}`)
+        return { body: { ...tx, inclusionHeight: TIP, numConfirmations: 0 } };
+      return undefined;
+    });
+    await ergo.pollTransaction(TX);
+    const paths = calls.map((c) => c.path);
+    expect(paths.findIndex((p) => p.startsWith('/transactions/unconfirmed/'))).toBeLessThan(
+      paths.findIndex((p) => p.startsWith('/blockchain/transaction/byId/')),
+    );
   });
 
   it('pending: in the mempool (not failed, D5)', async () => {
@@ -123,9 +155,10 @@ describe('poll', () => {
         return notFound();
       if (p === `/blockchain/box/byId/${input.boxId}`)
         return { body: nodeBoxJson(input, { spentTransactionId: other }) };
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
       return undefined;
     });
-    ergo.pending.record(TX, [input.boxId], []);
+    ergo.pending.record(TX, [input.boxId], [], '{}');
     const r = await ergo.pollTransaction(TX);
     expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
     expect(r.error).toContain(other);
@@ -133,11 +166,12 @@ describe('poll', () => {
   });
 
   it('surfaces a node error rather than turning it into a status (D13)', async () => {
-    const { ergo } = chain((_m, p) =>
-      p.startsWith('/blockchain/transaction/byId/')
+    const { ergo } = chain((_m, p) => {
+      if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+      return p.startsWith('/blockchain/transaction/byId/')
         ? { status: 500, body: { error: 500, reason: 'internal', detail: 'indexer stopped' } }
-        : undefined,
-    );
+        : undefined;
+    });
     await expect(ergo.pollTransaction(TX)).rejects.toThrow('indexer stopped');
   });
 
@@ -232,7 +266,7 @@ describe('fixed inputs and our own pending transactions', () => {
   it('refuses a fixed input that one of our pending transactions already spends', async () => {
     const pool = makeBox({ ergoTree: ME_TREE, value: 3n * ERG });
     const { ergo, calls } = chain(() => undefined);
-    ergo.pending.record(TX, [pool.boxId], []);
+    ergo.pending.record(TX, [pool.boxId], [], '{}');
     await expect(
       ergo.buildTransaction({
         changeAddress: ME,
@@ -242,6 +276,75 @@ describe('fixed inputs and our own pending transactions', () => {
       }),
     ).rejects.toThrow('already spent by one of our pending transactions');
     expect(calls.length).toBe(0);
+  });
+
+  it('refuses a data input that one of our pending transactions already spends (M9)', async () => {
+    const lp = makeBox({ ergoTree: ME_TREE, value: 3n * ERG });
+    const { ergo, calls } = chain(() => undefined);
+    ergo.pending.record(TX, [lp.boxId], [], '{}');
+    await expect(
+      ergo.buildTransaction({
+        changeAddress: ME,
+        dataInputs: [lp],
+        walletBoxes: [makeBox({ ergoTree: ME_TREE, value: 5n * ERG })],
+        outputs: [{ ergoTree: ME_TREE, value: ERG }],
+      }),
+    ).rejects.toThrow(`Data input ${lp.boxId} is already spent by one of our pending transactions`);
+    expect(calls.length).toBe(0);
+  });
+});
+
+describe('miner fee limits (M7)', () => {
+  const funding = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
+  const node = (method: string, path: string) => {
+    if (method === 'GET' && path === '/blocks/lastHeaders/10') return { body: HEADERS };
+    return undefined;
+  };
+
+  it('refuses a requested fee above maxMinerFee or below minerFee before any node request', async () => {
+    const { ergo, calls } = chain(node);
+    const request = { changeAddress: ME, walletBoxes: [funding], outputs: [{ ergoTree: ME_TREE, value: ERG }] };
+    await expect(ergo.buildTransaction({ ...request, fee: ergo.config.maxMinerFee + 1n })).rejects.toThrow(
+      'outside the allowed range',
+    );
+    await expect(ergo.buildTransaction({ ...request, fee: ergo.config.minerFee - 1n })).rejects.toThrow(
+      'outside the allowed range',
+    );
+    expect(calls.length).toBe(0);
+    const ok = await ergo.buildTransaction({ ...request, fee: ergo.config.maxMinerFee });
+    expect(ok.fee).toBe(ergo.config.maxMinerFee);
+  });
+
+  it('refuses to sign a built transaction whose fee is above maxMinerFee', async () => {
+    const { ergo } = chain(node);
+    const built = buildUnsignedTransaction({
+      height: TIP,
+      minValuePerByte: 360n,
+      fee: ergo.config.maxMinerFee + 1n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      walletBoxes: [funding],
+      outputs: [{ ergoTree: ME_TREE, value: ERG }],
+    });
+    const spy: ErgoSigner = { publicKeys: signer.publicKeys, signTransaction: jest.fn() };
+    await expect(ergo.signTransaction(built, spy)).rejects.toThrow(ErgoTransactionAssertionError);
+    await expect(ergo.signTransaction(built, spy)).rejects.toThrow('above maxMinerFee');
+    expect(spy.signTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('box listing limit (A8)', () => {
+  it('refuses a partial set when every page it may read is full', async () => {
+    const box = makeBox({ ergoTree: ME_TREE, value: ERG });
+    const { ergo, calls } = chain(
+      (method, path) =>
+        method === 'POST' && path.startsWith('/blockchain/box/unspent/byAddress')
+          ? { body: [nodeBoxJson(box)] }
+          : undefined,
+      { boxPageSize: 1 },
+    );
+    await expect(ergo.getSpendableBoxes(ME)).rejects.toThrow('refusing to report a partial set');
+    expect(calls.filter((c) => c.path.startsWith('/blockchain/box/unspent/byAddress')).length).toBe(1000);
   });
 });
 
@@ -284,6 +387,52 @@ describe('balances and tokens', () => {
     if (path.startsWith('/blockchain/token/byId/')) return notFound();
     return undefined;
   };
+
+  // The token list is fixed here, not read from this machine's untracked conf/ (A9).
+  let listSpy: jest.SpyInstance;
+  beforeEach(() => {
+    listSpy = jest
+      .spyOn(Ergo.prototype, 'getTokenList')
+      .mockResolvedValue([{ address: SIGUSD, symbol: 'SigUSD', name: 'SigUSD', decimals: 2 }]);
+  });
+  afterEach(() => listSpy.mockRestore());
+
+  it('a held token the node has no decimals for yet is refused, not reported as 0, and not cached', async () => {
+    const fresh = tokenId(0x5a);
+    const held = makeBox({ ergoTree: ME_TREE, value: ERG, assets: [{ tokenId: fresh, amount: 700n }] });
+    let nodeKnowsToken = false;
+    const { ergo } = chain((method, path) => {
+      if (method === 'POST' && path.startsWith('/blockchain/box/unspent/byAddress'))
+        return { body: [nodeBoxJson(held)] };
+      if (path === `/blockchain/token/byId/${fresh}`)
+        return nodeKnowsToken ? { body: { id: fresh, name: 'FRESH', decimals: 0, emissionAmount: 700 } } : notFound();
+      return undefined;
+    });
+    listSpy.mockResolvedValue([]);
+    const first = await ergo.getBalances(ME, [fresh]).then(
+      () => null,
+      (e) => e,
+    );
+    expect(first.statusCode).toBe(503);
+    expect(first.message).toContain('held but the node has no decimals');
+    nodeKnowsToken = true;
+    const second = await ergo.getBalances(ME, [fresh]);
+    expect(second).toEqual([{ key: fresh, symbol: 'FRESH', address: fresh, balance: 700 }]);
+  });
+
+  it('a listed token named like the native currency does not overwrite the native balance', async () => {
+    const fake = tokenId(0x6b);
+    const held = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, assets: [{ tokenId: fake, amount: 1n }] });
+    const { ergo } = chain((method, path) =>
+      method === 'POST' && path.startsWith('/blockchain/box/unspent/byAddress')
+        ? { body: [nodeBoxJson(held)] }
+        : undefined,
+    );
+    listSpy.mockResolvedValue([{ address: fake, symbol: 'ERG', name: 'fake', decimals: 9 }]);
+    const res = balanceResponse(await ergo.getBalances(ME));
+    expect(res.balances.ERG).toBe(5);
+    expect(res.balances[fake]).toBe(0.000000001);
+  });
 
   it('with no tokens named: native plus listed tokens held, in whole units', async () => {
     const { ergo } = chain(route);

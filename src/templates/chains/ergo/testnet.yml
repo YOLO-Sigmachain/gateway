@@ -12,6 +12,10 @@ nativeDecimals: 9
 # Miner fee per transaction, in the smallest unit of the native currency (nanoERG)
 minerFee: 1100000
 
+# Highest miner fee any transaction may pay, in nanoERG. A connector or request asking for
+# more (or for less than minerFee) is refused before signing. Defaults to 10 x minerFee.
+maxMinerFee: 11000000
+
 # ErgoTree (hex) of the miner fee output
 minerFeeErgoTree: 1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304
 

@@ -1,6 +1,7 @@
 import { Type } from '@sinclair/typebox';
 
 import { configuredDefaultWallet } from '../chains/default-wallet';
+import { getErgoNetworkConfig } from '../chains/ergo/ergo.config';
 import { getEthereumChainConfig, getEthereumNetworkConfig } from '../chains/ethereum/ethereum.config';
 import { getSolanaChainConfig, getSolanaNetworkConfig } from '../chains/solana/solana.config';
 import { DecimalNumber } from '../schemas/decimal-field';
@@ -197,7 +198,9 @@ export function resolveSwapConnector(chain: string, network: string, type: Tradi
   const swapProvider =
     chain === 'solana'
       ? getSolanaNetworkConfig(network)?.swapProvider
-      : getEthereumNetworkConfig(network)?.swapProvider;
+      : chain === 'ergo'
+        ? getErgoNetworkConfig(network).swapProvider
+        : getEthereumNetworkConfig(network)?.swapProvider;
 
   if (!swapProvider) {
     throw httpErrors.badRequest(

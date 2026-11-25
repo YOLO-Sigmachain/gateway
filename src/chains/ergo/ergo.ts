@@ -11,11 +11,12 @@ import * as path from 'path';
 
 import { rootPath } from '../../paths';
 import { TransactionStatusCode } from '../../schemas/chain-schema';
+import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 import { WalletTokenBalance } from '../wallet-balances';
 
 import { configuredAddressPrefixes, ErgoNetworkConfig, getErgoNetworkConfig, networks } from './ergo.config';
-import { bigintsToStrings, toAmount } from './ergo.json';
+import { bigintsToStrings, parseNodeJson, toAmount } from './ergo.json';
 import { ErgoNodeClient, ErgoNodeError, FetchLike, normalizeNodeBox, NodeTransaction } from './ergo.node-client';
 import { ErgoPendingTracker } from './ergo.pending';
 import { ErgoSigner, SignedErgoTransaction } from './ergo.signer';
@@ -59,6 +60,28 @@ export class AmbiguousTokenError extends Error {
   }
 }
 
+/**
+ * The node may or may not have taken the transaction: the connection failed, the node
+ * answered 5xx, or it answered 200 without an id. The transaction stays tracked (its
+ * inputs are not selected again); poll `txId` before doing the action again.
+ */
+export class ErgoSubmitOutcomeUnknownError extends ErgoNodeError {
+  readonly txId: string;
+
+  constructor(txId: string, cause: unknown) {
+    const nodeError = cause instanceof ErgoNodeError ? cause : undefined;
+    const causeText = cause instanceof Error ? cause.message : String(cause);
+    super(
+      nodeError?.status ?? 0,
+      `Submit outcome unknown for ${txId}; poll it before retrying`,
+      nodeError?.reason,
+      nodeError?.detail ?? causeText,
+    );
+    this.name = 'ErgoSubmitOutcomeUnknownError';
+    this.txId = txId;
+  }
+}
+
 export class Ergo {
   private static _instances: Record<string, Ergo> = {};
 
@@ -67,7 +90,9 @@ export class Ergo {
   readonly config: ErgoNetworkConfig;
   readonly node: ErgoNodeClient;
   readonly pending: ErgoPendingTracker;
-  private readonly tokenInfoCache = new Map<string, ErgoTokenInfo | null>();
+  private readonly tokenInfoCache = new Map<string, ErgoTokenInfo>();
+  /** One build-sign-submit at a time per wallet tree, so two sends never select the same boxes. */
+  private readonly sendLocks = new Map<string, Promise<unknown>>();
 
   constructor(network: string, options: { config?: ErgoNetworkConfig; fetch?: FetchLike; now?: () => number } = {}) {
     this.network = network;
@@ -78,7 +103,7 @@ export class Ergo {
       fetch: options.fetch,
     });
     const timeoutMs = this.config.pendingTxTimeoutBlocks * this.config.blockTimeSeconds * 1000;
-    this.pending = new ErgoPendingTracker(timeoutMs, options.now);
+    this.pending = new ErgoPendingTracker(timeoutMs, options.now, this.config.blockTimeSeconds * 1000);
   }
 
   public static async getInstance(network: string): Promise<Ergo> {
@@ -164,18 +189,22 @@ export class Ergo {
       }));
   }
 
-  /** A token by id: the token list first, then the node's index. Null if neither knows it. */
+  /**
+   * A token by id: the token list first, then the node's index. Null if neither knows it.
+   * Only hits are cached: the index may learn a token later (a fresh mint, a lagging index).
+   */
   async getTokenById(tokenId: string): Promise<ErgoTokenInfo | null> {
     const id = assertErgoId(tokenId, 'token id');
     const listed = (await this.getTokenList()).find((t) => t.address === id);
     if (listed) return listed;
-    if (this.tokenInfoCache.has(id)) return this.tokenInfoCache.get(id)!;
+    const cached = this.tokenInfoCache.get(id);
+    if (cached) return cached;
     const fromNode = await this.node.getToken(id);
     const info =
       fromNode && fromNode.decimals !== null
         ? { address: id, symbol: fromNode.name ?? id, name: fromNode.name ?? id, decimals: fromNode.decimals }
         : null;
-    this.tokenInfoCache.set(id, info);
+    if (info) this.tokenInfoCache.set(id, info);
     return info;
   }
 
@@ -228,7 +257,8 @@ export class Ergo {
 
     if (!requested) {
       result.push({ key: native, symbol: native, address: null, balance: nativeBalance });
-      const symbolCount = new Map<string, number>();
+      // the native symbol counts as taken: a listed token named like it is keyed by its id
+      const symbolCount = new Map<string, number>([[native.toLowerCase(), 1]]);
       for (const t of list) symbolCount.set(t.symbol.toLowerCase(), (symbolCount.get(t.symbol.toLowerCase()) ?? 0) + 1);
       for (const t of list) {
         const amount = held.get(t.address) ?? 0n;
@@ -247,6 +277,12 @@ export class Ergo {
       }
       const token = await this.getToken(name); // throws on an ambiguous symbol
       if (!token) {
+        // Without decimals the amount cannot be stated; a held token is never reported as 0.
+        if (isErgoId(name) && (held.get(name.toLowerCase()) ?? 0n) > 0n) {
+          throw httpErrors.serviceUnavailable(
+            `Token ${name.toLowerCase()} is held but the node has no decimals for it yet; retry`,
+          );
+        }
         result.push({ key: name, symbol: null, address: null, balance: 0 });
         continue;
       }
@@ -281,6 +317,18 @@ export class Ergo {
         throw new ErgoBuildError(`Input ${spec.box.boxId} is already spent by one of our pending transactions`);
       }
     }
+    // Nor can it read a box our own pending transaction spends: the node would reject it.
+    for (const box of request.dataInputs ?? []) {
+      if (this.pending.isSpent(box.boxId)) {
+        throw new ErgoBuildError(
+          `Data input ${box.boxId} is already spent by one of our pending transactions; read its successor`,
+        );
+      }
+    }
+    const { minerFee, maxMinerFee } = this.config;
+    if (request.fee !== undefined && (request.fee < minerFee || request.fee > maxMinerFee)) {
+      throw new ErgoBuildError(`fee ${request.fee} is outside the allowed range [${minerFee}, ${maxMinerFee}]`);
+    }
     const { height, minValuePerByte } = await this.getBuildState();
     const walletBoxes = request.walletBoxes ?? (await this.getSpendableBoxes(request.changeAddress));
     return buildUnsignedTransaction({
@@ -302,6 +350,14 @@ export class Ergo {
    */
   async signTransaction(built: BuiltErgoTransaction, signer: ErgoSigner): Promise<SignedErgoTransaction> {
     assertTransactionBalanced(built);
+    if (built.fee > this.config.maxMinerFee) {
+      throw new ErgoTransactionAssertionError(`fee ${built.fee} is above maxMinerFee ${this.config.maxMinerFee}`);
+    }
+    // The remainder of every selected box goes to change; it must come back to the signer.
+    const owned = new Set(signer.publicKeys.map((pk) => ('0008cd' + pk).toLowerCase()));
+    if (!owned.has(built.changeErgoTree)) {
+      throw new ErgoTransactionAssertionError("change goes to a tree that is not the signer's address");
+    }
     const headers = await this.node.getLastHeaders(10);
     const signed = await signer.signTransaction(built.unsigned, built.unsigned.inputs, built.unsigned.dataInputs, {
       headers,
@@ -310,31 +366,64 @@ export class Ergo {
     return signed;
   }
 
-  /** Submit through the node. Records the transaction so its boxes are not selected again. */
+  /**
+   * Submit through the node. The transaction is recorded before the POST, so its boxes are
+   * not selected again even when the node's answer is lost. A definite rejection (4xx)
+   * releases it and rethrows; any other failure keeps it tracked and throws
+   * ErgoSubmitOutcomeUnknownError carrying the transaction id.
+   */
   async submitTransaction(signed: SignedErgoTransaction, built: BuiltErgoTransaction): Promise<string> {
-    const txId = await this.node.submitTransaction(signed.json);
-    if (txId !== signed.id) {
-      logger.warn(`Ergo node returned id ${txId} for transaction ${signed.id}`);
-    }
+    const inputBoxIds = built.inputBoxes.map((b) => b.boxId);
     const outputs = signed.parsed.outputs.map((o, index) =>
       normalizeNodeBox({ ...o, transactionId: signed.id, index } as Record<string, unknown>),
     );
-    this.pending.record(
-      signed.id,
-      built.inputBoxes.map((b) => b.boxId),
-      outputs,
-    );
-    logger.info(`Submitted Ergo transaction ${signed.id} on ${this.network}`);
-    return signed.id;
+    this.pending.record(signed.id, inputBoxIds, outputs, signed.json);
+    let txId: string;
+    try {
+      txId = await this.node.submitTransaction(signed.json);
+    } catch (error) {
+      if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
+        this.pending.release(signed.id);
+        throw error;
+      }
+      throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
+    }
+    if (txId !== signed.id) {
+      // The node's id is the one that will confirm. The outputs' box ids derive from our id,
+      // so they are not offered as spendable; the inputs stay hidden under the node's id.
+      logger.error(`Ergo node returned id ${txId} for transaction ${signed.id}; tracking the node's id`);
+      this.pending.release(signed.id);
+      this.pending.record(txId, inputBoxIds, [], signed.json);
+    }
+    logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
+    return txId;
   }
 
   async sendTransaction(
     request: ErgoTransactionRequest,
     signer: ErgoSigner,
   ): Promise<{ txId: string; built: BuiltErgoTransaction }> {
-    const built = await this.buildTransaction(request);
-    const signed = await this.signTransaction(built, signer);
-    return { txId: await this.submitTransaction(signed, built), built };
+    return this.withLock(this.addressToErgoTree(request.changeAddress), async () => {
+      const built = await this.buildTransaction(request);
+      const signed = await this.signTransaction(built, signer);
+      return { txId: await this.submitTransaction(signed, built), built };
+    });
+  }
+
+  /** Run `fn` after every earlier call for the same key has settled. */
+  private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sendLocks.get(key) ?? Promise.resolve();
+    const run = previous.then(() => fn());
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.sendLocks.set(key, settled);
+    try {
+      return await run;
+    } finally {
+      if (this.sendLocks.get(key) === settled) this.sendLocks.delete(key);
+    }
   }
 
   /** Build an ERG and token transfer without signing it. */
@@ -368,10 +457,12 @@ export class Ergo {
     nanoErgs: bigint,
     tokens: ErgoTokenAmount[] = [],
   ): Promise<string> {
-    const wallet = await this.getWallet(fromAddress);
-    const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
-    const signed = await this.signTransaction(built, wallet.signer);
-    return this.submitTransaction(signed, built);
+    return this.withLock(this.addressToErgoTree(fromAddress), async () => {
+      const wallet = await this.getWallet(fromAddress);
+      const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
+      const signed = await this.signTransaction(built, wallet.signer);
+      return this.submitTransaction(signed, built);
+    });
   }
 
   // -------------------------------------------------------------------------------------
@@ -382,12 +473,27 @@ export class Ergo {
     const { fullHeight } = await this.node.getInfo();
     const base = { currentBlock: fullHeight, signature: txId, fee: null, error: null };
 
+    // The mempool first, then the index: a transaction that leaves the mempool between the
+    // two reads has moved into a block, which the index lookup or its lag check covers.
+    const unconfirmed = await this.node.getUnconfirmedTransaction(id);
+    if (unconfirmed) {
+      return {
+        ...base,
+        txBlock: null,
+        txStatus: TransactionStatusCode.PENDING,
+        fee: this.feeOf(unconfirmed),
+        txData: summarize(unconfirmed, 0),
+      };
+    }
+
     const confirmed = await this.node.getTransaction(id);
     if (confirmed) {
       const inclusionHeight = typeof confirmed.inclusionHeight === 'number' ? confirmed.inclusionHeight : null;
+      // The node's numConfirmations counts the blocks after the inclusion block (0 at the
+      // tip); the config counts the inclusion block too.
       const confirmations =
         typeof confirmed.numConfirmations === 'number'
-          ? confirmed.numConfirmations
+          ? confirmed.numConfirmations + 1
           : inclusionHeight !== null
             ? fullHeight - inclusionHeight + 1
             : 0;
@@ -402,21 +508,19 @@ export class Ergo {
       };
     }
 
-    const unconfirmed = await this.node.getUnconfirmedTransaction(id);
-    if (unconfirmed) {
-      return {
-        ...base,
-        txBlock: null,
-        txStatus: TransactionStatusCode.PENDING,
-        fee: this.feeOf(unconfirmed),
-        txData: summarize(unconfirmed, 0),
-      };
-    }
+    // The indexer can lag the chain; a transaction in a block it has not indexed yet looks
+    // unknown. Read the index height before any input box, so box reads are at least as
+    // fresh as the height the decision below is made on.
+    const indexed = await this.node.getIndexedHeight();
+    const chainHeight = Math.max(fullHeight, typeof indexed.fullHeight === 'number' ? indexed.fullHeight : fullHeight);
+    const indexBehind = indexed.indexedHeight < chainHeight;
 
     // Neither indexed nor in the mempool. Failed only on evidence: one of its inputs spent
     // by a different transaction, which we can check for transactions we submitted.
     const tracked = this.pending.get(id);
+    let inputsUnspent = false;
     if (tracked) {
+      inputsUnspent = true;
       for (const boxId of tracked.inputBoxIds) {
         const box = await this.node.getBox(boxId);
         if (box?.spentTransactionId && box.spentTransactionId !== id) {
@@ -429,18 +533,43 @@ export class Ergo {
             txData: null,
           };
         }
+        if (!box || box.spentTransactionId) inputsUnspent = false;
       }
     }
 
-    // The indexer can lag the chain; a transaction in a block it has not indexed yet looks
-    // unknown, so do not call it not-found until the index has caught up.
-    const indexed = await this.node.getIndexedHeight();
-    if (indexed.indexedHeight < fullHeight) {
+    if (indexBehind) {
       return {
         ...base,
         txBlock: null,
         txStatus: TransactionStatusCode.PENDING,
-        txData: { note: `node index at ${indexed.indexedHeight}, chain at ${fullHeight}; status not yet known` },
+        txData: { note: `node index at ${indexed.indexedHeight}, chain at ${chainHeight}; status not yet known` },
+      };
+    }
+
+    // Ours, every input still unspent on an index that has caught up, and the node holds
+    // it nowhere: it was dropped. Post it once more rather than forget it, since releasing
+    // would let a rebuild execute twice if the dropped one resurfaces.
+    if (tracked && inputsUnspent) {
+      try {
+        await this.node.submitTransaction(tracked.json);
+      } catch (error) {
+        if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
+          this.pending.release(id);
+          return {
+            ...base,
+            txBlock: null,
+            txStatus: TransactionStatusCode.FAILED,
+            error: error.detail ?? error.message,
+            txData: null,
+          };
+        }
+        throw error;
+      }
+      return {
+        ...base,
+        txBlock: null,
+        txStatus: TransactionStatusCode.PENDING,
+        txData: { note: 'rebroadcast: the node had dropped it' },
       };
     }
     return { ...base, txBlock: null, txStatus: TransactionStatusCode.NOT_FOUND, txData: null };
@@ -471,15 +600,29 @@ function summarize(tx: NodeTransaction, confirmations: number): Record<string, u
   }) as Record<string, unknown>;
 }
 
-/** The signed transaction spends, reads and creates exactly what was checked. */
+/**
+ * The signed transaction spends, reads and creates exactly what was checked. It reads the
+ * JSON that is submitted, not a parallel representation, and compares each input's context
+ * extension too: an extension picks the contract path the node runs.
+ */
 export function assertSignedMatches(built: BuiltErgoTransaction, signed: SignedErgoTransaction): void {
   const fail = (message: string): never => {
     throw new ErgoTransactionAssertionError(`signed transaction differs from the checked one: ${message}`);
   };
-  const tx = signed.parsed;
+  const tx = parseNodeJson<SignedErgoTransaction['parsed']>(signed.json);
   if (tx.id !== signed.id) fail('id');
   const ins = built.unsigned.inputs.map((i) => i.boxId);
   if (tx.inputs.length !== ins.length || tx.inputs.some((input, i) => input.boxId !== ins[i])) fail('inputs');
+  tx.inputs.forEach((input, i) => {
+    const want: Record<string, string> = built.unsigned.inputs[i].extension ?? {};
+    const got: Record<string, string> = input.spendingProof?.extension ?? {};
+    for (const k of new Set([...Object.keys(want), ...Object.keys(got)])) {
+      const g = got[k];
+      const w = want[k];
+      if (typeof g !== 'string' || typeof w !== 'string' || g.toLowerCase() !== w.toLowerCase())
+        fail(`input ${i} context variable ${k}`);
+    }
+  });
   const datas = built.unsigned.dataInputs.map((d) => d.boxId);
   if ((tx.dataInputs ?? []).length !== datas.length || (tx.dataInputs ?? []).some((d, i) => d.boxId !== datas[i]))
     fail('data inputs');

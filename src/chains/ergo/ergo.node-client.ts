@@ -217,6 +217,7 @@ export class ErgoNodeClient {
    */
   async getUnspentBoxesByAddress(address: string, query: UnspentQuery): Promise<ErgoBox[]> {
     const boxes: ErgoBox[] = [];
+    let lastBatchLength = 0;
     for (let page = 0; page < MAX_PAGES; page++) {
       const params = new URLSearchParams({
         offset: String(page * this.pageSize),
@@ -230,9 +231,17 @@ export class ErgoNodeClient {
         `/blockchain/box/unspent/byAddress?${params.toString()}`,
         { body: address, contentType: 'text/plain', notFoundIsNull: true },
       );
+      lastBatchLength = batch ? batch.length : 0;
       if (!batch || batch.length === 0) break;
       boxes.push(...batch.map(normalizeNodeBox));
       if (batch.length < this.pageSize) break;
+    }
+    // The last page was full: there are more boxes than the page limit lets us read.
+    if (lastBatchLength >= this.pageSize) {
+      throw new ErgoNodeError(
+        200,
+        `Address has more than ${MAX_PAGES * this.pageSize} unspent boxes; refusing to report a partial set`,
+      );
     }
     // A box can appear twice if the set moved between pages.
     const seen = new Set<string>();

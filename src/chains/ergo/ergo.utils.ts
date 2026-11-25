@@ -83,6 +83,14 @@ function numberToPlainString(value: number): string {
   if (/e/i.test(text)) {
     throw new Error(`Amount ${value} must be given as a decimal string`);
   }
+  // A decimal of at most 15 significant digits round-trips through a double exactly; more
+  // may already have been rounded by the time it is a number.
+  const significant = text.replace('.', '').replace(/^0+/, '');
+  if (significant.length > 15) {
+    throw new Error(
+      `Amount ${value} has more significant digits than a JSON number holds exactly; send it as a string`,
+    );
+  }
   return text;
 }
 
@@ -95,6 +103,8 @@ export function toDecimalNumber(amount: bigint, decimals: number): number {
 // Addresses. Fleet encodes any prefix, but an omitted network argument silently means
 // prefix 0 and its validation does not look at the network, so every call here takes the
 // prefix explicitly and every check compares it.
+
+const BASE58_ADDRESS_TEXT = /^[1-9A-HJ-NP-Za-km-z]{1,120}$/;
 
 export interface DecodedErgoAddress {
   address: string;
@@ -110,7 +120,11 @@ export function decodeErgoAddress(address: string): DecodedErgoAddress {
   try {
     decoded = ErgoAddress.decode(address);
   } catch {
-    throw new Error(`Invalid Ergo address: ${address}`);
+    // Echo the input only if it could be an address: text with spaces (a mnemonic pasted
+    // into the wrong field) or any other non-base58 text is never repeated back or logged.
+    throw new Error(
+      BASE58_ADDRESS_TEXT.test(address) ? `Invalid Ergo address: ${address}` : 'Invalid Ergo address (not base58)',
+    );
   }
   return { address, ergoTree: decoded.ergoTree, prefix: Number(decoded.network) };
 }

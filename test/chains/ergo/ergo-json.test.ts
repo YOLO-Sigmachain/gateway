@@ -150,6 +150,15 @@ describe('whole-unit conversion at the edge', () => {
     expect(() => parseUnits('-1', 9)).toThrow();
   });
 
+  it('parseUnits refuses a number with more significant digits than a double holds exactly (M6)', () => {
+    // both would otherwise come back one unit off, silently
+    // written as Number('...') so the literal reaches parseUnits as the double it rounds to
+    expect(() => parseUnits(Number('12345678.123456789'), 9)).toThrow('send it as a string');
+    expect(() => parseUnits(Number('9007199254740993'), 0)).toThrow('send it as a string');
+    expect(parseUnits(0.1, 9)).toBe(100000000n);
+    expect(parseUnits('12345678.123456789', 9)).toBe(12345678123456789n);
+  });
+
   it('toDecimalNumber builds the integer part from digits', () => {
     expect(toDecimalNumber(123456789012345678n, 9)).toBe(Number('123456789.012345678'));
     expect(toDecimalNumber(0n, 9)).toBe(0);

@@ -43,6 +43,19 @@ describe('mnemonic validation', () => {
     expect(normalizeMnemonic(`  ${MNEMONIC_B.split(' ').join('   \n ')}  `)).toBe(MNEMONIC_B);
   });
 
+  it('canonicalizes case, so a capitalised phrase derives the address every BIP-39 wallet gives', () => {
+    const capitalised = MNEMONIC_A.replace(/^abandon/, 'Abandon');
+    const upper = MNEMONIC_A.toUpperCase();
+    expect(normalizeMnemonic(capitalised)).toBe(MNEMONIC_A);
+    expect(normalizeMnemonic(upper)).toBe(MNEMONIC_A);
+    const canonical = deriveErgoAddress(MNEMONIC_A, 0);
+    expect(deriveErgoAddress(capitalised, 0)).toBe(canonical);
+    expect(deriveErgoAddress(upper, 0)).toBe(canonical);
+    // ethers lower-cases before deriving; the gateway must agree with it
+    const ethersPk = ethersUtils.HDNode.fromMnemonic(capitalised).derivePath("m/44'/429'/0'/0/0").publicKey;
+    expect(addressFromPublicKey(ethersPk.slice(2), 0)).toBe(canonical);
+  });
+
   it.each([
     ['bad checksum', 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon'],
     ['wrong word count', 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'],

@@ -20,6 +20,13 @@
       ],
       "description": "Miner fee per transaction in the smallest native unit"
     },
+    "maxMinerFee": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^[1-9][0-9]*$" }
+      ],
+      "description": "Highest miner fee a transaction may pay, in the smallest native unit; at least minerFee. Defaults to 10 x minerFee"
+    },
     "minerFeeErgoTree": {
       "type": "string",
       "pattern": "^([0-9a-fA-F]{2})+$",

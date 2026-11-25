@@ -27,7 +27,12 @@ const WORD_COUNTS = new Set([12, 15, 18, 21, 24]);
 export const INVALID_MNEMONIC_MESSAGE =
   'The secret is not a valid BIP-39 mnemonic (12, 15, 18, 21 or 24 English words with a valid checksum)';
 
-/** Whitespace-normalized phrase; throws INVALID_MNEMONIC_MESSAGE when it is not BIP-39. */
+/**
+ * The canonical phrase (lower-case words, single spaces), which is what every BIP-39 wallet
+ * derives the seed from; throws INVALID_MNEMONIC_MESSAGE when it is not BIP-39. Validation
+ * ignores case, so the phrase as typed must not reach the seed: 'Abandon ...' would derive
+ * a different key from the one Nautilus or the node gives for the same words.
+ */
 export function normalizeMnemonic(secret: unknown): string {
   if (typeof secret !== 'string') {
     throw new Error(INVALID_MNEMONIC_MESSAGE);
@@ -37,7 +42,7 @@ export function normalizeMnemonic(secret: unknown): string {
   if (!WORD_COUNTS.has(words.length) || !ethersUtils.isValidMnemonic(phrase)) {
     throw new Error(INVALID_MNEMONIC_MESSAGE);
   }
-  return phrase;
+  return ethersUtils.entropyToMnemonic(ethersUtils.mnemonicToEntropy(phrase));
 }
 
 /** The P2PK address of m/44'/429'/0'/0/0 for a network prefix. */
