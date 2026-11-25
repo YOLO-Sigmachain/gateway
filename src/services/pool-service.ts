@@ -83,8 +83,10 @@ export class PoolService {
         return SupportedChain.ETHEREUM;
       case 'solana':
         return SupportedChain.SOLANA;
+      case 'ergo':
+        return SupportedChain.ERGO;
       default:
-        throw new Error(`Unsupported chain: ${chain}. Supported chains: ethereum, solana`);
+        throw new Error(`Unsupported chain: ${chain}. Supported chains: ethereum, solana, ergo`);
     }
   }
 
@@ -317,6 +319,12 @@ export class PoolService {
       }
       if (!ethers.utils.isAddress(pool.quoteTokenAddress)) {
         throw new Error('Invalid Ethereum quote token address');
+      }
+    } else if (chainEnum === SupportedChain.ERGO) {
+      // An Ergo pool is named by its pool NFT id and a token by its id (all zeros: the native coin)
+      const ergoId = /^[0-9a-fA-F]{64}$/;
+      if (![pool.address, pool.baseTokenAddress, pool.quoteTokenAddress].every((a) => ergoId.test(a))) {
+        throw new Error('Invalid Ergo pool or token id: expected 64 hex characters');
       }
     }
 

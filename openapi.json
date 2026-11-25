@@ -1808,7 +1808,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "type": "string",
             "example": "meteora"
@@ -1905,7 +1906,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "type": "string",
             "example": "meteora"
@@ -1986,7 +1988,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "type": "string",
             "example": "meteora"
@@ -2065,7 +2068,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -2116,7 +2120,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -2171,7 +2176,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -2221,7 +2227,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -3395,7 +3402,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -3567,7 +3575,8 @@
               "meteora",
               "raydium",
               "uniswap",
-              "pancakeswap"
+              "pancakeswap",
+              "ergodex"
             ],
             "default": "meteora",
             "type": "string",
@@ -8006,7 +8015,8 @@
                 "meteora",
                 "raydium",
                 "uniswap",
-                "pancakeswap"
+                "pancakeswap",
+                "ergodex"
               ],
               "default": "meteora",
               "type": "string"
@@ -8104,7 +8114,8 @@
                 "meteora",
                 "raydium",
                 "uniswap",
-                "pancakeswap"
+                "pancakeswap",
+                "ergodex"
               ],
               "default": "meteora",
               "type": "string"
@@ -8211,7 +8222,8 @@
                 "meteora",
                 "raydium",
                 "uniswap",
-                "pancakeswap"
+                "pancakeswap",
+                "ergodex"
               ],
               "default": "meteora",
               "type": "string"
@@ -8312,7 +8324,8 @@
                 "meteora",
                 "raydium",
                 "uniswap",
-                "pancakeswap"
+                "pancakeswap",
+                "ergodex"
               ],
               "default": "meteora",
               "type": "string"
@@ -8472,7 +8485,8 @@
                 "meteora",
                 "raydium",
                 "uniswap",
-                "pancakeswap"
+                "pancakeswap",
+                "ergodex"
               ],
               "default": "meteora",
               "type": "string"

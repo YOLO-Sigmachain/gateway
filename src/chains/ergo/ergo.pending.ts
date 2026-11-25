@@ -96,11 +96,9 @@ export class ErgoPendingTracker {
     const tree = ergoTree.toLowerCase();
     const result = nodeBoxes.filter((box) => !this.spentBy.has(box.boxId));
     const listed = new Set(nodeBoxes.map((box) => box.boxId));
-    const nodeListed = new Set(listed);
+    const offered = this.offeredTransactions(new Set(listed));
     for (const tx of this.txs.values()) {
-      const recent = this.now() - tx.submittedAt < this.recentMs;
-      const nodeSeesASpend = tx.inputBoxIds.some((boxId) => !nodeListed.has(boxId));
-      if (!recent && !nodeSeesASpend) continue;
+      if (!offered.has(tx.txId)) continue;
       for (const output of tx.outputs) {
         if (output.ergoTree.toLowerCase() !== tree) continue;
         if (listed.has(output.boxId) || this.spentBy.has(output.boxId)) continue;
@@ -109,6 +107,50 @@ export class ErgoPendingTracker {
       }
     }
     return result;
+  }
+
+  /**
+   * The pending transactions whose outputs may be offered. A transaction is offered when
+   * every tracked transaction it spends from (its parents, for chained transactions) is
+   * offered, and either it was recorded less than `recentMs` ago or the node shows one of
+   * its inputs as spent. An input that is the output of a tracked parent never counts as
+   * "the node shows it spent" on its own: the node never listed it, so its absence says
+   * nothing. So when the node has forgotten a chain of our transactions, none of the
+   * chain's outputs is offered, not only the first transaction's.
+   */
+  private offeredTransactions(nodeListed: Set<string>): Set<string> {
+    const producer = new Map<string, string>();
+    for (const tx of this.txs.values()) for (const o of tx.outputs) producer.set(o.boxId, tx.txId);
+    const memo = new Map<string, boolean>();
+    const visit = (txId: string, depth: number): boolean => {
+      const known = memo.get(txId);
+      if (known !== undefined) return known;
+      const tx = this.txs.get(txId);
+      if (!tx || depth > this.txs.size) return false;
+      memo.set(txId, false); // a cycle cannot happen (ids are hashes); guard anyway
+      let ok = true;
+      let nodeSeesASpend = false;
+      for (const boxId of tx.inputBoxIds) {
+        const parent = producer.get(boxId);
+        if (parent !== undefined && parent !== txId) {
+          if (!visit(parent, depth + 1)) ok = false;
+        } else if (!nodeListed.has(boxId)) {
+          nodeSeesASpend = true;
+        }
+      }
+      // a spent parent output the node does not list is consistent with our chain having
+      // reached the node, once the parent itself is offered
+      if (ok && !nodeSeesASpend) {
+        nodeSeesASpend = tx.inputBoxIds.some((boxId) => producer.has(boxId) && !nodeListed.has(boxId));
+      }
+      const recent = this.now() - tx.submittedAt < this.recentMs;
+      const result = ok && (recent || nodeSeesASpend);
+      memo.set(txId, result);
+      return result;
+    };
+    const offered = new Set<string>();
+    for (const txId of this.txs.keys()) if (visit(txId, 0)) offered.add(txId);
+    return offered;
   }
 
   private expire(): void {

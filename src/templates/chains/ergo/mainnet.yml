@@ -34,3 +34,7 @@ confirmations: 1
 # Node request timeout in milliseconds, and page size for box queries
 nodeTimeoutMs: 10000
 boxPageSize: 100
+
+# Default connector for the unified trading routes when a request names none
+# (format: connector/type)
+swapProvider: ergodex/amm

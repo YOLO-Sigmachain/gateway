@@ -129,6 +129,10 @@ configurations:
     configurationPath: connectors/titan.yml
     schemaPath: titan-schema.json
 
+  $namespace ergodex:
+    configurationPath: connectors/ergodex.yml
+    schemaPath: ergodex-schema.json
+
   # API Keys (centralized)
   $namespace apiKeys:
     configurationPath: apiKeys.yml

@@ -55,7 +55,7 @@ describe('App Integration - Route Registration', () => {
       expect(all.map((c) => c.name)).toEqual(expect.arrayContaining(['jupiter', 'uniswap']));
 
       for (const connector of all) {
-        expect(['ethereum', 'solana']).toContain(connector.chain);
+        expect(['ethereum', 'solana', 'ergo']).toContain(connector.chain);
         expect(Array.isArray(connector.networks)).toBe(true);
         expect(connector.networks.length).toBeGreaterThan(0);
 

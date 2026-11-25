@@ -43,7 +43,7 @@
     "boxPageSize": { "type": "integer", "minimum": 1, "maximum": 500 },
     "swapProvider": {
       "type": "string",
-      "description": "Default swap provider for the unified trading routes (format: connector/type); none yet"
+      "description": "Default swap provider for the unified trading routes (format: connector/type), e.g. ergodex/amm"
     }
   },
   "required": [

@@ -1,6 +1,7 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
+import { ergodexNotSupported } from '../../connectors/ergodex/amm-routes/notSupported';
 import { getPositionsOwned as meteoraGetPositionsOwned } from '../../connectors/meteora/amm-routes/positionsOwned';
 import { PositionInfo, PositionInfoSchema } from '../../schemas/amm-schema';
 import { httpErrors } from '../../services/error-handler';
@@ -55,6 +56,8 @@ export const positionsOwnedRoute: FastifyPluginAsync = async (fastify) => {
               `positions-owned is not supported for ${connector}: fungible-LP AMMs have no enumerable ` +
                 'positions. Use position-info with a specific pool address instead.',
             );
+          case 'ergodex':
+            return ergodexNotSupported('positions-owned');
           default:
             throw httpErrors.badRequest(
               `Unsupported AMM connector: ${connector}. Supported: ${AMM_CONNECTORS.join(', ')}`,

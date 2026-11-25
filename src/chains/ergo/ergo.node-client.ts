@@ -248,6 +248,79 @@ export class ErgoNodeClient {
     return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
   }
 
+  /**
+   * Unspent boxes holding a token, one page (newest first). Without `includeUnconfirmed`
+   * this is the confirmed UTXO set only.
+   */
+  async getUnspentBoxesByTokenId(
+    tokenId: string,
+    query: UnspentQuery & { limit: number; offset?: number },
+  ): Promise<ErgoBox[]> {
+    const params = new URLSearchParams({
+      offset: String(query.offset ?? 0),
+      limit: String(Math.min(query.limit, this.pageSize)),
+      sortDirection: 'desc',
+      includeUnconfirmed: String(query.includeUnconfirmed),
+      excludeMempoolSpent: String(query.excludeMempoolSpent),
+    });
+    const batch = await this.request<Array<Record<string, unknown>>>(
+      'GET',
+      `/blockchain/box/unspent/byTokenId/${assertErgoId(tokenId, 'token id')}?${params.toString()}`,
+      { notFoundIsNull: true },
+    );
+    return (batch ?? []).map(normalizeNodeBox);
+  }
+
+  /**
+   * Every confirmed unspent box at an exact ErgoTree, paged at the client's page size.
+   * The node answers with a list (or, on some versions, `{ items, total }`).
+   */
+  async getUnspentBoxesByErgoTree(ergoTree: string, maxBoxes: number): Promise<ErgoBox[]> {
+    if (!/^([0-9a-fA-F]{2})+$/.test(ergoTree)) throw new Error('ergoTree must be hex');
+    const boxes: ErgoBox[] = [];
+    for (let offset = 0; offset < maxBoxes; offset += this.pageSize) {
+      const params = new URLSearchParams({
+        offset: String(offset),
+        limit: String(this.pageSize),
+        sortDirection: 'asc',
+        includeUnconfirmed: 'false',
+        excludeMempoolSpent: 'false',
+      });
+      const body = await this.request<Array<Record<string, unknown>> | { items?: Array<Record<string, unknown>> }>(
+        'POST',
+        `/blockchain/box/unspent/byErgoTree?${params.toString()}`,
+        { body: JSON.stringify(ergoTree.toLowerCase()), contentType: 'application/json', notFoundIsNull: true },
+      );
+      const batch = Array.isArray(body) ? body : (body?.items ?? []);
+      boxes.push(...batch.map(normalizeNodeBox));
+      if (batch.length < this.pageSize) {
+        const seen = new Set<string>();
+        return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
+      }
+    }
+    throw new ErgoNodeError(200, `More than ${maxBoxes} unspent boxes at this ErgoTree; refusing a partial set`);
+  }
+
+  /** Outputs of mempool transactions that hold a token (boxes not yet confirmed). */
+  async getUnconfirmedOutputsByTokenId(tokenId: string): Promise<ErgoBox[]> {
+    const batch = await this.request<Array<Record<string, unknown>>>(
+      'GET',
+      `/transactions/unconfirmed/outputs/byTokenId/${assertErgoId(tokenId, 'token id')}`,
+      { notFoundIsNull: true },
+    );
+    return (batch ?? []).map(normalizeNodeBox);
+  }
+
+  /** Whether a mempool transaction spends this box. */
+  async isSpentInMempool(boxId: string): Promise<boolean> {
+    const raw = await this.request<Record<string, unknown>>(
+      'GET',
+      `/transactions/unconfirmed/inputs/byBoxId/${assertErgoId(boxId, 'boxId')}`,
+      { notFoundIsNull: true },
+    );
+    return raw !== null;
+  }
+
   async getBox(boxId: string): Promise<(ErgoBox & { spentTransactionId?: string | null }) | null> {
     const raw = await this.request<Record<string, unknown>>(
       'GET',

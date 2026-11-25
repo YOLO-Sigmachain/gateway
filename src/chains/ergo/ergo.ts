@@ -82,6 +82,33 @@ export class ErgoSubmitOutcomeUnknownError extends ErgoNodeError {
   }
 }
 
+/**
+ * A fixed input of the transaction (a contract box such as a pool) is already spent: by
+ * one of our own pending transactions, or, on the node's evidence, by someone else. The
+ * transaction cannot confirm. Retryable: read the box's successor and build again.
+ * `nodeText` is the node's own rejection text when the node rejected the submit.
+ */
+export class ErgoInputSpentError extends Error {
+  readonly boxIds: string[];
+  readonly nodeText?: string;
+  readonly retryable = true;
+
+  constructor(message: string, boxIds: string[], nodeText?: string) {
+    super(nodeText ? `${message}. Node said: ${nodeText}` : message);
+    this.name = 'ErgoInputSpentError';
+    this.boxIds = boxIds;
+    this.nodeText = nodeText;
+  }
+}
+
+/** Node rejection text that means an input is not (or no longer) in the UTXO set. */
+const INPUT_GONE_TEXT = /double.?spend|utxo|missing input|input.{0,40}(not found|spent)|already spent/i;
+
+/** What a connector may check on the built transaction, inside the lock, before it is signed. */
+export interface ErgoSendOptions {
+  verify?: (built: BuiltErgoTransaction) => void | Promise<void>;
+}
+
 export class Ergo {
   private static _instances: Record<string, Ergo> = {};
 
@@ -314,7 +341,9 @@ export class Ergo {
     // A fixed input our own pending transaction already spends could only double-spend.
     for (const spec of request.inputs ?? []) {
       if (this.pending.isSpent(spec.box.boxId)) {
-        throw new ErgoBuildError(`Input ${spec.box.boxId} is already spent by one of our pending transactions`);
+        throw new ErgoInputSpentError(`Input ${spec.box.boxId} is already spent by one of our pending transactions`, [
+          spec.box.boxId,
+        ]);
       }
     }
     // Nor can it read a box our own pending transaction spends: the node would reject it.
@@ -354,8 +383,14 @@ export class Ergo {
       throw new ErgoTransactionAssertionError(`fee ${built.fee} is above maxMinerFee ${this.config.maxMinerFee}`);
     }
     // The remainder of every selected box goes to change; it must come back to the signer.
+    // The assertion above tied the change outputs to built.changeErgoTree; the outputs
+    // themselves are checked here too, so the decision rests on what is created.
     const owned = new Set(signer.publicKeys.map((pk) => ('0008cd' + pk).toLowerCase()));
-    if (!owned.has(built.changeErgoTree)) {
+    const changeTrees = [
+      built.changeErgoTree,
+      ...built.changeOutputIndexes.map((i) => built.unsigned.outputs[i]?.ergoTree),
+    ];
+    if (changeTrees.some((tree) => typeof tree !== 'string' || !owned.has(tree.toLowerCase()))) {
       throw new ErgoTransactionAssertionError("change goes to a tree that is not the signer's address");
     }
     const headers = await this.node.getLastHeaders(10);
@@ -371,11 +406,30 @@ export class Ergo {
    * not selected again even when the node's answer is lost. A definite rejection (4xx)
    * releases it and rethrows; any other failure keeps it tracked and throws
    * ErgoSubmitOutcomeUnknownError carrying the transaction id.
+   *
+   * A transaction with fixed inputs (a contract box such as a pool) must go through
+   * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
+   * two wallets cannot race each other for the same box inside this process.
    */
   async submitTransaction(signed: SignedErgoTransaction, built: BuiltErgoTransaction): Promise<string> {
+    if (built.fixedInputCount > 0) {
+      throw new ErgoBuildError(
+        'A transaction with fixed inputs must be sent with sendTransaction, which holds the wallet and input locks',
+      );
+    }
+    return this.submitSigned(signed, built);
+  }
+
+  private async submitSigned(signed: SignedErgoTransaction, built: BuiltErgoTransaction): Promise<string> {
     const inputBoxIds = built.inputBoxes.map((b) => b.boxId);
-    const outputs = signed.parsed.outputs.map((o, index) =>
-      normalizeNodeBox({ ...o, transactionId: signed.id, index } as Record<string, unknown>),
+    // One source for what is tracked: the JSON that is posted (and that assertSignedMatches
+    // read), not the signer's parallel parsed object.
+    const posted = parseNodeJson<SignedErgoTransaction['parsed']>(signed.json);
+    if (posted.id !== signed.id) {
+      throw new ErgoTransactionAssertionError('signed JSON carries a different transaction id');
+    }
+    const outputs = posted.outputs.map((o, index) =>
+      normalizeNodeBox({ ...o, transactionId: posted.id, index } as Record<string, unknown>),
     );
     this.pending.record(signed.id, inputBoxIds, outputs, signed.json);
     let txId: string;
@@ -384,6 +438,15 @@ export class Ergo {
     } catch (error) {
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
         this.pending.release(signed.id);
+        const fixed = built.inputBoxes.slice(0, built.fixedInputCount).map((b) => b.boxId);
+        const gone = fixed.length > 0 ? await this.spentFixedInputs(fixed, error) : [];
+        if (gone.length > 0) {
+          throw new ErgoInputSpentError(
+            `The node rejected the transaction: fixed input ${gone.join(', ')} is already spent`,
+            gone,
+            error.detail ?? error.reason ?? error.message,
+          );
+        }
         throw error;
       }
       throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
@@ -399,15 +462,61 @@ export class Ergo {
     return txId;
   }
 
+  /**
+   * Which of a rejected transaction's fixed inputs are gone: spent by a mempool
+   * transaction, or shown spent by the index. If the node's text says an input is missing
+   * and no lookup could say which, every fixed input is named. The lookups are best
+   * effort; a failed lookup is not evidence either way.
+   */
+  private async spentFixedInputs(boxIds: string[], rejection: ErgoNodeError): Promise<string[]> {
+    const gone: string[] = [];
+    for (const boxId of boxIds) {
+      try {
+        if (await this.node.isSpentInMempool(boxId)) {
+          gone.push(boxId);
+          continue;
+        }
+        const box = await this.node.getBox(boxId);
+        if (box?.spentTransactionId) gone.push(boxId);
+      } catch {
+        // no evidence from this lookup
+      }
+    }
+    if (gone.length === 0 && INPUT_GONE_TEXT.test(`${rejection.reason ?? ''} ${rejection.detail ?? ''}`)) {
+      return [...boxIds];
+    }
+    return gone;
+  }
+
+  /**
+   * Build, check, sign and submit under locks: one on the wallet (change) tree, so two
+   * sends from one wallet never select the same boxes, and one on each fixed input, so two
+   * wallets in this process never both build on the same contract box. Locks are taken in
+   * one global order, so two sends cannot wait on each other. `verify` runs on the built
+   * transaction after the conservation check would pass and before anything is signed.
+   */
   async sendTransaction(
     request: ErgoTransactionRequest,
     signer: ErgoSigner,
+    options: ErgoSendOptions = {},
   ): Promise<{ txId: string; built: BuiltErgoTransaction }> {
-    return this.withLock(this.addressToErgoTree(request.changeAddress), async () => {
+    const keys = [
+      `tree:${this.addressToErgoTree(request.changeAddress)}`,
+      ...(request.inputs ?? []).map((spec) => `box:${spec.box.boxId}`),
+    ];
+    return this.withLocks(keys, async () => {
       const built = await this.buildTransaction(request);
+      if (options.verify) await options.verify(built);
       const signed = await this.signTransaction(built, signer);
-      return { txId: await this.submitTransaction(signed, built), built };
+      return { txId: await this.submitSigned(signed, built), built };
     });
+  }
+
+  /** Hold every lock in `keys`, taken in sorted order, while `fn` runs. */
+  private async withLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    const sorted = [...new Set(keys)].sort();
+    const run = (i: number): Promise<T> => (i === sorted.length ? fn() : this.withLock(sorted[i], () => run(i + 1)));
+    return run(0);
   }
 
   /** Run `fn` after every earlier call for the same key has settled. */
@@ -457,11 +566,11 @@ export class Ergo {
     nanoErgs: bigint,
     tokens: ErgoTokenAmount[] = [],
   ): Promise<string> {
-    return this.withLock(this.addressToErgoTree(fromAddress), async () => {
+    return this.withLock(`tree:${this.addressToErgoTree(fromAddress)}`, async () => {
       const wallet = await this.getWallet(fromAddress);
       const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
       const signed = await this.signTransaction(built, wallet.signer);
-      return this.submitTransaction(signed, built);
+      return this.submitSigned(signed, built);
     });
   }
 

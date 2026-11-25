@@ -133,13 +133,17 @@ export const makeQuoteSwapRoute = (type: PoolType): FastifyPluginAsync => {
           const { chain, network } = parseChainNetwork(chainNetwork);
           const name = resolveSwapConnector(chain, network, type, connector);
           assertConnectorOnChain(name, chain, type);
-          const pool = await resolvePoolAddress(chain, network, type, name, baseToken, quoteToken, poolAddress);
+          const ops = getPoolOps(name, chain, type);
+          const pool =
+            !poolAddress && ops.resolvePool
+              ? await ops.resolvePool({ network, baseToken, quoteToken, side: side as 'BUY' | 'SELL', amount })
+              : await resolvePoolAddress(chain, network, type, name, baseToken, quoteToken, poolAddress);
 
           logger.info(
             `[trading/${type}] quote ${baseToken}-${quoteToken} on ${chain}/${network} via ${name} pool ${pool}`,
           );
 
-          const result = await getPoolOps(name, chain, type).quoteSwap({
+          const result = await ops.quoteSwap({
             network,
             poolAddress: pool,
             baseToken,
@@ -189,13 +193,17 @@ export const makeExecuteSwapRoute = (type: PoolType): FastifyPluginAsync => {
           const walletAddress = resolveWalletAddress(chain, requestedWallet);
           const name = resolveSwapConnector(chain, network, type, connector);
           assertConnectorOnChain(name, chain, type);
-          const pool = await resolvePoolAddress(chain, network, type, name, baseToken, quoteToken, poolAddress);
+          const ops = getPoolOps(name, chain, type);
+          const pool =
+            !poolAddress && ops.resolvePool
+              ? await ops.resolvePool({ network, baseToken, quoteToken, side: side as 'BUY' | 'SELL', amount })
+              : await resolvePoolAddress(chain, network, type, name, baseToken, quoteToken, poolAddress);
 
           logger.info(
             `[trading/${type}] execute ${side} ${amount} ${baseToken}-${quoteToken} on ${chain}/${network} via ${name} pool ${pool}`,
           );
 
-          const result = await getPoolOps(name, chain, type).executeSwap({
+          const result = await ops.executeSwap({
             network,
             walletAddress,
             poolAddress: pool,

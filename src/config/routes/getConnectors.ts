@@ -3,6 +3,7 @@ import { FastifyPluginAsync } from 'fastify';
 
 import { ZeroXConfig } from '../../connectors/0x/0x.config';
 import { DFlowConfig } from '../../connectors/dflow/dflow.config';
+import { ErgodexConfig } from '../../connectors/ergodex/ergodex.config';
 import { JupiterConfig } from '../../connectors/jupiter/jupiter.config';
 import { MeteoraConfig } from '../../connectors/meteora/meteora.config';
 import { OkxConfig } from '../../connectors/okx/okx.config';
@@ -96,6 +97,12 @@ export const connectorsConfig = [
     trading_types: [...TitanConfig.tradingTypes],
     chain: TitanConfig.chain,
     networks: [...TitanConfig.networks],
+  },
+  {
+    name: 'ergodex',
+    trading_types: [...ErgodexConfig.tradingTypes],
+    chain: ErgodexConfig.chain,
+    networks: [...ErgodexConfig.networks],
   },
 ];
 

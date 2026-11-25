@@ -79,8 +79,10 @@ export interface BuiltErgoTransaction {
   fee: bigint;
   feeErgoTree: string;
   changeErgoTree: string;
-  /** Indexes in `unsigned.outputs` of the change boxes. */
+  /** Indexes in `unsigned.outputs` of the change boxes: right before the fee box. */
   changeOutputIndexes: number[];
+  /** How many of `inputBoxes`, from the start, are the caller's fixed inputs; the rest were selected. */
+  fixedInputCount: number;
   mint?: ErgoTokenAmount;
   burn: ErgoTokenAmount[];
   minValuePerByte: bigint;
@@ -476,6 +478,7 @@ export function buildUnsignedTransaction(params: ErgoBuildParams): BuiltErgoTran
     feeErgoTree,
     changeErgoTree,
     changeOutputIndexes,
+    fixedInputCount: fixed.length,
     mint: params.mint ? { tokenId: params.mint.tokenId.toLowerCase(), amount: params.mint.amount } : undefined,
     burn: burn.map((b) => ({ tokenId: b.tokenId.toLowerCase(), amount: b.amount })),
     minValuePerByte,
@@ -528,7 +531,11 @@ function sameBox(eip12: Eip12BoxCandidate & { boxId: string }, box: ErgoBox): bo
  * inputs and data inputs are exactly the given boxes, in order, with valid box ids; ERG in
  * equals ERG out, with exactly one fee box, last, holding exactly the fee and nothing else;
  * for every token, in plus declared mint equals out plus declared burn; every output meets
- * the minimum box value; every output's creation height is at or above every input's.
+ * the minimum box value; every output's creation height is at or above every input's;
+ * the change outputs are the boxes right before the fee box and sit at the change tree,
+ * and every selected (not fixed) input sits at the change tree too. The last two read the
+ * outputs and inputs themselves, so a signer-ownership check of the change tree holds for
+ * the boxes that are actually created.
  */
 export function assertTransactionBalanced(built: BuiltErgoTransaction): void {
   const { unsigned, inputBoxes, dataInputBoxes, fee, feeErgoTree, minValuePerByte } = built;
@@ -561,6 +568,25 @@ export function assertTransactionBalanced(built: BuiltErgoTransaction): void {
   if (toAmount(feeBox.value) !== fee) fail(`fee box holds ${feeBox.value}, expected ${fee}`);
   if ((feeBox.assets ?? []).length > 0) fail('the fee box holds tokens');
   if (Object.keys(feeBox.additionalRegisters ?? {}).length > 0) fail('the fee box has registers');
+
+  // Change: the outputs the indexes name must be the ones right before the fee box, at
+  // the change tree, holding no registers. Selected inputs must be at the change tree.
+  const changeTree = built.changeErgoTree.toLowerCase();
+  const changeIndexes = built.changeOutputIndexes;
+  changeIndexes.forEach((index, k) => {
+    if (!Number.isInteger(index) || index !== outputs.length - 1 - changeIndexes.length + k)
+      fail('change outputs must be the boxes right before the fee box');
+    const box = outputs[index];
+    if (box.ergoTree.toLowerCase() !== changeTree) fail(`change output ${index} is not at the change address`);
+    if (Object.keys(box.additionalRegisters ?? {}).length > 0) fail(`change output ${index} has registers`);
+  });
+  const fixedCount = built.fixedInputCount;
+  if (!Number.isInteger(fixedCount) || fixedCount < 0 || fixedCount > inputBoxes.length)
+    fail('fixed input count is out of range');
+  inputBoxes.slice(fixedCount).forEach((box, k) => {
+    if (box.ergoTree.toLowerCase() !== changeTree)
+      fail(`selected input ${fixedCount + k} is not at the change address`);
+  });
 
   const ergIn = inputBoxes.reduce((s, b) => s + b.value, 0n);
   const ergOut = outputs.reduce((s, o) => s + toAmount(o.value, 'output value'), 0n);

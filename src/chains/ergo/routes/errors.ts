@@ -1,5 +1,5 @@
 import { httpErrors } from '../../../services/error-handler';
-import { AmbiguousTokenError } from '../ergo';
+import { AmbiguousTokenError, ErgoInputSpentError } from '../ergo';
 import { ErgoNodeError } from '../ergo.node-client';
 import { ErgoBuildError } from '../ergo.tx-builder';
 
@@ -11,6 +11,10 @@ import { ErgoBuildError } from '../ergo.tx-builder';
 export function toHttpError(error: unknown, action: string): Error {
   if (error && typeof error === 'object' && 'statusCode' in error) {
     return error as unknown as Error;
+  }
+  // a contract box someone spent first: retry after reading its successor
+  if (error instanceof ErgoInputSpentError) {
+    return httpErrors.createError(409, error.message);
   }
   // a request the builder cannot satisfy (including insufficient funds) is the caller's to fix
   if (error instanceof AmbiguousTokenError || error instanceof ErgoBuildError) {

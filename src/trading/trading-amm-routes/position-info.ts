@@ -1,6 +1,7 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
+import { ergodexNotSupported } from '../../connectors/ergodex/amm-routes/notSupported';
 import { getPositionInfo as meteoraGetPositionInfo } from '../../connectors/meteora/amm-routes/positionInfo';
 import { getPositionInfo as pancakeswapGetPositionInfo } from '../../connectors/pancakeswap/amm-routes/positionInfo';
 import { getPositionInfo as raydiumGetPositionInfo } from '../../connectors/raydium/amm-routes/positionInfo';
@@ -55,6 +56,8 @@ export const positionInfoRoute: FastifyPluginAsync = async (fastify) => {
             return await uniswapGetPositionInfo(network, poolAddress, walletAddress);
           case 'pancakeswap':
             return await pancakeswapGetPositionInfo(network, poolAddress, walletAddress);
+          case 'ergodex':
+            return ergodexNotSupported('position-info');
           default:
             throw httpErrors.badRequest(
               `Unsupported AMM connector: ${connector}. Supported: ${AMM_CONNECTORS.join(', ')}`,

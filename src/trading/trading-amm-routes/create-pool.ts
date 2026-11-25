@@ -1,6 +1,7 @@
 import { Static, Type } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
+import { ergodexNotSupported } from '../../connectors/ergodex/amm-routes/notSupported';
 import { createPool as meteoraCreatePool } from '../../connectors/meteora/amm-routes/createPool';
 import { createPool as pancakeswapCreatePool } from '../../connectors/pancakeswap/amm-routes/createPool';
 import { createPool as raydiumCreatePool } from '../../connectors/raydium/amm-routes/createPool';
@@ -139,6 +140,8 @@ export const createPoolRoute: FastifyPluginAsync = async (fastify) => {
               slippagePct,
             );
 
+          case 'ergodex':
+            return ergodexNotSupported('create-pool');
           default:
             throw httpErrors.badRequest(`Unsupported AMM connector: ${connector}`);
         }

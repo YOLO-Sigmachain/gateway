@@ -1,6 +1,7 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
+import { getPoolInfo as ergodexGetPoolInfo } from '../../connectors/ergodex/amm-routes/poolInfo';
 import { getPoolInfo as meteoraGetPoolInfo } from '../../connectors/meteora/amm-routes/poolInfo';
 import { getPoolInfo as pancakeswapGetPoolInfo } from '../../connectors/pancakeswap/amm-routes/poolInfo';
 import { getPoolInfo as raydiumGetPoolInfo } from '../../connectors/raydium/amm-routes/poolInfo';
@@ -29,6 +30,8 @@ export async function getAmmPoolInfo(connector: string, network: string, poolAdd
       return await uniswapGetPoolInfo(network, poolAddress);
     case 'pancakeswap':
       return await pancakeswapGetPoolInfo(network, poolAddress);
+    case 'ergodex':
+      return await ergodexGetPoolInfo(network, poolAddress);
     default:
       throw httpErrors.badRequest(`Unsupported AMM connector: ${connector}. Supported: ${AMM_CONNECTORS.join(', ')}`);
   }

@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "definitions": {
+    "amount": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "pattern": "^[0-9]+$" }
+      ]
+    },
+    "tree": { "type": "string", "pattern": "^([0-9a-fA-F]{2})+$" },
+    "network": {
+      "type": "object",
+      "properties": {
+        "useMempoolSuccessor": {
+          "type": "boolean",
+          "description": "Build on the newest unconfirmed successor of a pool box in the node's mempool"
+        },
+        "maxPoolFeePct": { "type": "number", "minimum": 0, "maximum": 100 },
+        "minPoolNativeReserve": { "$ref": "#/definitions/amount" },
+        "minPoolTokenReserve": { "$ref": "#/definitions/amount" },
+        "poolAllowlist": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "description": "Pool NFT ids; if not empty, only these pools may be traded"
+        },
+        "maxDiscoveredBoxes": { "type": "integer", "minimum": 1 },
+        "spectrum": {
+          "type": "object",
+          "properties": {
+            "n2tPoolTrees": { "type": "array", "items": { "$ref": "#/definitions/tree" } },
+            "t2tPoolTrees": { "type": "array", "items": { "$ref": "#/definitions/tree" } },
+            "feeDenominator": { "$ref": "#/definitions/amount" },
+            "n2tMinSuccessorValue": { "$ref": "#/definitions/amount" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "slippagePct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Default slippage percentage (e.g., 1 for 1%)"
+    },
+    "maxRebuilds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "Rebuilds after a rejection because the pool box was already spent"
+    },
+    "networks": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/network" }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["slippagePct", "maxRebuilds", "networks"]
+}

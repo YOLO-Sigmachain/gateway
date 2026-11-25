@@ -21,6 +21,10 @@ import { quoteSwap as zeroXQuoteSwap } from '../connectors/0x/router-routes/quot
 import { executeQuote as dflowExecuteQuote } from '../connectors/dflow/router-routes/executeQuote';
 import { executeSwap as dflowExecuteSwap } from '../connectors/dflow/router-routes/executeSwap';
 import { quoteSwap as dflowQuoteSwap } from '../connectors/dflow/router-routes/quoteSwap';
+import { executeSwap as ergodexExecuteSwap } from '../connectors/ergodex/amm-routes/executeSwap';
+import { fetchPools as ergodexFetchPools } from '../connectors/ergodex/amm-routes/fetchPools';
+import { quoteSwap as ergodexQuoteSwap } from '../connectors/ergodex/amm-routes/quoteSwap';
+import { resolvePool as ergodexResolvePool } from '../connectors/ergodex/amm-routes/resolvePool';
 import { executeQuote as jupiterExecuteQuote } from '../connectors/jupiter/router-routes/executeQuote';
 import { executeSwap as jupiterExecuteSwap } from '../connectors/jupiter/router-routes/executeSwap';
 import { quoteSwap as jupiterQuoteSwap } from '../connectors/jupiter/router-routes/quoteSwap';
@@ -125,11 +129,21 @@ interface RouterOps {
 }
 
 interface PoolOps {
-  chain: 'solana' | 'ethereum';
+  chain: 'solana' | 'ethereum' | 'ergo';
   quoteSwap: (args: PoolQuoteArgs) => Promise<any>;
   executeSwap: (args: PoolExecuteArgs) => Promise<any>;
   /** Only connectors whose DEX exposes a pool-discovery API implement this. */
   fetchPools?: (args: FetchPoolsArgs) => Promise<FetchPoolsResponseType>;
+  /** Optional: the connector picks the pool for a pair itself when the caller pins none. */
+  resolvePool?: (args: PoolResolveArgs) => Promise<string>;
+}
+
+export interface PoolResolveArgs {
+  network: string;
+  baseToken: string;
+  quoteToken: string;
+  side: 'BUY' | 'SELL';
+  amount: number;
 }
 
 // ============================================
@@ -375,6 +389,14 @@ const AMM_REGISTRY: Record<string, PoolOps> = {
         a.amount,
         a.slippagePct,
       ),
+  },
+  ergodex: {
+    chain: 'ergo',
+    quoteSwap: (a) => ergodexQuoteSwap(a.network, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct),
+    executeSwap: (a) =>
+      ergodexExecuteSwap(a.network, a.walletAddress, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct),
+    fetchPools: (a) => ergodexFetchPools({ network: a.network, limit: a.limit, query: a.query }),
+    resolvePool: ergodexResolvePool,
   },
 };
 

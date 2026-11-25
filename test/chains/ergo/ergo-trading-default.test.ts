@@ -9,6 +9,9 @@ import { mockConfigStorage } from '../../mocks/shared-mocks';
 
 import { FEE_TREE } from './ergo-test-helpers';
 
+const fs = jest.requireActual<typeof import('fs')>('fs');
+const path = jest.requireActual<typeof import('path')>('path');
+
 const ergoMainnet: Record<string, unknown> = {
   'ergo-mainnet.nodeURL': 'http://node.test:9053',
   'ergo-mainnet.addressPrefix': 0,
@@ -39,8 +42,15 @@ describe('default swap connector for chain ergo', () => {
   });
 
   it("reads ergo-mainnet.swapProvider, not Ethereum's", () => {
-    mockConfigStorage['ergo-mainnet.swapProvider'] = 'spectrum/router';
-    expect(resolveSwapConnector('ergo', 'mainnet', 'router')).toBe('spectrum');
+    mockConfigStorage['ergo-mainnet.swapProvider'] = 'ergodex/amm';
+    expect(resolveSwapConnector('ergo', 'mainnet', 'amm')).toBe('ergodex');
+  });
+
+  it('the shipped Ergo network templates name ergodex/amm, in the connector/type format', () => {
+    for (const net of ['mainnet', 'testnet']) {
+      const text = fs.readFileSync(path.join(__dirname, '../../../src/templates/chains/ergo', `${net}.yml`), 'utf8');
+      expect(text).toMatch(/^swapProvider: ergodex\/amm$/m);
+    }
   });
 
   it('with no ergo swapProvider configured, answers 400 naming ergo-mainnet', () => {
