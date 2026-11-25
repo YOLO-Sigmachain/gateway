@@ -71,6 +71,19 @@ configurations:
     configurationPath: chains/solana/devnet.yml
     schemaPath: solana-network-schema.json
 
+  # Ergo chain and networks
+  $namespace ergo:
+    configurationPath: chains/ergo.yml
+    schemaPath: ergo-chain-schema.json
+
+  $namespace ergo-mainnet:
+    configurationPath: chains/ergo/mainnet.yml
+    schemaPath: ergo-network-schema.json
+
+  $namespace ergo-testnet:
+    configurationPath: chains/ergo/testnet.yml
+    schemaPath: ergo-network-schema.json
+
   # Connectors
   $namespace uniswap:
     configurationPath: connectors/uniswap.yml

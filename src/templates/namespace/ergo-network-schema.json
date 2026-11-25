@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "nodeURL": {
+      "type": "string",
+      "description": "Ergo node with the extra indexer enabled; used for every read and submit"
+    },
+    "addressPrefix": {
+      "type": "integer",
+      "enum": [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240],
+      "description": "Network prefix of addresses on this network (0 Ergo mainnet, 16 Ergo testnet). Never read from the node."
+    },
+    "nativeCurrencySymbol": { "type": "string" },
+    "nativeDecimals": { "type": "integer", "minimum": 0, "maximum": 30 },
+    "minerFee": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^[1-9][0-9]*$" }
+      ],
+      "description": "Miner fee per transaction in the smallest native unit"
+    },
+    "minerFeeErgoTree": {
+      "type": "string",
+      "pattern": "^([0-9a-fA-F]{2})+$",
+      "description": "ErgoTree (hex) of the miner fee output"
+    },
+    "tokenListSource": {
+      "type": "string",
+      "description": "Token list file, relative to conf/ and inside conf/tokens/"
+    },
+    "blockTimeSeconds": { "type": "number", "exclusiveMinimum": 0 },
+    "pendingTxTimeoutBlocks": { "type": "integer", "minimum": 1 },
+    "confirmations": { "type": "integer", "minimum": 1 },
+    "nodeTimeoutMs": { "type": "integer", "minimum": 1 },
+    "boxPageSize": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "swapProvider": {
+      "type": "string",
+      "description": "Default swap provider for the unified trading routes (format: connector/type); none yet"
+    }
+  },
+  "required": [
+    "nodeURL",
+    "addressPrefix",
+    "nativeCurrencySymbol",
+    "nativeDecimals",
+    "minerFee",
+    "minerFeeErgoTree",
+    "tokenListSource",
+    "blockTimeSeconds",
+    "pendingTxTimeoutBlocks",
+    "confirmations"
+  ],
+  "additionalProperties": true
+}

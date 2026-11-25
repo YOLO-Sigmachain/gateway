@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "defaultNetwork": {
+      "type": "string",
+      "description": "Default network for Ergo operations; also the network whose address prefix a wallet added through /wallet/add is derived for"
+    },
+    "defaultNetworks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of networks to query for balance operations. If not specified, falls back to defaultNetwork only."
+    },
+    "defaultWallet": {
+      "type": "string",
+      "description": "Default wallet address for examples and testing"
+    }
+  },
+  "required": ["defaultNetwork", "defaultWallet"],
+  "additionalProperties": true
+}

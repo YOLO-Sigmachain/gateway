@@ -41,6 +41,12 @@ import {
 import { httpErrors } from '../services/error-handler';
 
 import { configuredDefaultWallet } from './default-wallet';
+import { getErgoChainConfig, getErgoNetworkConfig, networks as ergoNetworks } from './ergo/ergo.config';
+import { getErgoBalances } from './ergo/routes/balances';
+import { estimateGasErgo } from './ergo/routes/estimate-gas';
+import { pollErgoTransaction } from './ergo/routes/poll';
+import { getErgoStatus } from './ergo/routes/status';
+import { unwrapErgo, wrapErgo } from './ergo/routes/wrap';
 import {
   getEthereumChainConfig,
   getEthereumNetworkConfig,
@@ -113,6 +119,17 @@ const CHAINS: Record<string, ChainOps> = {
     unwrap: (fastify, network, address, amount) => unwrapEthereum(fastify, network, address, amount!),
     unwrapRequiresAmount: true,
   },
+  ergo: {
+    networks: ergoNetworks,
+    defaultNetwork: () => getErgoChainConfig().defaultNetwork,
+    status: (_fastify, network) => getErgoStatus(network),
+    estimateGas: (_fastify, network) => estimateGasErgo(network),
+    balances: (_fastify, network, address, tokens) => getErgoBalances(network, address, tokens),
+    poll: (_fastify, network, signature) => pollErgoTransaction(network, signature),
+    wrap: () => wrapErgo(),
+    unwrap: () => unwrapErgo(),
+    unwrapRequiresAmount: false,
+  },
 };
 
 export const SUPPORTED_CHAINS = Object.keys(CHAINS);
@@ -152,6 +169,7 @@ function resolveChain(chain: string, network?: string): { ops: ChainOps; network
   // Surfaces a misconfigured-but-listed network as a clear error rather than a
   // downstream failure inside the chain client.
   if (chain === 'solana') getSolanaNetworkConfig(resolved);
+  else if (chain === 'ergo') getErgoNetworkConfig(resolved);
   else getEthereumNetworkConfig(resolved);
 
   return { ops, network: resolved };

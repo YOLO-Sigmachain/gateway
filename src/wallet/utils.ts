@@ -1,6 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import fse from 'fs-extra';
 
+import { Ergo } from '../chains/ergo/ergo';
+import { addErgoWallet } from '../chains/ergo/ergo.wallet';
 import { Ethereum } from '../chains/ethereum/ethereum';
 import { Solana } from '../chains/solana/solana';
 import { updateDefaultWallet } from '../config/utils';
@@ -44,7 +46,7 @@ export function validateChainName(chain: string): boolean {
   } catch (error) {
     // Fallback to hardcoded list if there's an error
     logger.warn(`Failed to get supported chains: ${error.message}. Using fallback list.`);
-    return ['ethereum', 'solana'].includes(chain.toLowerCase());
+    return ['ethereum', 'solana', 'ergo'].includes(chain.toLowerCase());
   }
 }
 
@@ -83,6 +85,12 @@ export async function addWallet(fastify: FastifyInstance, req: AddWalletRequest)
   // Validate chain name
   if (!validateChainName(req.chain)) {
     throw fastify.httpErrors.badRequest(`Unrecognized chain name: ${req.chain}`);
+  }
+
+  // Ergo keys are mnemonics with their own validation; kept away from the error below,
+  // which echoes the start of the secret.
+  if (req.chain.toLowerCase() === 'ergo') {
+    return addErgoWallet(fastify, req, walletKey);
   }
 
   let connection: Chain;
@@ -159,6 +167,8 @@ export async function removeWallet(fastify: FastifyInstance, req: RemoveWalletRe
       validatedAddress = Ethereum.validateAddress(req.address);
     } else if (req.chain.toLowerCase() === 'solana') {
       validatedAddress = Solana.validateAddress(req.address);
+    } else if (req.chain.toLowerCase() === 'ergo') {
+      validatedAddress = Ergo.validateAddress(req.address);
     } else {
       // This should not happen due to validateChainName check, but just in case
       throw new Error(`Unsupported chain: ${req.chain}`);
@@ -273,7 +283,7 @@ export async function getWallets(
     await mkdirIfDoesNotExist(walletPath);
 
     // Get only valid chain directories
-    const validChains = ['ethereum', 'solana'];
+    const validChains = ['ethereum', 'solana', 'ergo'];
     const allDirs = await getDirectories(walletPath);
     const chains = allDirs.filter((dir) => validChains.includes(dir.toLowerCase()));
 
@@ -295,6 +305,8 @@ export async function getWallets(
             } else if (chain.toLowerCase() === 'solana') {
               // Basic Solana address length check
               return address.length >= 32 && address.length <= 44;
+            } else if (chain.toLowerCase() === 'ergo') {
+              return Ergo.validateAddress(address) === address;
             }
             return false;
           } catch {
@@ -377,6 +389,8 @@ export async function getAllWalletAddressesForChain(chain: string): Promise<stri
           return /^0x[a-fA-F0-9]{40}$/i.test(address);
         } else if (chainLower === 'solana') {
           return address.length >= 32 && address.length <= 44;
+        } else if (chainLower === 'ergo') {
+          return Ergo.validateAddress(address) === address;
         }
         return false;
       } catch {

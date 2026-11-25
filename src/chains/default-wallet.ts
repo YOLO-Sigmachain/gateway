@@ -1,3 +1,4 @@
+import { getErgoChainConfig } from './ergo/ergo.config';
 import { getEthereumChainConfig } from './ethereum/ethereum.config';
 import { getSolanaChainConfig } from './solana/solana.config';
 
@@ -9,5 +10,6 @@ import { getSolanaChainConfig } from './solana/solana.config';
  * until Gateway restarts.
  */
 export function configuredDefaultWallet(chain: string): string | undefined {
+  if (chain === 'ergo') return getErgoChainConfig().defaultWallet;
   return chain === 'solana' ? getSolanaChainConfig().defaultWallet : getEthereumChainConfig().defaultWallet;
 }

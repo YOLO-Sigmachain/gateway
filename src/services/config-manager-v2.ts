@@ -540,7 +540,7 @@ export class ConfigManagerV2 {
 
       const [chain] = namespace.split('-');
       // Only process known chains
-      if (['ethereum', 'solana'].includes(chain)) {
+      if (['ethereum', 'solana', 'ergo'].includes(chain)) {
         chainNetworks.push(namespace);
       }
     }

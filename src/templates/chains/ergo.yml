@@ -1,0 +1,7 @@
+defaultNetwork: mainnet
+defaultWallet: '<ergo-wallet-address>'
+
+# Optional: List of networks to query for balance operations
+# If not specified, only defaultNetwork is used
+defaultNetworks:
+  - mainnet

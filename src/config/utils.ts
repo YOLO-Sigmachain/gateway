@@ -4,7 +4,7 @@ import { ConfigManagerV2 } from '../services/config-manager-v2';
 import { logger } from '../services/logger';
 
 // Known blockchain chains for chain-network parsing
-const KNOWN_CHAINS = ['solana', 'ethereum'];
+const KNOWN_CHAINS = ['solana', 'ethereum', 'ergo'];
 
 /**
  * Is this config namespace a chain-network one, and if so which?

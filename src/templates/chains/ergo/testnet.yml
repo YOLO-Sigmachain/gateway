@@ -1,0 +1,32 @@
+# Ergo node with the extra indexer enabled (the /blockchain API). Every read and every
+# submit goes to this node; no explorer is used.
+nodeURL: http://127.0.0.1:9052
+
+# Network prefix used to encode and check addresses (0 mainnet, 16 testnet).
+# Taken from this file only, never from the node's /info.
+addressPrefix: 16
+
+nativeCurrencySymbol: ERG
+nativeDecimals: 9
+
+# Miner fee per transaction, in the smallest unit of the native currency (nanoERG)
+minerFee: 1100000
+
+# ErgoTree (hex) of the miner fee output
+minerFeeErgoTree: 1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304
+
+# Token list file, relative to conf/
+tokenListSource: tokens/ergo/testnet.json
+
+# Average block interval in seconds; pending-transaction tracking times out after
+# pendingTxTimeoutBlocks blocks of this length
+blockTimeSeconds: 120
+pendingTxTimeoutBlocks: 15
+
+# Number of blocks on top of (and including) the one holding a transaction before poll
+# reports it as confirmed
+confirmations: 1
+
+# Node request timeout in milliseconds, and page size for box queries
+nodeTimeoutMs: 10000
+boxPageSize: 100

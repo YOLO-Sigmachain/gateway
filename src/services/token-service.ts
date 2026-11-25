@@ -227,6 +227,13 @@ export class TokenService {
         }
         break;
 
+      case SupportedChain.ERGO:
+        // An Ergo token's address is its token id: 32 bytes of hex
+        if (!/^[0-9a-fA-F]{64}$/.test(token.address)) {
+          throw new Error('Invalid Ergo token id: expected 64 hex characters');
+        }
+        break;
+
       default:
         throw new Error(`Unsupported chain for validation: ${chain}`);
     }

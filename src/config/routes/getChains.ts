@@ -49,7 +49,7 @@ export const getChainsRoute: FastifyPluginAsync = async (fastify) => {
         const network = networkParts.join('-'); // Handle networks like mainnet-beta
 
         // Only process known chains
-        if (['ethereum', 'solana'].includes(chain)) {
+        if (['ethereum', 'solana', 'ergo'].includes(chain)) {
           if (!chainNetworks[chain]) {
             chainNetworks[chain] = [];
           }

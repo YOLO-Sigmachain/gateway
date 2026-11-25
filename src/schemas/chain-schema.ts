@@ -1,5 +1,6 @@
 import { Type, Static } from '@sinclair/typebox';
 
+import { networks as ergoNetworks } from '../chains/ergo/ergo.config';
 import { networks as ethereumNetworks } from '../chains/ethereum/ethereum.config';
 import { networks as solanaNetworks } from '../chains/solana/solana.config';
 
@@ -13,7 +14,7 @@ import { DecimalNumber } from './decimal-field';
  * Passing a network belonging to the other chain still fails, in resolveChain,
  * with a message naming the chain's own networks.
  */
-export const CHAIN_NETWORKS = [...new Set([...solanaNetworks, ...ethereumNetworks])];
+export const CHAIN_NETWORKS = [...new Set([...solanaNetworks, ...ethereumNetworks, ...ergoNetworks])];
 
 /**
  * Network selector shared by every chain route.

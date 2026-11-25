@@ -1,6 +1,7 @@
 import sensible from '@fastify/sensible';
 import { FastifyPluginAsync } from 'fastify';
 
+import { Ergo } from '../../chains/ergo/ergo';
 import { Ethereum } from '../../chains/ethereum/ethereum';
 import { Solana } from '../../chains/solana/solana';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
@@ -45,12 +46,16 @@ export const removeWalletRoute: FastifyPluginAsync = async (fastify) => {
 
       // Validate the address based on chain type
       let validatedAddress: string;
-      if (chain.toLowerCase() !== 'ethereum' && chain.toLowerCase() !== 'solana') {
+      if (!['ethereum', 'solana', 'ergo'].includes(chain.toLowerCase())) {
         throw new Error(`Unsupported chain: ${chain}`);
       }
       try {
         validatedAddress =
-          chain.toLowerCase() === 'ethereum' ? Ethereum.validateAddress(address) : Solana.validateAddress(address);
+          chain.toLowerCase() === 'ergo'
+            ? Ergo.validateAddress(address)
+            : chain.toLowerCase() === 'ethereum'
+              ? Ethereum.validateAddress(address)
+              : Solana.validateAddress(address);
       } catch (error) {
         throw fastify.httpErrors.badRequest(error.message);
       }
