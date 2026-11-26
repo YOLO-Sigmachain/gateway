@@ -12,6 +12,7 @@ import { getAvailableErgoNetworks, isErgoId, isHexBytes, parseUnits } from '../.
 import { AvailableNetworks } from '../../services/base';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
 
+import { ergoTreeTemplateHash } from './venues/lithos/lithos.deployment';
 import { encodeLong } from './venues/lithos/lithos.math';
 import { ergoTreeConstants } from './venues/spectrum/spectrum.math';
 
@@ -43,14 +44,26 @@ export interface LithosKindTemplates {
    * NFT, vault NFT): the bytes whose hash the provision guard names.
    */
   provisionLogicValue: string;
+  /**
+   * The node's template hash of `poolTree` (see `ergoTreeTemplateHash`): pools of this kind
+   * are discovered by it. Must match the hash of `poolTree`.
+   */
+  poolTemplateHash: string;
 }
 
 /** LithosDex pools (ERG/token "n2t" and token/token "t2t") on one network. */
 export interface LithosVenueConfig {
   /**
-   * Pool NFT ids the operator has checked and chosen. A LithosDex pool is offered (pool info, quote,
-   * swap, pool choice) only if it is listed here and passes the deployment check. Empty:
-   * no LithosDex pool is offered.
+   * true: with `poolAllowlist` empty, LithosDex pools are discovered by template hash and
+   * every one that passes the deployment check and the guards is offered. false: none is
+   * discovered; only the pools on `poolAllowlist` are offered, and none when it is empty.
+   */
+  discoverPools: boolean;
+  /**
+   * Empty: with `discoverPools`, every LithosDex pool found by template that passes the
+   * deployment check and the guards is offered; without it, none. Not empty: only these
+   * pool NFT ids are offered (and pools are not discovered), still only if they pass the
+   * same checks.
    */
   poolAllowlist: string[];
   /** The pool contracts' fee denominator (R5 holds the numerators). */
@@ -88,7 +101,7 @@ export interface ErgodexNetworkConfig {
   minPoolTokenReserve: bigint;
   /** If not empty, only these pools (by pool NFT id) may be traded. */
   poolAllowlist: string[];
-  /** Upper bound on boxes read per pool tree when discovering pools. */
+  /** Upper bound on boxes read per pool tree (or LithosDex template) when discovering pools. */
   maxDiscoveredBoxes: number;
   spectrum: SpectrumVenueConfig;
   /** Absent: no LithosDex venue on this network. */
@@ -172,13 +185,33 @@ function lithos(value: unknown, where: string): LithosVenueConfig | undefined {
   if (new Set(Object.values(sentinels)).size !== LITHOS_SENTINELS.length) {
     throw new Error(`${where}.sentinels must all differ`);
   }
+  if (typeof raw.discoverPools !== 'boolean') throw new Error(`${where}.discoverPools must be true or false`);
   const kind = (k: 'n2t' | 't2t'): LithosKindTemplates => {
     const block = (raw[k] ?? {}) as Record<string, unknown>;
     const out = {} as LithosKindTemplates;
     for (const name of LITHOS_KIND_TEMPLATES) out[name] = tree(block[name], `${where}.${k}.${name}`);
+    const hash = block.poolTemplateHash;
+    if (typeof hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hash)) {
+      throw new Error(
+        `${where}.${k}.poolTemplateHash must be 32 bytes of hex. LithosDex pools of this kind are discovered ` +
+          `on chain under this hash: with ${where}.discoverPools true and ${where}.poolAllowlist empty, every ` +
+          `pool found that passes the deployment check and the guards is offered (set ${where}.discoverPools ` +
+          'false to keep LithosDex off)',
+      );
+    }
+    // the hash discovery reads by must be the configured pool tree's
+    const expected = ergoTreeTemplateHash(out.poolTree);
+    if (hash.toLowerCase() !== expected) {
+      throw new Error(
+        `${where}.${k}.poolTemplateHash is not the template hash of ${where}.${k}.poolTree` +
+          (expected ? ` (${expected})` : ': the tree cannot be read'),
+      );
+    }
+    out.poolTemplateHash = expected;
     return out;
   };
   return {
+    discoverPools: raw.discoverPools,
     poolAllowlist: poolIds(raw.poolAllowlist, `${where}.poolAllowlist`),
     feeDenominator: required('feeDenominator'),
     accumulatorScale: required('accumulatorScale'),

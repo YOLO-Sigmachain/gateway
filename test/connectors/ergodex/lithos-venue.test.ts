@@ -2,13 +2,21 @@
  * The LithosDex venue without signing: reading pool boxes of both kinds, the contract's
  * acceptance rule on a successor and on the transaction's other inputs, the deployment
  * check (rebuilt trees and the single vault) on captured mainnet pools and on look-alikes,
- * the operator allowlist, the size and fee guards, pool choice across venues, and the
- * shipped config.
+ * the optional lithos allowlist, the size and fee guards, pool choice across venues, and
+ * the shipped config. Discovery by template hash is in `lithos-discovery.test.ts`.
  */
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
 import { Eip12BoxCandidate, ErgoBox } from '../../../src/chains/ergo/ergo.types';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
-import { blake2b256Hex, LithosDeployments } from '../../../src/connectors/ergodex/venues/lithos/lithos.deployment';
+import {
+  blake2b256Hex,
+  ergoTreeTemplateHash,
+  LithosDeployments,
+} from '../../../src/connectors/ergodex/venues/lithos/lithos.deployment';
 import {
   decodeLong,
   encodeBigInt,
@@ -324,13 +332,17 @@ describe('the allowlist, the guards and pool choice', () => {
 
   const vaultReads = () => state.calls.filter((c) => c.path.includes(LIT_VAULT.assets[0].tokenId)).length;
 
-  it('with an empty allowlist no LithosDex pool is offered, and its vault is never read', async () => {
-    const dex = makeLithosDex(state, lithosDexConfig([]));
-    await expect(dex.freshPlan(LIT_NFT, { tokenId: null, symbol: 'ERG', decimals: 9 }, 'SELL', ERG)).rejects.toThrow(
-      /not on the lithos poolAllowlist/,
+  it('with an empty allowlist a LithosDex pool that passes the deployment check and the guards is offered', async () => {
+    const dex = makeLithosDex(state, lithosDexConfig([], { minPoolNativeReserve: 100n * ERG }));
+    const lithosPlan = await dex.freshPlan(LIT_NFT, { tokenId: null, symbol: 'ERG', decimals: 9 }, 'SELL', ERG);
+    expect(lithosPlan.pool.venue).toBe('lithos');
+    expect(lithosPlan.swap.amountOut).toBe(241428628025n);
+    expect(vaultReads()).toBe(1);
+    // the dust pool passes the deployment check but not the native reserve floor
+    expect((await dex.getFreshPool(BBC_NFT)).pool.venue).toBe('lithos');
+    await expect(dex.freshPlan(BBC_NFT, { tokenId: null, symbol: 'ERG', decimals: 9 }, 'SELL', ERG)).rejects.toThrow(
+      /minPoolNativeReserve/,
     );
-    await expect(dex.getFreshPool(LIT_NFT)).rejects.toThrow(/not on the lithos poolAllowlist/);
-    expect(vaultReads()).toBe(0);
     // Spectrum is untouched
     const plan = await dex.freshPlan(
       RSN_POOL.assets[0].tokenId,
@@ -339,6 +351,15 @@ describe('the allowlist, the guards and pool choice', () => {
       ERG,
     );
     expect(plan.pool.venue).toBe('spectrum');
+  });
+
+  it('a pool off a non-empty lithos allowlist is refused, and its vault is never read', async () => {
+    const dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
+    await expect(dex.freshPlan(LIT_NFT, { tokenId: null, symbol: 'ERG', decimals: 9 }, 'SELL', ERG)).rejects.toThrow(
+      /not on the lithos poolAllowlist/,
+    );
+    await expect(dex.getFreshPool(LIT_NFT)).rejects.toThrow(/not on the lithos poolAllowlist/);
+    expect(vaultReads()).toBe(0);
   });
 
   it('a listed pool that passes the deployment check is offered, after its vault is read', async () => {
@@ -369,10 +390,14 @@ describe('the allowlist, the guards and pool choice', () => {
     expect(error.message).toMatch(/index has not caught up/);
   });
 
-  it('the guardFailure of the connector names the lithos allowlist too', () => {
+  it('the guardFailure of the connector names a non-empty lithos allowlist too; an empty one restricts nothing', () => {
     const dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
     const pool = venue.parsePool(LIT_POOL)!;
     expect(dex.guardFailure(pool)).toMatch(/not on the lithos poolAllowlist/);
+    expect(makeLithosDex(state, lithosDexConfig([])).guardFailure(pool)).toBeNull();
+    // the top-level allowlist still applies to LithosDex pools
+    const top = makeLithosDex(state, lithosDexConfig([], { poolAllowlist: [LIT_RSN_NFT] }));
+    expect(top.guardFailure(pool)).toMatch(/not on the allowlist/);
   });
 
   it('the native reserve floor applies to the ERG/token pool; a token/token pool is judged on its token reserves only', () => {
@@ -470,6 +495,19 @@ describe('the shipped config', () => {
   it('mainnet carries the LithosDex templates with an empty allowlist; testnet has no LithosDex venue', () => {
     const main = shippedMainnet();
     expect(main.lithos!.poolAllowlist).toEqual([]);
+    // LithosDex pools are discovered by template, by the operator's decision
+    expect(main.lithos!.discoverPools).toBe(true);
+    // the shipped guards: 3% fee ceiling, 100 ERG floor
+    expect(main.maxPoolFeePct).toBe('3');
+    expect(main.minPoolNativeReserve).toBe(100n * ERG);
+    // the template hashes, each that of its pool tree and of the captured pool boxes
+    expect(main.lithos!.n2t.poolTemplateHash).toBe('76fb608217788427bc0ee0c4f7319982b618d98857ba5c1c8753b2c12ee4c139');
+    expect(main.lithos!.t2t.poolTemplateHash).toBe('4b8ced39b69eb50b2474e8399034111bb7be6c49055110cd0396f0fe1570055a');
+    expect(ergoTreeTemplateHash(main.lithos!.n2t.poolTree)).toBe(main.lithos!.n2t.poolTemplateHash);
+    expect(ergoTreeTemplateHash(main.lithos!.t2t.poolTree)).toBe(main.lithos!.t2t.poolTemplateHash);
+    for (const box of [LIT_POOL, BBC_POOL])
+      expect(ergoTreeTemplateHash(box.ergoTree)).toBe(main.lithos!.n2t.poolTemplateHash);
+    expect(ergoTreeTemplateHash(LIT_RSN_POOL.ergoTree)).toBe(main.lithos!.t2t.poolTemplateHash);
     expect(main.lithos!.feeDenominator).toBe(10000n);
     expect(main.lithos!.accumulatorScale).toBe(10n ** 27n);
     expect(main.lithos!.lockedLiquidity).toBe(2n ** 63n - 1n);
@@ -507,5 +545,88 @@ describe('the shipped config', () => {
       get: (k: string) => (patched as Record<string, unknown>)[k.replace(/^ergodex\./, '')],
     } as never);
     expect(() => ErgodexConfig.network('mainnet')).toThrow(/lithos\.accumulatorScale must be set/);
+  });
+
+  it('a lithos block whose discoverPools is not a boolean is refused', () => {
+    const template = shippedTemplate();
+    const networks = template.networks as Record<string, Record<string, unknown>>;
+    for (const value of [undefined, 'false', 0]) {
+      const lithos = { ...(networks.mainnet.lithos as Record<string, unknown>), discoverPools: value };
+      const patched = { ...template, networks: { ...networks, mainnet: { ...networks.mainnet, lithos } } };
+      jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({
+        get: (k: string) => (patched as Record<string, unknown>)[k.replace(/^ergodex\./, '')],
+      } as never);
+      expect(() => ErgodexConfig.network('mainnet')).toThrow(/lithos\.discoverPools must be true or false/);
+    }
+  });
+
+  it('through the config loader: an old file without discoverPools is filled in as true; false is kept', () => {
+    const templates = path.join(__dirname, '../../../src/templates');
+    const schema = path.join(templates, 'namespace/ergodex-schema.json');
+    const templateFile = path.join(templates, 'connectors/ergodex.yml');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ergodex-discover-'));
+    try {
+      const load = (text: string) => {
+        const file = path.join(dir, 'ergodex.yml');
+        fs.writeFileSync(path.join(dir, 'root.yml'), 'version: 1\nconfigurations: {}\n');
+        fs.writeFileSync(file, text);
+        const manager = new ConfigManagerV2(path.join(dir, 'root.yml'));
+        manager.addNamespace('ergodex', schema, file, templateFile);
+        jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue(manager);
+        return ErgodexConfig.network('mainnet').lithos!;
+      };
+      const shipped = fs.readFileSync(templateFile, 'utf8');
+      expect(shipped.match(/^ {6}discoverPools: true$/gm)).toHaveLength(1);
+      // a file written before the key existed, with its empty allowlist: the merge fills in true
+      const old = shipped.replace(/^ {6}discoverPools: true\n/m, '');
+      expect(old).not.toMatch(/^\s*discoverPools:/m);
+      expect(load(old)).toMatchObject({ discoverPools: true, poolAllowlist: [] });
+      // false, as an operator sets it to keep LithosDex off, is kept
+      expect(load(shipped.replace(/^ {6}discoverPools: true$/m, '      discoverPools: false')).discoverPools).toBe(
+        false,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a lithos block without a pool template hash, or with one that is not its pool tree's, is refused", () => {
+    const template = shippedTemplate();
+    const networks = template.networks as Record<string, Record<string, unknown>>;
+    const shipped = networks.mainnet.lithos as Record<string, Record<string, unknown>>;
+    const load = (t2t: Record<string, unknown>) => {
+      const lithos = { ...shipped, t2t };
+      const patched = { ...template, networks: { ...networks, mainnet: { ...networks.mainnet, lithos } } };
+      jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({
+        get: (k: string) => (patched as Record<string, unknown>)[k.replace(/^ergodex\./, '')],
+      } as never);
+      return () => ErgodexConfig.network('mainnet');
+    };
+    const { poolTemplateHash: _h, ...noHash } = shipped.t2t;
+    expect(load(noHash)).toThrow(/lithos\.t2t\.poolTemplateHash must be 32 bytes of hex/);
+    // the message says what discovery does, and how to keep LithosDex off
+    expect(load(noHash)).toThrow(
+      /discovered on chain under this hash: with .*lithos\.discoverPools true .*every pool found .* is offered \(set .*lithos\.discoverPools false/,
+    );
+    // the ERG/token hash in the token/token block: the message names the right value
+    expect(load({ ...shipped.t2t, poolTemplateHash: shipped.n2t.poolTemplateHash })).toThrow(
+      /lithos\.t2t\.poolTemplateHash is not the template hash of .*lithos\.t2t\.poolTree \(4b8ced39/,
+    );
+    // upper case is read as the same hash
+    const upper = String(shipped.t2t.poolTemplateHash).toUpperCase();
+    expect(load({ ...shipped.t2t, poolTemplateHash: upper })().lithos!.t2t.poolTemplateHash).toBe(
+      shipped.t2t.poolTemplateHash,
+    );
+  });
+
+  it('an absent lithos allowlist is read as empty', () => {
+    const template = shippedTemplate();
+    const networks = template.networks as Record<string, Record<string, unknown>>;
+    const { poolAllowlist: _a, ...lithos } = networks.mainnet.lithos as Record<string, unknown>;
+    const patched = { ...template, networks: { ...networks, mainnet: { ...networks.mainnet, lithos } } };
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({
+      get: (k: string) => (patched as Record<string, unknown>)[k.replace(/^ergodex\./, '')],
+    } as never);
+    expect(ErgodexConfig.network('mainnet').lithos!.poolAllowlist).toEqual([]);
   });
 });

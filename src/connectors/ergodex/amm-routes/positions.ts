@@ -105,7 +105,7 @@ export async function getPositionsOwned(network: string, walletAddress: string):
     const dex = await Ergodex.getInstance(network);
     dex.assertLiquidityOffered();
     const held = await confirmedHoldings(dex.ergo, walletAddress);
-    const { pools, complete } = await dex.discoverPoolList();
+    const { pools, complete } = await dex.discoverPoolList({ liquidityOnly: true });
     if (!complete) {
       logger.warn(
         `ergodex: positions-owned on ${network} read only part of a pool tree (more than maxDiscoveredBoxes ` +

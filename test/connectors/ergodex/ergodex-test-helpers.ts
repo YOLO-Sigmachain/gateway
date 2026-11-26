@@ -156,6 +156,13 @@ export interface NodeState {
   mempoolSpent: Set<string>;
   /** Boxes at each tree (what byErgoTree returns). */
   byTree: Map<string, ErgoBox[]>;
+  /**
+   * Boxes under each template hash (what byTemplateHash returns), oldest first; a hash not
+   * set answers an empty list, as the node does.
+   */
+  byTemplate: Map<string, ErgoBox[]>;
+  /** Set: the node does not serve the byTemplateHash route (every call answers 404). */
+  noTemplateRoute?: boolean;
   wallet: ErgoBox[];
   /** Index view of a box (for `getBox`). */
   boxes: Map<string, Record<string, unknown>>;
@@ -187,6 +194,7 @@ export function newNodeState(): NodeState {
     mempool: new Map(),
     mempoolSpent: new Set(),
     byTree: new Map(),
+    byTemplate: new Map(),
     wallet: [],
     boxes: new Map(),
     submit: (body) => ({ body: JSON.stringify(JSON.parse(body).id) }),
@@ -200,7 +208,12 @@ export function newNodeState(): NodeState {
 
 /** Whether a pool box anywhere in the state holds this token as its NFT (slot 0). */
 function isPoolNft(state: NodeState, id: string): boolean {
-  const boxes = [...state.pools.values(), ...state.mempool.values(), ...state.byTree.values()].flat();
+  const boxes = [
+    ...state.pools.values(),
+    ...state.mempool.values(),
+    ...state.byTree.values(),
+    ...state.byTemplate.values(),
+  ].flat();
   return boxes.some((b) => b.assets[0]?.tokenId === id);
 }
 
@@ -257,6 +270,14 @@ export function stateNode(state: NodeState): FetchLike {
       const offset = Number(url.searchParams.get('offset'));
       const limit = Number(url.searchParams.get('limit'));
       return json((state.byTree.get(tree) ?? []).slice(offset, offset + limit));
+    }
+    if (method === 'GET' && (m = p.match(/^\/blockchain\/box\/unspent\/byTemplateHash\/([0-9a-f]{64})$/))) {
+      if (state.noTemplateRoute) return send(notFound);
+      const listed = state.byTemplate.get(m[1]) ?? [];
+      const ordered = url.searchParams.get('sortDirection') === 'desc' ? [...listed].reverse() : listed;
+      const offset = Number(url.searchParams.get('offset'));
+      const limit = Number(url.searchParams.get('limit'));
+      return json(ordered.slice(offset, offset + limit));
     }
     if (method === 'POST' && p === '/blockchain/box/unspent/byAddress') {
       const offset = Number(url.searchParams.get('offset'));

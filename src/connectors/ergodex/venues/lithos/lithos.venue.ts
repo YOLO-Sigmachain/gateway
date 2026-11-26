@@ -15,10 +15,12 @@
  *   [first side, second side], R7 and R8 BigInt fee accumulators of the two sides.
  * - Reserves are what the box holds on a side less that side's pending fee.
  *
- * A pool is recognised by the shape of a pinned pool template (any deployment's ids in
- * its terms) and offered only after the deployment check and the operator allowlist
- * (`admit`). The swap rule is in `lithos.math.ts`. Templates and contract constants come
- * from config.
+ * Pools are discovered on chain by their template hash (one per kind). A pool is
+ * recognised by the shape of a pinned pool template (any deployment's ids in its terms)
+ * and offered only after the deployment check (`admit`), then judged by the same guards
+ * as a Spectrum-style pool. The optional `poolAllowlist` restricts the venue to listed
+ * pools. The swap rule is in `lithos.math.ts`. Templates and contract constants come from
+ * config.
  */
 import { toAmount } from '../../../../chains/ergo/ergo.json';
 import { ErgoOutputSpec } from '../../../../chains/ergo/ergo.tx-builder';
@@ -217,9 +219,18 @@ export class LithosVenue implements Venue {
     return [lithosOf(pool).kind === 'n2t' ? 2 : 3];
   }
 
+  /**
+   * With a non-empty lithos poolAllowlist, a pool off it is refused. Empty: no restriction
+   * when `discoverPools` is set, else every pool is refused.
+   */
   guardFailure(pool: VenuePool): string | null {
-    if (!this.allow.has(pool.poolId.toLowerCase())) {
-      return `LithosDex pool ${pool.poolId} is not on the lithos poolAllowlist`;
+    if (this.allow.size > 0) {
+      return this.allow.has(pool.poolId.toLowerCase())
+        ? null
+        : `LithosDex pool ${pool.poolId} is not on the lithos poolAllowlist`;
+    }
+    if (!this.config.discoverPools) {
+      return `LithosDex pool ${pool.poolId} is not offered: lithos.discoverPools is false and lithos.poolAllowlist is empty`;
     }
     return null;
   }
@@ -228,7 +239,12 @@ export class LithosVenue implements Venue {
     return [...this.allow];
   }
 
-  /** The allowlist first (no node read), then the deployment check. */
+  /** The two kinds' template hashes; none when `discoverPools` is false. */
+  poolTemplateHashes(): string[] {
+    return this.config.discoverPools ? [this.config.n2t.poolTemplateHash, this.config.t2t.poolTemplateHash] : [];
+  }
+
+  /** The restriction list first (no node read), then the deployment check. */
   async admit(pool: VenuePool, node: VenueNodeReader): Promise<string | null> {
     const listed = this.guardFailure(pool);
     if (listed) return listed;

@@ -3,18 +3,19 @@
  * pools and LithosDex pools; Dexy is to follow as a further module.
  *
  * What this file holds, and nothing more: finding a pool box by its pool NFT on the node,
- * picking the venue that recognises the box's ErgoTree (Spectrum by exact tree, LithosDex
- * by its template's shape, bound to a real deployment only by the venue's admission
- * check, which runs before any pool is used), the guards from config (fee ceiling,
- * minimum size, allowlist), token resolution by id, and turning a quote into a
- * transaction request for the chain layer. Box selection, change, conservation, signing,
- * submit, locks and pending tracking are `src/chains/ergo`'s.
+ * discovering pools (Spectrum by exact tree, LithosDex by template hash), picking the
+ * venue that recognises the box's ErgoTree (Spectrum by exact tree, LithosDex by its
+ * template's shape, bound to a real deployment only by the venue's admission check, which
+ * runs before any pool is used), the guards from config (fee ceiling, minimum size,
+ * allowlist), which apply to every venue alike, token resolution by id, and turning a
+ * quote into a transaction request for the chain layer. Box selection, change,
+ * conservation, signing, submit, locks and pending tracking are `src/chains/ergo`'s.
  *
  * A pool is addressed by its pool NFT id, which is stable; box ids change at every swap.
  * Every quote and every execute reads the pool box fresh.
  */
 import { Ergo } from '../../chains/ergo/ergo';
-import { ErgoNodeError } from '../../chains/ergo/ergo.node-client';
+import { ErgoNodeError, normalizeNodeBox } from '../../chains/ergo/ergo.node-client';
 import { ErgoOutputSpec } from '../../chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../chains/ergo/ergo.types';
 import { formatUnits, isErgoId, NATIVE_COIN_ID, parseUnits, symbolForMessage } from '../../chains/ergo/ergo.utils';
@@ -48,16 +49,32 @@ export interface DiscoveredPool {
   lpTokenId?: string;
   /** How much of that LP token the box holds, when `lpTokenId` is set. */
   lpReserve?: bigint;
+  /**
+   * The pool as parsed from the discovered (confirmed) box: only for dropping a candidate
+   * the guards refuse before it is read live. Never priced or traded.
+   */
+  asDiscovered: VenuePool;
 }
 
-/** Discovery results per chain instance (one per network), by trees and limit. */
+/** Discovery results per chain instance (one per network), by sources and limit. */
 const discoveryCache = new WeakMap<
   Ergo,
   Map<string, { height: number; at: number; pools: DiscoveredPool[]; complete: boolean }>
 >();
 
+/** Where discovery reads a venue's pool boxes: an exact tree, or a template hash. */
+interface DiscoverySource {
+  venue: Venue;
+  by: 'tree' | 'template';
+  key: string;
+}
+
 function holdsPairIds(ids: Array<string | null>, a: TokenRef, b: TokenRef): boolean {
   return a.tokenId !== b.tokenId && ids.includes(a.tokenId) && ids.includes(b.tokenId);
+}
+
+function offersLiquidity(v: Venue): boolean {
+  return Boolean(v.liquidity && v.depositFor && v.redeemFor && v.liquiditySuccessor);
 }
 
 export interface FreshPool {
@@ -155,6 +172,8 @@ export class Ergodex {
   readonly root: ErgodexRootConfig;
   readonly venues: Venue[];
   private readonly spectrum: SpectrumVenue;
+  /** Whether discovery by template has been logged once on this network. */
+  private templateDiscoveryLogged = false;
 
   constructor(network: string, ergo: Ergo, config: ErgodexNetworkConfig, root: ErgodexRootConfig) {
     this.network = network;
@@ -291,8 +310,8 @@ export class Ergodex {
 
   /**
    * The pool, fresh from the node, with its venue. Only the venue's own admission applies
-   * (for LithosDex: the operator allowlist and the deployment check); the connector's
-   * guards do not.
+   * (for LithosDex: its restriction list when set, and the deployment check) and the
+   * pool NFT's single issue; the connector's guards do not.
    */
   async getFreshPool(
     poolId: string,
@@ -333,7 +352,7 @@ export class Ergodex {
   /** A 501 unless some venue on this network offers liquidity. */
   assertLiquidityOffered(): void {
     this.assertConfigured();
-    const offering = this.venues.filter((v) => v.liquidity && v.depositFor && v.redeemFor && v.liquiditySuccessor);
+    const offering = this.venues.filter(offersLiquidity);
     if (offering.length === 0) {
       throw httpErrors.createError(501, `No ergodex venue on ${this.network} offers liquidity`);
     }
@@ -420,7 +439,7 @@ export class Ergodex {
   async assertSoleLpClaimant(fresh: FreshLiquidityPool, amount: bigint): Promise<void> {
     const lpTokenId = fresh.lpToken.tokenId!;
     const poolId = fresh.pool.poolId;
-    const { pools, complete } = await this.discoverPoolList();
+    const { pools, complete } = await this.discoverPoolList({ liquidityOnly: true });
     const others = pools.filter(
       (p) => p.poolId !== poolId && p.lpTokenId === lpTokenId && (p.lpReserve ?? 0n) >= amount,
     );
@@ -468,23 +487,33 @@ export class Ergodex {
   }
 
   /**
-   * Every pool at the configured trees, from the node's index (confirmed boxes): its id,
-   * kind and tokens only, for choosing candidates; a candidate is always read live before
-   * it is priced. Boxes at a pool tree that are not pools (wrong token count, no R4) are
-   * skipped. A tree holding more than `maxDiscoveredBoxes` boxes is read in part, with a
-   * warning: a partial list can only miss a pool, and the pool used is still read fresh.
-   * The list is kept for one block time at one node height, so quotes do not re-read
-   * every pool box.
+   * Every pool at the configured trees and templates, from the node's index (confirmed
+   * boxes): its id, kind and tokens only, for choosing candidates; a candidate is always
+   * read live, and admitted by its venue (for LithosDex the deployment check), before it
+   * is priced. Spectrum-style pools are read by exact tree; LithosDex pools by template
+   * hash, since each pool's tree holds its own ids, unless lithos.discoverPools is false
+   * or the lithos poolAllowlist names the pools. Boxes that are not pools (another tree under the template, wrong token
+   * count, no R4) are skipped. A tree or template holding more than `maxDiscoveredBoxes`
+   * boxes is read in part, with a warning: a partial list can only miss a pool, and the
+   * pool used is still read fresh. The list is kept for one block time at one node height,
+   * so quotes do not re-read every pool box.
    */
   async discoverPools(): Promise<DiscoveredPool[]> {
     return (await this.discoverPoolList()).pools;
   }
 
-  /** The same list, and whether every pool tree was read whole (false: a pool can be missing). */
-  async discoverPoolList(): Promise<{ pools: DiscoveredPool[]; complete: boolean }> {
+  /**
+   * The same list, and whether every source was read whole (false: a pool can be
+   * missing). `liquidityOnly`: only venues that offer liquidity.
+   */
+  async discoverPoolList(
+    options: { liquidityOnly?: boolean } = {},
+  ): Promise<{ pools: DiscoveredPool[]; complete: boolean }> {
     this.assertConfigured();
-    const trees = this.venues.flatMap((venue) => (venue === this.spectrum ? this.spectrum.trees : []));
-    const key = `${this.config.maxDiscoveredBoxes}:${trees.join(',')}`;
+    const sources = this.discoverySources(options.liquidityOnly === true);
+    if (sources.length === 0) return { pools: [], complete: true };
+    const max = this.config.maxDiscoveredBoxes;
+    const key = `${max}:${sources.map((s) => `${s.venue.name}:${s.by}:${s.key}`).join(',')}`;
     const { fullHeight } = await this.ergo.node.getInfo();
     let cache = discoveryCache.get(this.ergo);
     if (!cache) discoveryCache.set(this.ergo, (cache = new Map()));
@@ -495,38 +524,112 @@ export class Ergodex {
     }
     const found: DiscoveredPool[] = [];
     let allRead = true;
-    for (const venue of this.venues) {
-      const venueTrees = venue === this.spectrum ? this.spectrum.trees : [];
-      for (const tree of venueTrees) {
-        const { boxes, complete } = await this.ergo.node.readUnspentBoxesByErgoTree(
-          tree,
-          this.config.maxDiscoveredBoxes,
+    for (const { venue, by, key: source } of sources) {
+      if (by === 'template' && !this.templateDiscoveryLogged) {
+        this.templateDiscoveryLogged = true;
+        logger.info(
+          `ergodex: LithosDex pools are being discovered by template (discoverPools: true) on ${this.network}`,
         );
-        if (!complete) {
-          allRead = false;
-          logger.warn(
-            `ergodex: more than ${this.config.maxDiscoveredBoxes} unspent boxes at a ${venue.name} pool tree on ` +
-              `${this.network}; choosing among the ${boxes.length} read. Raise maxDiscoveredBoxes or set poolAllowlist.`,
-          );
-        }
-        for (const box of boxes) {
-          if (box.ergoTree.toLowerCase() !== tree) continue;
-          const pool = venue.parsePool(box);
-          if (pool) {
-            const lpTokenId = venue.liquidity?.(pool)?.lpTokenId;
-            found.push({
-              poolId: pool.poolId,
-              venue: pool.venue,
-              kind: pool.kind,
-              tokenIds: [pool.x.tokenId, pool.y.tokenId],
-              ...(lpTokenId ? { lpTokenId, lpReserve: pool.box.assets[1].amount } : {}),
-            });
-          }
-        }
+      }
+      const { boxes, complete, notServed } =
+        by === 'tree'
+          ? { ...(await this.ergo.node.readUnspentBoxesByErgoTree(source, max)), notServed: false }
+          : await this.readUnspentBoxesByTemplateHash(source, max);
+      if (notServed) {
+        allRead = false;
+      } else if (!complete) {
+        allRead = false;
+        const restrict = venue === this.spectrum ? 'poolAllowlist' : `${venue.name}.poolAllowlist`;
+        logger.warn(
+          `ergodex: more than ${max} unspent boxes ${by === 'tree' ? 'at' : 'under'} a ${venue.name} pool ` +
+            `${by === 'tree' ? 'tree' : 'template'} on ${this.network}; choosing among the ${boxes.length} read. ` +
+            `Raise maxDiscoveredBoxes or set ${restrict}.`,
+        );
+      }
+      for (const box of boxes) {
+        // a box at another tree is not this source's: under a template, any tree whose
+        // constants differ from the pinned template's is junk
+        if (by === 'tree' ? box.ergoTree.toLowerCase() !== source : !venue.ownsTree(box.ergoTree)) continue;
+        const pool = venue.parsePool(box);
+        if (!pool) continue;
+        const lpTokenId = venue.liquidity?.(pool)?.lpTokenId;
+        found.push({
+          poolId: pool.poolId,
+          venue: pool.venue,
+          kind: pool.kind,
+          tokenIds: [pool.x.tokenId, pool.y.tokenId],
+          ...(lpTokenId ? { lpTokenId, lpReserve: pool.box.assets[1].amount } : {}),
+          asDiscovered: pool,
+        });
       }
     }
     cache.set(key, { height: fullHeight, at: Date.now(), pools: found, complete: allRead });
     return { pools: found, complete: allRead };
+  }
+
+  /**
+   * What discovery reads: each Spectrum pool tree, and each template hash of a venue
+   * found by template (LithosDex) unless that venue is restricted to listed pools or its
+   * discovery is switched off (no template hashes).
+   */
+  private discoverySources(liquidityOnly: boolean): DiscoverySource[] {
+    const sources: DiscoverySource[] = [];
+    for (const venue of this.venues) {
+      if (liquidityOnly && !offersLiquidity(venue)) continue;
+      if (venue === this.spectrum) {
+        for (const tree of this.spectrum.trees) sources.push({ venue, by: 'tree', key: tree });
+      } else if ((venue.candidatePoolIds?.() ?? []).length === 0) {
+        for (const hash of venue.poolTemplateHashes?.() ?? []) sources.push({ venue, by: 'template', key: hash });
+      }
+    }
+    return sources;
+  }
+
+  /**
+   * Confirmed unspent boxes the node's index files under a template hash, newest first
+   * (a pool box is re-created at every swap, so a pool that trades stays inside the cap
+   * however many older boxes sit under the template), in pages of the chain's box page
+   * size: at most about `maxBoxes`, and `complete` false when there are more. A GET; the
+   * node answers an empty list for a hash it has no box under. A 404 means the node does
+   * not serve this route: `complete` false and `notServed` true, with a warning, and the
+   * boxes read so far.
+   */
+  private async readUnspentBoxesByTemplateHash(
+    hash: string,
+    maxBoxes: number,
+  ): Promise<{ boxes: ErgoBox[]; complete: boolean; notServed: boolean }> {
+    if (!isErgoId(hash)) throw new Error('a template hash is 32 bytes of hex');
+    const pageSize = this.ergo.config.boxPageSize;
+    const boxes: ErgoBox[] = [];
+    const unique = () => {
+      const seen = new Set<string>();
+      return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
+    };
+    for (let offset = 0; offset < maxBoxes; offset += pageSize) {
+      const params = new URLSearchParams({
+        offset: String(offset),
+        limit: String(pageSize),
+        sortDirection: 'desc',
+        includeUnconfirmed: 'false',
+        excludeMempoolSpent: 'false',
+      });
+      const body = await this.ergo.node.request<
+        Array<Record<string, unknown>> | { items?: Array<Record<string, unknown>> }
+      >('GET', `/blockchain/box/unspent/byTemplateHash/${hash.toLowerCase()}?${params.toString()}`, {
+        notFoundIsNull: true,
+      });
+      if (body === null) {
+        logger.warn(
+          `ergodex: the node at ${this.network} answered 404 for GET /blockchain/box/unspent/byTemplateHash/` +
+            `${hash.toLowerCase()}: it does not serve this route, so pools under this template are not discovered`,
+        );
+        return { boxes: unique(), complete: false, notServed: true };
+      }
+      const batch = Array.isArray(body) ? body : (body.items ?? []);
+      boxes.push(...batch.map(normalizeNodeBox));
+      if (batch.length < pageSize) return { boxes: unique(), complete: true, notServed: false };
+    }
+    return { boxes: unique(), complete: false, notServed: false };
   }
 
   // ------------------------------------------------------------------------------------
@@ -733,17 +836,21 @@ export class Ergodex {
     const base = await this.resolveToken(baseName);
     const quote = await this.resolveToken(quoteName);
     const raw = toRaw(amount, base);
-    // Pools found by tree (Spectrum-style), and the pools a venue offers by id (LithosDex:
-    // its allowlist, since its pool tree differs per deployment). Every candidate is read
-    // live and must hold the pair.
+    // Pools found by discovery (Spectrum by tree, LithosDex by template), and the pools of a
+    // venue restricted to listed ones (a non-empty lithos poolAllowlist). A discovered pool
+    // the guards refuse on its discovered box is dropped before any live read. Every
+    // candidate is read live, admitted by its venue, must hold the pair, and must pass the
+    // guards again on the live box.
     const ids =
       this.config.poolAllowlist.length > 0
         ? this.config.poolAllowlist
         : [
-            ...(this.spectrum.configured ? await this.discoverPools() : [])
-              .filter((p) => holdsPairIds(p.tokenIds, base, quote))
-              .map((p) => p.poolId),
-            ...this.venues.flatMap((v) => v.candidatePoolIds?.() ?? []),
+            ...new Set([
+              ...(await this.discoverPools())
+                .filter((p) => holdsPairIds(p.tokenIds, base, quote) && !this.guardFailure(p.asDiscovered))
+                .map((p) => p.poolId),
+              ...this.venues.flatMap((v) => v.candidatePoolIds?.() ?? []),
+            ]),
           ];
     const candidates = await this.livePools(ids);
     let best: { poolId: string; score: bigint } | null = null;
@@ -773,13 +880,21 @@ export class Ergodex {
     return holdsPairIds([pool.x.tokenId, pool.y.tokenId], a, b);
   }
 
-  /** Each pool read live; a pool that is gone, invalid or ambiguous right now is skipped. */
+  /**
+   * Each pool read live; a pool that is gone, invalid or ambiguous right now is skipped,
+   * and so is one whose read meets a node error that may pass (unreachable, or a 5xx),
+   * with a warning.
+   */
   private async livePools(ids: string[]): Promise<FreshPool[]> {
     const pools: FreshPool[] = [];
     for (const id of ids) {
       try {
         pools.push(await this.getFreshPool(id));
       } catch (error) {
+        if (error instanceof ErgoNodeError && (error.status === 0 || error.status >= 500)) {
+          logger.warn(`ergodex: pool ${id} skipped for this choice: the node read failed (${error.message})`);
+          continue;
+        }
         if ((error as { statusCode?: number }).statusCode === undefined) throw error;
       }
     }

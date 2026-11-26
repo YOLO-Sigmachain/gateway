@@ -126,14 +126,25 @@ export interface Venue {
   unchangedTokenIndexes?(pool: VenuePool): number[];
   /**
    * Whether this pool may be offered at all, read from the node if need be (for example a
-   * deployment check and an operator allowlist): null when it may, else the reason.
+   * deployment check, and the venue's own restriction list): null when it may, else the reason.
    * Absent: every parsed pool may be offered.
    */
   admit?(pool: VenuePool, node: VenueNodeReader): Promise<string | null>;
   /** A venue's own guard on a parsed pool, beside the connector's: null, or the reason to refuse. */
   guardFailure?(pool: VenuePool): string | null;
-  /** Pool ids this venue offers when a pool is chosen by pair (beside discovery by tree). */
+  /**
+   * The pool ids this venue is restricted to, when the operator lists some: then these
+   * are its only candidates when a pool is chosen by pair, and its pools are not
+   * discovered. Absent or empty: no restriction.
+   */
   candidatePoolIds?(): string[];
+  /**
+   * Template hashes the node's index lists this venue's pool boxes under, for discovery
+   * of a venue whose pool tree differs per pool (see `ergoTreeTemplateHash`); empty when
+   * the venue's pools are not to be discovered. Every box found is still matched by
+   * `ownsTree` and `parsePool`, and `admit` runs before use.
+   */
+  poolTemplateHashes?(): string[];
   /**
    * Liquidity by direct spend of the pool box (a deposit or redeem in the trader's own
    * transaction). Absent: this venue offers no liquidity routes. `liquidityRefusal` says

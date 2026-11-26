@@ -25,6 +25,10 @@ import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBox, ErgoTokenInfo, NodeHeaderJson } from '../../../src/chains/ergo/ergo.types';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig, ErgodexNetworkConfig, LithosVenueConfig } from '../../../src/connectors/ergodex/ergodex.config';
+import {
+  ergoTreeTemplateHash,
+  LithosDeployments,
+} from '../../../src/connectors/ergodex/venues/lithos/lithos.deployment';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
 import { testConfig } from '../../chains/ergo/ergo-test-helpers';
 
@@ -32,6 +36,7 @@ import {
   dexConfig,
   fixturePool,
   fixtureText,
+  makeBox,
   ME,
   ME_TREE,
   MNEMONIC_A,
@@ -129,13 +134,56 @@ export function lithosNode(state: NodeState): FetchLike {
   };
 }
 
-/** Pools and their vaults on the stand-in node, by token id. */
+/**
+ * Pools and their vaults on the stand-in node, by token id, and each pool box under its
+ * tree's template hash (as the node's index files it).
+ */
 export function putPools(state: NodeState, pairs: Array<[ErgoBox, ErgoBox | ErgoBox[]]>): void {
   for (const [pool, vault] of pairs) {
     state.pools.set(pool.assets[0].tokenId, [pool]);
+    putUnderTemplate(state, pool);
     const vaults = Array.isArray(vault) ? vault : [vault];
     if (vaults.length > 0) state.pools.set(vaults[0].assets[0].tokenId, vaults);
   }
+}
+
+/** A box listed under its tree's template hash on the stand-in node. */
+export function putUnderTemplate(state: NodeState, box: ErgoBox): void {
+  const hash = ergoTreeTemplateHash(box.ergoTree)!;
+  state.byTemplate.set(hash, [...(state.byTemplate.get(hash) ?? []), box]);
+}
+
+/**
+ * A synthetic LithosDex deployment that passes the deployment check: the pool and vault
+ * trees rebuilt from new ids, the pool box a copy of `like` with those ids (and any
+ * register or value changes), and its single vault box.
+ */
+export function syntheticPool(
+  like: ErgoBox,
+  ids: { poolNft: string; vaultNft: string; provisionToken: string },
+  over: { registers?: Record<string, string>; value?: bigint; tokenAmounts?: bigint[] } = {},
+): { pool: ErgoBox; vault: ErgoBox } {
+  const kind = like.assets.length === 3 ? 'n2t' : 't2t';
+  const trees = new LithosDeployments(lithosConfig()).rebuild({ kind, ...ids });
+  const n = like.assets.length;
+  const assets = like.assets.map((a, i) => ({
+    tokenId: i === 0 ? ids.poolNft : i === n - 1 ? ids.provisionToken : a.tokenId,
+    amount: over.tokenAmounts?.[i] ?? a.amount,
+  }));
+  const pool = makeBox({
+    ergoTree: trees.poolTree,
+    value: over.value ?? like.value,
+    assets,
+    registers: { ...like.additionalRegisters, ...(over.registers ?? {}) },
+    creationHeight: like.creationHeight,
+  });
+  const vault = makeBox({
+    ergoTree: trees.feeVaultTree,
+    value: 1000000n,
+    assets: [{ tokenId: ids.vaultNft, amount: 1n }],
+    creationHeight: like.creationHeight,
+  });
+  return { pool, vault };
 }
 
 /** A connector on the stand-in node with the LithosDex venue. */

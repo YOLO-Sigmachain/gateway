@@ -15,9 +15,13 @@
       "properties": {
         "poolTree": { "$ref": "#/definitions/tree" },
         "feeVaultTree": { "$ref": "#/definitions/tree" },
-        "provisionLogicValue": { "$ref": "#/definitions/tree" }
+        "provisionLogicValue": { "$ref": "#/definitions/tree" },
+        "poolTemplateHash": {
+          "$ref": "#/definitions/id",
+          "description": "The node's template hash of poolTree; pools of this kind are discovered by it"
+        }
       },
-      "required": ["poolTree", "feeVaultTree", "provisionLogicValue"],
+      "required": ["poolTree", "feeVaultTree", "provisionLogicValue", "poolTemplateHash"],
       "additionalProperties": false
     },
     "network": {
@@ -49,12 +53,16 @@
         },
         "lithos": {
           "type": "object",
-          "description": "LithosDex pools: operator allowlist, contract constants and pinned contract templates",
+          "description": "LithosDex pools: optional restriction list, contract constants and pinned contract templates",
           "properties": {
+            "discoverPools": {
+              "type": "boolean",
+              "description": "true: with poolAllowlist empty, LithosDex pools are discovered by template hash and every one that passes the deployment check and the guards is offered. false: none is discovered; only poolAllowlist pools are offered, none when it is empty"
+            },
             "poolAllowlist": {
               "type": "array",
               "items": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
-              "description": "Pool NFT ids of LithosDex pools the operator has checked; only these are offered, and only if they pass the deployment check"
+              "description": "Pool NFT ids; if not empty, only these LithosDex pools are offered (and none is discovered), still only if they pass the deployment check and the guards"
             },
             "feeDenominator": { "$ref": "#/definitions/amount" },
             "accumulatorScale": { "$ref": "#/definitions/amount" },
@@ -78,7 +86,7 @@
             "t2t": { "$ref": "#/definitions/lithosKind" }
           },
           "required": [
-            "poolAllowlist",
+            "discoverPools",
             "feeDenominator",
             "accumulatorScale",
             "lockedLiquidity",

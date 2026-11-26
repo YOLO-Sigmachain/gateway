@@ -5,7 +5,8 @@
  * quote and execute on an ERG/token and a token/token pool (the pool at input 0 with the
  * swap operation byte, its successor at output 0, PENDING with pendingData); the pool box
  * spent between quote and execute (rebuild on the successor); the price bounds; pool
- * info; and a pool off the allowlist refused with nothing posted.
+ * info; a pool off a non-empty lithos allowlist refused with nothing posted; and, with
+ * the allowlist empty, a pair-only quote on a pool found by template hash.
  */
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
@@ -270,7 +271,7 @@ describe('ergodex on LithosDex pools through /trading/amm', () => {
     expect(info.feePct).toBe('0.299775'); // 1 - (9985/10000)^2, the costlier direction
   });
 
-  it('a LithosDex pool off the allowlist is refused for quote and execute, nothing posted', async () => {
+  it('a LithosDex pool off a non-empty lithos allowlist is refused for quote and execute, nothing posted', async () => {
     dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
     const q = await app.inject({ method: 'GET', url: quoteUrl() });
     expect(q.statusCode).toBe(400);
@@ -360,5 +361,26 @@ describe('ergodex on LithosDex pools through /trading/amm', () => {
     expect(q.poolAddress).toBe(LIT_RSN_NFT);
     expect(q.amountOut).toBe('9.877515028');
     expect(q.routePath).toContain('lithos:t2t');
+  });
+
+  it('with the lithos allowlist empty, a quote with only a pair picks the pool found by template hash', async () => {
+    dex = makeLithosDex(state, lithosDexConfig([], { minPoolNativeReserve: 100n * ERG }));
+    const url =
+      '/trading/amm/quote-swap?' +
+      new URLSearchParams({
+        chainNetwork: 'ergo-mainnet',
+        connector: 'ergodex',
+        baseToken: 'RSN',
+        quoteToken: 'LIT',
+        amount: '1',
+        side: 'SELL',
+      });
+    const res = await app.inject({ method: 'GET', url });
+    expect(res.statusCode).toBe(200);
+    const q = JSON.parse(res.body);
+    expect(q.poolAddress).toBe(LIT_RSN_NFT);
+    expect(q.amountOut).toBe('9.877515028');
+    expect(state.calls.some((c) => c.path.startsWith('/blockchain/box/unspent/byTemplateHash/'))).toBe(true);
+    expect(posts()).toBe(0);
   });
 });

@@ -8,8 +8,13 @@
  * - exactly one confirmed unspent box carries that vault NFT, and its tree is the vault
  *   contract rebuilt from the pool NFT and the provision token.
  * The pool tree does not name the provision token, so only the vault ties it to the
- * deployment. This does not prove how the pool was minted; that is why an operator
- * allowlist sits on top.
+ * deployment. This does not prove how the pool was minted (its genesis), as nothing proves
+ * that for a Spectrum-style pool either; the same guards apply to both, and an operator
+ * may restrict either venue to listed pools.
+ *
+ * Pools are found on chain by their template hash (`ergoTreeTemplateHash`): the hash of
+ * the pool tree with its constants taken out, which every deployment of a kind shares
+ * because its ids are constants.
  *
  * Rebuilding is substitution only, no compiling: each term is a 32-byte byte-array
  * constant written in the template as `0e 20 <32 sentinel bytes>`, so a deployment's
@@ -21,9 +26,10 @@
  *   vault  = feeVaultTree(poolNft, provisionToken)
  * The templates and sentinels come from config.
  */
-import { ErgoMessage } from '@fleet-sdk/core';
+import { ErgoMessage, ErgoTree } from '@fleet-sdk/core';
 
 import { httpErrors } from '../../../../services/error-handler';
+// types only, so the config module may import this one
 import { LithosKindTemplates, LithosVenueConfig } from '../../ergodex.config';
 import { VenueNodeReader } from '../venue';
 
@@ -33,6 +39,21 @@ type SentinelName = keyof LithosVenueConfig['sentinels'];
 
 export function blake2b256Hex(hex: string): string {
   return Buffer.from(ErgoMessage.fromData(Uint8Array.from(Buffer.from(hex, 'hex'))).hash).toString('hex');
+}
+
+/**
+ * The hash the node's index files a box under for its contract template: blake2b256 of
+ * the tree's expression with its constants taken out (header, size and constant table
+ * dropped). Null when the tree cannot be read.
+ */
+export function ergoTreeTemplateHash(treeHex: string): string | null {
+  if (!/^([0-9a-fA-F]{2})+$/.test(treeHex)) return null;
+  try {
+    const template = new ErgoTree(treeHex).template;
+    return template.length > 0 ? blake2b256Hex(Buffer.from(template).toString('hex')) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

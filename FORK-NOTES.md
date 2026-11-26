@@ -29,7 +29,7 @@ Ergo is a UTXO chain. A pool on Ergo is a single box (an unspent output) that ho
 Venues:
 
 - Spectrum-style pools: ERG/token and token/token pools whose contract matches one of the exact ErgoTrees (compiled contract scripts) in the config.
-- LithosDex pools: ERG/token and token/token pools. A LithosDex pool is offered only if it is on an allowlist you write (section 3.4).
+- LithosDex pools: ERG/token and token/token pools, found on chain by contract template and admitted by the same rules as Spectrum-style pools (section 3.4).
 
 Not built: LithosDex order mode, deposit and redeem; pool creation; Dexy; any network file for the yolo chain. See section 8.
 
@@ -56,7 +56,8 @@ The read-only server run happened before the commits that add `pendingData`, the
 - No transaction has been signed with a real wallet key or submitted to a node. The contract proofs use test keys and fixtures. The live test signs with a synthetic test key and fails if anything is posted.
 - What a live node answers at submit, and when a transaction is posted again, was read from node source code. It was not observed. The HTTP codes in section 4 rest on that reading.
 - LithosDex pool boxes are at ErgoTree version 3, which `ergo-lib-wasm-nodejs` 0.28.0 cannot read. A transaction with a version-3 input is therefore signed with `ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3`. That is an unreleased build of the library, installed under the alias `ergo-lib-wasm-nodejs-alpha` and loaded only when such a transaction is signed (its wasm file is about 17 MB). Everything else signs with 0.28.0. Whether a node accepts a LithosDex swap built and signed this way has not been tested.
-- The pool allowlist for LithosDex ships empty, so no LithosDex pool is offered until you list one.
+- LithosDex pools are admitted without anyone checking how they were created (section 3.4), as Spectrum-style pools always were. Discovery by template hash was checked once against the local mainnet node on 26 November 2026 (11 pool boxes, the 11 known pools); the routes have not been run against it.
+- LithosDex discovery is switched by `networks.<network>.lithos.discoverPools`, shipped `true` on mainnet. Upgrade note: a config written before this key existed has `lithos.poolAllowlist: []`, which used to offer no LithosDex pool. When it loads, the loader fills the missing key in from the template as `true`, so that config now discovers LithosDex pools and offers every one that passes the rules. Set `discoverPools: false` to keep LithosDex off (section 3.4).
 - The check-only mode (section 3.5) exists so that a real node can judge a real signed swap without anything being broadcast. It has been tested against stand-in nodes only. What the node's check endpoint does was read from the node's API description and source, not observed.
 
 ## 3. Running it for Ergo
@@ -71,6 +72,7 @@ Every read and every submit goes to one Ergo node, set by `nodeURL`. No explorer
 | `GET /blockchain/indexedHeight` | Confirms the extra indexer is on and how far it has indexed. The client refuses a node without it. |
 | `GET /blocks/lastHeaders/{n}` | Block headers for the signing context. |
 | `GET /blockchain/box/unspent/byAddress`, `byTokenId`, `byErgoTree` | Wallet boxes and pool discovery. |
+| `GET /blockchain/box/unspent/byTemplateHash/{hash}` | LithosDex pool discovery (called by the connector through the node client's `request`). |
 | `GET /blockchain/box/byId/{id}` | One box, including whether it is spent. |
 | `GET /blockchain/transaction/byId/{id}` | A confirmed transaction. |
 | `GET /blockchain/token/byId/{id}` | Token name, decimals and issued amount. |
@@ -160,24 +162,40 @@ Per network, under `networks.<network>`. The pool guards are here. They fail clo
 | `minPoolNativeReserve` | Pools with less native coin than this (nanoERG) are refused or skipped. | `100000000000` (100 ERG) |
 | `minPoolTokenReserve` | Pools with any token reserve below this (raw units, the same number for every token whatever its decimals) are refused or skipped. This is the only size guard on a token/token pool. | `1` |
 | `poolAllowlist` | If not empty, only these pool NFT ids may be traded, of any venue. | `[]` |
-| `maxDiscoveredBoxes` | Most boxes read per pool tree when discovering pools. A tree with more is read in part, with a warning. | `5000` |
+| `maxDiscoveredBoxes` | Most boxes read per pool tree, or per LithosDex template, when discovering pools. One with more is read in part, with a warning. | `5000` |
 | `spectrum.n2tPoolTrees`, `spectrum.t2tPoolTrees` | Exact ErgoTrees (hex) of ERG/token and token/token pools. A box is a Spectrum-style pool only at one of these trees. | one tree each |
 | `spectrum.feeDenominator` | The pool contracts' fee denominator. | `1000` |
 | `spectrum.n2tMinSuccessorValue` | An ERG/token pool's successor must hold more than this many nanoERG. | `10000000` |
 | `spectrum.lockedLiquidity` | The pool contracts' LP constant: a pool's LP supply is this minus the LP tokens it holds. Must be a constant of every configured pool tree; another value is refused when the config loads (a wrong value would underpay deposits). Unset: the liquidity and position routes answer 501; swaps are unaffected. | `'9223372036854775807'` |
-| `lithos.poolAllowlist` | LithosDex pool NFT ids you have checked and chosen. See below. | `[]` |
+| `lithos.discoverPools` | `true`: LithosDex pools are discovered by template hash, and with `lithos.poolAllowlist` empty every one that passes the rules is used. `false`: none is discovered; only the pools on `lithos.poolAllowlist` are used, and none when it is empty. Absent from an older file: the loader fills it in from the template as `true`. See below. | `true` |
+| `lithos.poolAllowlist` | Optional. Not empty: only these LithosDex pool NFT ids are used, and no LithosDex pool is discovered. Empty or absent: with `discoverPools`, every LithosDex pool that passes the rules; without it, none. See below. | `[]` |
 | `lithos.feeDenominator`, `lithos.accumulatorScale`, `lithos.lockedLiquidity`, `lithos.n2tMinSuccessorValue`, `lithos.swapOperation` | Constants of the LithosDex contracts. | `10000`, `10^27`, `9223372036854775807`, `10000000`, `0` |
 | `lithos.sentinels`, `lithos.provisionGuardTree`, `lithos.n2t.*`, `lithos.t2t.*` | The pinned LithosDex contract templates (pool, fee vault, provision logic) with placeholder ids that are replaced by each pool's own ids. Do not edit these without a reason. | pinned templates |
+| `lithos.n2t.poolTemplateHash`, `lithos.t2t.poolTemplateHash` | The node's template hash of each pool tree (blake2b256 of the tree with its constants taken out). LithosDex pools are discovered under it. Must be the hash of the `poolTree` beside it, or the config is refused with the right value in the message. | `76fb6082...c139`, `4b8ced39...055a` |
 
 The testnet block has no pool trees, so a testnet pool is never found. Its `minPoolNativeReserve` is 0.
 
 Two more checks run on every pool, whatever the config: a pool is used only if its NFT was issued with a supply of exactly 1 (read from the node), and a swap whose fee would exceed `maxPoolFeePct` is refused.
 
-#### The LithosDex allowlist
+#### LithosDex pools: discovery and admission
 
-A LithosDex pool is offered for pool info, quote, swap and pool choice only if its NFT id is on `networks.<network>.lithos.poolAllowlist` and it passes the deployment check. The list ships empty. Until you list a pool, no LithosDex pool is offered, and Spectrum-style pools work as if the LithosDex block were not there. If `networks.<network>.poolAllowlist` is also non-empty, a LithosDex pool must be on both lists.
+With `networks.<network>.lithos.discoverPools: true` (the shipped mainnet value), LithosDex pools are found and admitted by the same rules as Spectrum-style pools. Each pool's contract tree holds its own ids (vault NFT, provision guard hash) as constants, so there is no single tree to look up. The connector asks the node for the unspent boxes under each kind's template hash instead (`GET /blockchain/box/unspent/byTemplateHash/{hash}`, newest first, paged at `boxPageSize`, at most `maxDiscoveredBoxes`). A box found there is a candidate only if its tree is the pinned template with 32 bytes at each id slot and nothing else changed, and its tokens and registers read as a pool. The first discovery on a network logs "LithosDex pools are being discovered by template (discoverPools: true)" at info. A 404 from that route means the node does not serve it: discovery logs a warning and counts the read as partial.
 
-The deployment check rebuilds the pool's contract tree from its own ids and requires a byte-for-byte match, and requires exactly one vault box at the rebuilt vault tree. LithosDex recognises a pool by the shape of its template, so the check does not prove how the pool was created. Before you list a pool, check from the chain:
+With `discoverPools: false`, no LithosDex pool is discovered: only the pools on `lithos.poolAllowlist` are offered, and with that list empty no LithosDex pool is offered at all, and Spectrum-style pools work as if the LithosDex block were not there.
+
+Upgrade note: a config written before `discoverPools` existed has `lithos.poolAllowlist: []`, which used to offer no LithosDex pool. When it loads, the loader merges the template in and fills `discoverPools` in as `true`, so that config now discovers LithosDex pools and offers every one that passes the rules. Set `discoverPools: false` to keep LithosDex off.
+
+Before a LithosDex pool is used for pool info, quote, swap or pool choice, it must pass:
+
+- the deployment check: the pool's contract tree rebuilt from its own ids matches byte for byte, and exactly one vault box sits at the rebuilt vault tree;
+- the pool NFT issued with a supply of exactly 1;
+- for a quote, swap or pool choice, the guards that apply to every pool: `maxPoolFeePct` (on the costlier direction, and on the trade's own fee), `minPoolNativeReserve` (ERG/token pools), `minPoolTokenReserve`, and `poolAllowlist` when not empty.
+
+With the shipped mainnet guards, a LithosDex pool above 3% fee is refused and an ERG/token pool under 100 ERG is skipped.
+
+`networks.<network>.lithos.poolAllowlist` is an optional restriction with the same meaning as the top-level `poolAllowlist`: empty means every pool that passes (with `discoverPools: true`; none with `false`); not empty means only those pools, which must still pass, and LithosDex pools are then not discovered. If `networks.<network>.poolAllowlist` is also non-empty, a LithosDex pool must be on both lists.
+
+Neither the check nor the guards prove how a pool was created; the same is true of a Spectrum-style pool. To restrict trading to pools you have checked, list them and check from the chain first:
 
 - the pool NFT and the vault NFT were each minted as one unit;
 - the whole supply of the provision token was minted into the pool;
@@ -359,5 +377,6 @@ The fork is additive. Ergo code lives in its own folders. The edits to shared fi
 - **Exact-output buys.** A BUY fixes the amount received and asks the contract for the smallest whole input unit that pays for it. On a token with few decimals one unit is a coarse step, so the input can be above the exact price.
 - **Duplicate requests.** There is no request id. Two identical execute-swap requests each trade.
 - **Not built:** LithosDex order mode, deposit and redeem; pool creation; Dexy; network files for the yolo chain. Liquidity and positions on a LithosDex pool, and pool creation, answer 501.
+- **LithosDex liquidity, when built,** must first require the vault NFT's supply to be 1 and account for the provision tokens (the whole supply in the pool or in genuine provision boxes), or be allowed only on listed pools: the deployment check does not prove these, and a discovered pool with loose provision tokens can be drained through Redeem or Resize.
 - **Liquidity answers carry no amounts.** An `add` or `remove` answers PENDING with the id only, and `quote-liquidity` does not state the LP tokens; see section 4.1.
 - **Not proven:** a live swap, deposit or redeem (section 2).
