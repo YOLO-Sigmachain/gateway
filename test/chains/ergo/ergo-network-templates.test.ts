@@ -23,6 +23,22 @@ describe('Ergo network templates', () => {
     expect(schema.properties.pendingStateFile.type).toBe('string');
   });
 
+  it.each(['mainnet', 'testnet'])('%s waits 3 confirmations of the spender before reporting failed', (net) => {
+    expect(load(net).failedAfterConfirmations).toBe(3);
+    expect(load(net).confirmations).toBe(1);
+  });
+
+  it('the schema takes failedAfterConfirmations as an optional whole number of at least 1', () => {
+    const validate = new Ajv({ strict: false }).compile(schema);
+    const { failedAfterConfirmations: _left, ...without } = load('mainnet');
+    expect(validate(without)).toBe(true);
+    expect(validate({ ...without, failedAfterConfirmations: 1 })).toBe(true);
+    expect(validate({ ...without, failedAfterConfirmations: 10 })).toBe(true);
+    expect(validate({ ...without, failedAfterConfirmations: 0 })).toBe(false);
+    expect(validate({ ...without, failedAfterConfirmations: 2.5 })).toBe(false);
+    expect(schema.required).not.toContain('failedAfterConfirmations');
+  });
+
   it.each(['mainnet', 'testnet'])('%s is valid against the schema, and a wrong type is not', (net) => {
     const validate = new Ajv({ strict: false }).compile(schema);
     expect(validate(load(net))).toBe(true);

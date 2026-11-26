@@ -14,7 +14,7 @@
  * inputs are unspent, so it is never forgotten for its age alone. An entry leaves only:
  * - when it is confirmed;
  * - when it is shown failed: one of its inputs is spent by a different transaction that
- *   has at least the network's `confirmations`, or it spends an output of a transaction
+ *   has at least the network's `failedAfterConfirmations`, or it spends an output of a transaction
  *   that failed that way. Such ids are remembered (newest 1,000), so poll keeps answering
  *   FAILED for them;
  * - once it is older than the per-network timeout (pendingTxTimeoutBlocks x
@@ -119,7 +119,8 @@ export class ErgoPendingTracker {
    * Record a transaction about to be submitted, or one the node accepted. With a file, the
    * entry is on disk when this returns; if it cannot be written the entry is dropped again
    * and this throws, so nothing is submitted that a restart would forget. With
-   * `mustPersist: false` (a transaction already submitted) a write failure is logged.
+   * `mustPersist: false` (a transaction already submitted) a write failure is logged. An
+   * id recorded again is taken off the remembered-failed list: it is live again.
    */
   record(
     txId: string,
@@ -129,6 +130,8 @@ export class ErgoPendingTracker {
     fixedInputs: PendingFixedInput[] = [],
     options: { mustPersist?: boolean } = {},
   ): void {
+    const wasFailed = this.failed.get(txId);
+    this.failed.delete(txId);
     this.insert({
       txId,
       inputBoxIds: [...inputBoxIds],
@@ -145,6 +148,7 @@ export class ErgoPendingTracker {
       this.write();
     } catch (error) {
       this.remove(txId);
+      if (wasFailed) this.rememberFailed(wasFailed);
       throw new Error(
         `Could not write the pending-transaction file ${this.file?.file}: ` +
           `${error instanceof Error ? error.message : String(error)}; nothing was submitted`,
@@ -152,9 +156,29 @@ export class ErgoPendingTracker {
     }
   }
 
-  /** Forget a transaction: confirmed (the node's view now has it), or no longer checkable. */
-  release(txId: string): void {
-    if (this.remove(txId)) this.persist();
+  /**
+   * Forget a transaction: confirmed (the node's view now has it), or no longer checkable. A
+   * file write failure is logged. With `mustPersist: true` (a caller about to answer that the
+   * transaction was not taken), a write failure puts the entry back and throws instead, so
+   * the caller can tell that a restart would bring the entry back.
+   */
+  release(txId: string, options: { mustPersist?: boolean } = {}): void {
+    const tx = this.txs.get(txId);
+    if (!tx) return;
+    this.remove(txId);
+    if (!options.mustPersist) {
+      this.persist();
+      return;
+    }
+    try {
+      this.write();
+    } catch (error) {
+      this.insert(tx);
+      throw new Error(
+        `Could not write the pending-transaction file ${this.file?.file}: ` +
+          `${error instanceof Error ? error.message : String(error)}; transaction ${txId} is still tracked`,
+      );
+    }
   }
 
   /**

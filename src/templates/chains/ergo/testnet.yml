@@ -26,10 +26,10 @@ tokenListSource: tokens/ergo/testnet.json
 # pendingTxTimeoutBlocks blocks of this length is checked against the node when boxes are
 # next selected, at most once per block. It is never forgotten for its age while its inputs
 # are unspent. It leaves only when it is confirmed; when it is shown failed (an input spent
-# by another transaction that has `confirmations` confirmations, or it spends an output of
-# a transaction that failed so); once past that age, when an input is known neither to the
-# node's index nor as an output of a transaction Gateway tracks; or when the node refuses
-# it at its first submit. One the node has dropped is posted again; one the node refuses
+# by another transaction that has `failedAfterConfirmations` confirmations, or it spends
+# an output of a transaction that failed so); once past that age, when an input is known
+# neither to the node's index nor as an output of a transaction Gateway tracks; or
+# when the node refuses it at its first submit. A dropped one is posted again; one the node refuses
 # when posted again is kept and tried again later.
 blockTimeSeconds: 120
 pendingTxTimeoutBlocks: 15
@@ -48,6 +48,12 @@ transactionsExpire: false
 # Number of blocks on top of (and including) the one holding a transaction before poll
 # reports it as confirmed
 confirmations: 1
+
+# How many confirmations the transaction that spent one of our inputs needs before ours is
+# reported failed. A reorganisation shallower than this cannot turn a reported failure into
+# a confirmed trade. A larger value is safer, and reports a lost race later (about
+# blockTimeSeconds per confirmation). Unset: the value of confirmations.
+failedAfterConfirmations: 3
 
 # Node request timeout in milliseconds, and page size for box queries
 nodeTimeoutMs: 10000

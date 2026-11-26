@@ -163,6 +163,26 @@ describe('pending transactions survive a restart', () => {
     expect(t.isSpent(input.boxId)).toBe(false);
   });
 
+  it('a release that cannot be written is logged and forgotten; one that must be written is kept and throws', () => {
+    const t = tracker();
+    recordOne(t);
+    const save = jest.spyOn(ErgoPendingFile.prototype, 'save').mockImplementation(() => {
+      throw new Error('ENOSPC: no space left on device, write');
+    });
+    const error = jest.spyOn(logger, 'error').mockImplementation(() => logger);
+    try {
+      expect(() => t.release(TX1, { mustPersist: true })).toThrow('is still tracked');
+      expect(t.get(TX1)).toBeDefined();
+      expect(t.isSpent(input.boxId)).toBe(true);
+      expect(() => t.release(TX1)).not.toThrow();
+      expect(t.get(TX1)).toBeUndefined();
+      expect(error.mock.calls.some(([m]) => String(m).includes('ENOSPC'))).toBe(true);
+    } finally {
+      save.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it("another network's file stops start-up, and is neither moved aside nor overwritten", () => {
     recordOne(tracker('testnet'));
     const before = fs.readFileSync(file, 'utf8');
@@ -272,6 +292,18 @@ describe('pending transactions survive a restart', () => {
     expect(long.failedReason(id(FAILED_KEPT))).toBeDefined();
     long.record(TX2, [input.boxId], [], '{}');
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).failed).toHaveLength(FAILED_KEPT);
+  });
+
+  it('an id recorded again is taken off the failed list, on disk too', () => {
+    const t = tracker();
+    recordOne(t);
+    t.releaseFailed(TX1, 'Input x was spent by transaction y');
+    expect(tracker().failedReason(TX1)).toBeDefined();
+    recordOne(t);
+    expect(t.failedReason(TX1)).toBeUndefined();
+    const again = tracker();
+    expect(again.failedReason(TX1)).toBeUndefined();
+    expect(again.get(TX1)).toBeDefined();
   });
 
   it('a file written before failed ids were kept loads as before', () => {

@@ -52,6 +52,11 @@
       "description": "Whether a signed transaction can expire before it confirms. False on Ergo: a transaction stays valid until one of its inputs is spent, so a transaction the node does not know may still confirm. A statement for clients; Gateway does not read it"
     },
     "confirmations": { "type": "integer", "minimum": 1 },
+    "failedAfterConfirmations": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Confirmations the transaction that spent one of a pending transaction's inputs needs before the pending one is reported failed. Unset: the value of confirmations"
+    },
     "nodeTimeoutMs": { "type": "integer", "minimum": 1 },
     "boxPageSize": { "type": "integer", "minimum": 1, "maximum": 500 },
     "swapProvider": {

@@ -401,7 +401,7 @@ describe('ergodex through /trading/amm', () => {
     expect(posts()).toBe(0);
   });
 
-  it('a whole-number limit above the largest exact integer is refused, with a pointer to send a string', async () => {
+  it('a whole-number limit above the largest exact integer is refused, stating the largest one', async () => {
     state.wallet = [walletBox(5n * ERG, [{ tokenId: RSN, amount: 100000n }])];
     const res = await app.inject({
       method: 'POST',
@@ -414,7 +414,22 @@ describe('ergodex through /trading/amm', () => {
       ),
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).message).toContain('send it as a string');
+    expect(JSON.parse(res.body).message).toContain('a whole number at most 9007199254740991');
+    expect(posts()).toBe(0);
+  });
+
+  it('a limit sent as a string reaches the swap as a JSON number: above the largest exact integer it is refused', async () => {
+    state.wallet = [walletBox(5n * ERG, [{ tokenId: RSN, amount: 100000n }])];
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify(execBody({ side: 'BUY', amount: 1, maxAmountIn: '9007199254740993' })),
+    });
+    expect(res.statusCode).toBe(400);
+    const message = JSON.parse(res.body).message;
+    expect(message).toContain('a whole number at most 9007199254740991');
+    expect(message).not.toContain('as a string');
     expect(posts()).toBe(0);
   });
 

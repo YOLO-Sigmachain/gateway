@@ -98,7 +98,10 @@ export function numberToPlainString(value: number): string {
     throw new Error(`Invalid amount: ${value}`);
   }
   const tooPrecise = () =>
-    new Error(`Amount ${value} has more significant digits than a JSON number holds exactly; send it as a string`);
+    new Error(
+      `Amount ${value} cannot be read exactly: an amount sent as a JSON number can carry at most 15 ` +
+        'significant digits, and a whole number at most 9007199254740991',
+    );
   if (Number.isInteger(value)) {
     if (!Number.isSafeInteger(value)) throw tooPrecise();
     return value.toString(); // below 1e21, so never in exponent form

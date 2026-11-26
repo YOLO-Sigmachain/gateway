@@ -216,6 +216,146 @@ describe('poll', () => {
       expect(again.error).toContain(other);
     });
 
+    describe('with failedAfterConfirmations 3', () => {
+      /** Our TX's input is spent by `other`, which the index holds at `depth` blocks. */
+      function spentAtDepth(depth: number) {
+        return chain(
+          (_m, p) => {
+            if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+            if (p === `/blockchain/transaction/byId/${other}`)
+              return {
+                body: {
+                  id: other,
+                  inputs: [],
+                  outputs: [],
+                  inclusionHeight: TIP - depth + 1,
+                  numConfirmations: depth - 1,
+                },
+              };
+            if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+            if (p === `/blockchain/box/byId/${input.boxId}`)
+              return { body: nodeBoxJson(input, { spentTransactionId: other }) };
+            if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+            return undefined;
+          },
+          { confirmations: 1, failedAfterConfirmations: 3 },
+        );
+      }
+
+      it.each([1, 2])('a spender %i block(s) deep: PENDING, naming the depth asked for, and kept', async (depth) => {
+        const { ergo } = spentAtDepth(depth);
+        ergo.pending.record(TX, [input.boxId], [], '{}');
+        const r = await ergo.pollTransaction(TX);
+        expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+        expect(r.error).toBeNull();
+        expect(r.txData).toEqual({ note: expect.stringContaining(`which has ${depth} of the 3 confirmations`) });
+        expect(ergo.pending.get(TX)).toBeDefined();
+        expect(ergo.pending.failedReason(TX)).toBeUndefined();
+      });
+
+      it('a spender 3 blocks deep: FAILED, and released', async () => {
+        const { ergo } = spentAtDepth(3);
+        ergo.pending.record(TX, [input.boxId], [], '{}');
+        const r = await ergo.pollTransaction(TX);
+        expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
+        expect(r.error).toContain(other);
+        expect(ergo.pending.get(TX)).toBeUndefined();
+      });
+
+      it('confirmations alone still decides CONFIRMED: our own transaction at 1 block is confirmed', async () => {
+        const { ergo } = chain(indexedAs(TIP, 0), { confirmations: 1, failedAfterConfirmations: 3 });
+        expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.CONFIRMED);
+      });
+    });
+
+    describe('tracked under the id the node answered, with the signed JSON of the id posted', () => {
+      const NODE_ID = 'cd'.repeat(32);
+      const POSTED = 'ef'.repeat(32);
+      const postedJson = JSON.stringify({ id: POSTED, inputs: [{ boxId: input.boxId }], dataInputs: [], outputs: [] });
+      let now = 0;
+      function spentByPosted() {
+        const node = fakeNode((method, p) => {
+          if (method === 'GET' && p === '/info') return { body: infoBody() };
+          if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+          if (p === `/blockchain/transaction/byId/${POSTED}`)
+            return { body: { id: POSTED, inputs: [], outputs: [], inclusionHeight: TIP - 2, numConfirmations: 2 } };
+          if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+          if (p === `/blockchain/box/byId/${input.boxId}`)
+            return { body: nodeBoxJson(input, { spentTransactionId: POSTED }) };
+          if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+          if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [] };
+          return undefined;
+        });
+        now = 0;
+        const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch, now: () => now });
+        ergo.pending.record(NODE_ID, [input.boxId], [], postedJson);
+        return ergo;
+      }
+
+      it('an input spent by the posted transaction, at full depth, is not a failure: poll', async () => {
+        const ergo = spentByPosted();
+        const r = await ergo.pollTransaction(NODE_ID);
+        expect(r.txStatus).not.toBe(TransactionStatusCode.FAILED);
+        expect(r.error).toBeNull();
+        expect(ergo.pending.failedReason(NODE_ID)).toBeUndefined();
+      });
+
+      it('an input spent by the posted transaction, at full depth, is not a failure: the overdue check', async () => {
+        const ergo = spentByPosted();
+        now = 15 * 120 * 1000 + 1;
+        await ergo.getSpendableBoxes(ME);
+        expect(ergo.pending.failedReason(NODE_ID)).toBeUndefined();
+      });
+
+      it('signed JSON that cannot be read: compared with the tracked id alone, as before', async () => {
+        const ergo = spentByPosted();
+        ergo.pending.release(NODE_ID);
+        ergo.pending.record(NODE_ID, [input.boxId], [], 'not json');
+        expect((await ergo.pollTransaction(NODE_ID)).txStatus).toBe(TransactionStatusCode.FAILED);
+      });
+    });
+
+    it('a remembered failure, asked while the index lags the chain: PENDING, status not yet known', async () => {
+      let lag = false;
+      const { ergo } = chain((_m, p) => {
+        if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+        if (p === `/blockchain/transaction/byId/${other}`)
+          return { body: { id: other, inputs: [], outputs: [], inclusionHeight: TIP, numConfirmations: 0 } };
+        if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+        if (p === `/blockchain/box/byId/${input.boxId}`)
+          return { body: nodeBoxJson(input, { spentTransactionId: other }) };
+        if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: lag ? TIP - 1 : TIP, fullHeight: TIP } };
+        return undefined;
+      });
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.FAILED);
+      lag = true;
+      const behind = await ergo.pollTransaction(TX);
+      expect(behind.txStatus).toBe(TransactionStatusCode.PENDING);
+      expect(behind.error).toBeNull();
+      expect(behind.txData).toEqual({ note: expect.stringContaining('status not yet known') });
+      lag = false;
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.FAILED);
+    });
+
+    it('a remembered id recorded again is live again: once it leaves without proof, not found, not FAILED', async () => {
+      const { ergo } = chain((_m, p) => {
+        if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+        if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+        if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+        return undefined;
+      });
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      ergo.pending.releaseFailed(TX, `Input ${input.boxId} was spent by transaction ${other}`);
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.FAILED);
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      expect(ergo.pending.failedReason(TX)).toBeUndefined();
+      ergo.pending.release(TX); // left without proof, as at the unknown-input timeout
+      const r = await ergo.pollTransaction(TX);
+      expect(r.txStatus).toBe(TransactionStatusCode.NOT_FOUND);
+      expect(r.error).toBeNull();
+    });
+
     it('a remembered failure gives way to what the chain shows: confirmed reads as confirmed', async () => {
       const opts = { txConfirmed: false };
       const { ergo } = spentByOther({}, opts);
@@ -556,7 +696,12 @@ describe('a pending transaction is forgotten only on evidence, never for its age
   function setup(
     box: () => FakeResponse,
     confirmed: () => FakeResponse = notFound,
-    opts: { submit?: () => FakeResponse; spender?: () => FakeResponse; overrides?: object } = {},
+    opts: {
+      submit?: () => FakeResponse;
+      spender?: () => FakeResponse;
+      overrides?: object;
+      unconfirmed?: () => FakeResponse;
+    } = {},
   ) {
     let now = 0;
     const posted: string[] = [];
@@ -567,7 +712,8 @@ describe('a pending transaction is forgotten only on evidence, never for its age
         posted.push(body!);
         return (opts.submit ?? accept)();
       }
-      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return (opts.unconfirmed ?? notFound)();
+      if (p.startsWith('/transactions/unconfirmed/inputs/byBoxId/')) return notFound();
       if (p === `/blockchain/transaction/byId/${TX}`) return confirmed();
       if (p === `/blockchain/transaction/byId/${SPENDER}`) return (opts.spender ?? notFound)();
       if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
@@ -653,6 +799,35 @@ describe('a pending transaction is forgotten only on evidence, never for its age
     }
   });
 
+  it('a 4xx when posted again while the node holds it after all: kept, and not marked refused', async () => {
+    let posts = 0;
+    const { ergo, posted, advance } = setup(unspent, notFound, {
+      submit: () => {
+        posts += 1;
+        return {
+          status: 400,
+          body: {
+            error: 400,
+            reason: 'bad.request',
+            detail: 'Pool can not accept transaction, it is already in the mempool',
+          },
+        };
+      },
+      // the node shows it in its mempool once it has been posted again
+      unconfirmed: () => (posts > 0 ? { body: { id: TX, inputs: [{ boxId: input.boxId }], outputs: [] } } : notFound()),
+    });
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      advance(TIMEOUT_MS + 1);
+      await ergo.getSpendableBoxes(ME);
+      expect(posted.length).toBe(1);
+      expect(ergo.pending.get(TX)).toBeDefined();
+      expect(ergo.pending.get(TX)!.refused).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('released past the timeout once an input is spent by another transaction that has the confirmations', async () => {
     const { ergo, posted, advance } = setup(spentBySpender, notFound, { spender: spenderAt(0) });
     advance(TIMEOUT_MS + 1);
@@ -671,6 +846,32 @@ describe('a pending transaction is forgotten only on evidence, never for its age
     await ergo.getSpendableBoxes(ME);
     expect(ergo.pending.get(TX)).toBeDefined();
     expect(posted.length).toBe(0);
+  });
+
+  it.each([0, 1])(
+    'kept past the timeout while the spender is %i block(s) after its own, below failedAfterConfirmations 3',
+    async (numConfirmations) => {
+      const { ergo, posted, advance } = setup(spentBySpender, notFound, {
+        spender: spenderAt(numConfirmations),
+        overrides: { confirmations: 1, failedAfterConfirmations: 3 },
+      });
+      advance(TIMEOUT_MS + 1);
+      await ergo.getSpendableBoxes(ME);
+      expect(ergo.pending.get(TX)).toBeDefined();
+      expect(ergo.pending.failedReason(TX)).toBeUndefined();
+      expect(posted.length).toBe(0);
+    },
+  );
+
+  it('released past the timeout once the spender has failedAfterConfirmations 3', async () => {
+    const { ergo, advance } = setup(spentBySpender, notFound, {
+      spender: spenderAt(2),
+      overrides: { confirmations: 1, failedAfterConfirmations: 3 },
+    });
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeUndefined();
+    expect(ergo.pending.failedReason(TX)!.reason).toContain(SPENDER);
   });
 
   it('released past the timeout once it is confirmed', async () => {

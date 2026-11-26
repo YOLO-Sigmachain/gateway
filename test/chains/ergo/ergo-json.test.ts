@@ -153,8 +153,8 @@ describe('whole-unit conversion at the edge', () => {
   it('parseUnits refuses a number with more significant digits than a double holds exactly', () => {
     // both would otherwise come back one unit off, silently
     // written as Number('...') so the literal reaches parseUnits as the double it rounds to
-    expect(() => parseUnits(Number('12345678.123456789'), 9)).toThrow('send it as a string');
-    expect(() => parseUnits(Number('9007199254740993'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(Number('12345678.123456789'), 9)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(Number('9007199254740993'), 0)).toThrow('can carry at most 15 significant digits');
     expect(parseUnits(0.1, 9)).toBe(100000000n);
     expect(parseUnits('12345678.123456789', 9)).toBe(12345678123456789n);
   });
@@ -175,19 +175,19 @@ describe('whole-unit conversion at the edge', () => {
 
   it('parseUnits refuses a whole number above the largest exact integer: its last digits are not known', () => {
     // each of these reads back as a double whose text differs from what the caller wrote
-    expect(() => parseUnits(JSON.parse('1e21'), 0)).toThrow('send it as a string');
-    expect(() => parseUnits(JSON.parse('100000000000000001'), 0)).toThrow('send it as a string');
-    expect(() => parseUnits(JSON.parse('10000000000000001'), 0)).toThrow('send it as a string');
-    expect(() => parseUnits(JSON.parse('1.2345e25'), 2)).toThrow('send it as a string');
-    expect(() => parseUnits(Number.MAX_SAFE_INTEGER + 1, 0)).toThrow('send it as a string');
+    expect(() => parseUnits(JSON.parse('1e21'), 0)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(JSON.parse('100000000000000001'), 0)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(JSON.parse('10000000000000001'), 0)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(JSON.parse('1.2345e25'), 2)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(Number.MAX_SAFE_INTEGER + 1, 0)).toThrow('can carry at most 15 significant digits');
     // as strings they are exact
     expect(parseUnits('100000000000000001', 0)).toBe(100000000000000001n);
   });
 
   it('parseUnits still refuses what a double cannot hold exactly, in either form', () => {
     expect(() => parseUnits(1e-10, 9)).toThrow('decimal places');
-    expect(() => parseUnits(Number('1.234567890123456e-7'), 30)).toThrow('send it as a string');
-    expect(() => parseUnits(Number('1.234567890123456e+22'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(Number('1.234567890123456e-7'), 30)).toThrow('can carry at most 15 significant digits');
+    expect(() => parseUnits(Number('1.234567890123456e+22'), 0)).toThrow('can carry at most 15 significant digits');
     expect(() => parseUnits(-4e-7, 9)).toThrow('Invalid amount');
     expect(() => parseUnits(Number.POSITIVE_INFINITY, 9)).toThrow('Invalid amount');
   });

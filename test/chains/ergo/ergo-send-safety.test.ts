@@ -3,8 +3,18 @@
  * change address that is not the signer's, a node that answers with another id. Built with
  * real fleet, signed with real wasm, submitted to a node stand-in.
  */
-import { Ergo, ErgoNotSubmittedError, ErgoSubmitOutcomeUnknownError } from '../../../src/chains/ergo/ergo';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+import {
+  Ergo,
+  ErgoNotSubmittedError,
+  ErgoSubmitOutcomeUnknownError,
+  ErgoTransactionRejectedError,
+} from '../../../src/chains/ergo/ergo';
 import { FetchLike } from '../../../src/chains/ergo/ergo.node-client';
+import { ErgoPendingFile } from '../../../src/chains/ergo/ergo.pending-file';
 import { ErgoSigner, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBuildError, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
 import { addressFromPublicKey } from '../../../src/chains/ergo/ergo.utils';
@@ -213,6 +223,96 @@ describe('a submit whose answer is lost', () => {
     expect(rejected.status).toBe(400);
     expect(ergo.pending.isSpent(big.boxId)).toBe(false);
   });
+});
+
+describe('a definite answer at the first submit is given only once its release is on disk', () => {
+  let dir: string;
+  let file: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ergo-release-'));
+    file = path.join(dir, 'mainnet-pending.json');
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const refusedConnect = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9053'), { code: 'ECONNREFUSED' }),
+    });
+
+  /** A file-backed chain whose POST is answered 400, or whose connection is refused. */
+  function fileBacked(mode: 'node-4xx' | 'refused') {
+    const posted: string[] = [];
+    const node = fakeNode((method, p, body) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(big)] };
+      if (method === 'GET' && p === '/blocks/lastHeaders/10') return { body: HEADERS };
+      if (method === 'POST' && p === '/transactions') {
+        posted.push(body!);
+        return { status: 400, body: { error: 400, reason: 'bad.request', detail: 'Double spending attempt' } };
+      }
+      return undefined;
+    });
+    const fetch: FetchLike = async (input, init) => {
+      if (mode === 'refused' && init?.method === 'POST' && input.endsWith('/transactions')) {
+        posted.push(String(init.body));
+        throw refusedConnect();
+      }
+      return node.fetch(input, init);
+    };
+    const ergo = new Ergo('mainnet', { config: testConfig({ pendingStateFile: file }), fetch });
+    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    return { ergo, posted };
+  }
+
+  /** Every write after the first one (the record before the POST) fails, as on a full disk. */
+  function failWritesAfterTheFirst() {
+    const original = ErgoPendingFile.prototype.save;
+    let saves = 0;
+    jest.spyOn(ErgoPendingFile.prototype, 'save').mockImplementation(function (this: ErgoPendingFile, ...args) {
+      saves += 1;
+      if (saves >= 2) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+      return original.apply(this, args as Parameters<typeof original>);
+    });
+  }
+
+  const inFile = (txId: string): boolean =>
+    JSON.parse(fs.readFileSync(file, 'utf8')).transactions.some((t: { txId: string }) => t.txId === txId);
+
+  it.each(['node-4xx', 'refused'] as const)(
+    '%s, and the release cannot be written: an unknown outcome, and the entry is still tracked',
+    async (mode) => {
+      const { ergo, posted } = fileBacked(mode);
+      failWritesAfterTheFirst();
+      const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+      const txId = JSON.parse(posted[0]).id;
+      expect(error).toBeInstanceOf(ErgoSubmitOutcomeUnknownError);
+      expect(error).not.toBeInstanceOf(ErgoNotSubmittedError);
+      expect(error).not.toBeInstanceOf(ErgoTransactionRejectedError);
+      expect(error.txId).toBe(txId);
+      expect(ergo.pending.get(txId)).toBeDefined();
+      expect(ergo.pending.isSpent(big.boxId)).toBe(true);
+      expect(inFile(txId)).toBe(true);
+    },
+  );
+
+  it.each([
+    ['node-4xx', ErgoTransactionRejectedError],
+    ['refused', ErgoNotSubmittedError],
+  ] as const)(
+    '%s, and the release is written: the definite answer, and released from memory and file',
+    async (mode, type) => {
+      const { ergo, posted } = fileBacked(mode);
+      const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+      const txId = JSON.parse(posted[0]).id;
+      expect(error).toBeInstanceOf(type);
+      expect(error).not.toBeInstanceOf(ErgoSubmitOutcomeUnknownError);
+      expect(ergo.pending.get(txId)).toBeUndefined();
+      expect(inFile(txId)).toBe(false);
+    },
+  );
 });
 
 describe('a transaction the node dropped', () => {

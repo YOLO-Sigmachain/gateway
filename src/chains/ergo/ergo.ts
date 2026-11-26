@@ -230,6 +230,14 @@ export class Ergo {
     return this.config.nativeCurrencySymbol;
   }
 
+  /**
+   * Confirmations a different transaction that spent one of our inputs needs before ours is
+   * reported failed; `confirmations` when the network config does not set it.
+   */
+  private get failedAfterConfirmations(): number {
+    return this.config.failedAfterConfirmations ?? this.config.confirmations;
+  }
+
   // -------------------------------------------------------------------------------------
   // Addresses
 
@@ -504,6 +512,9 @@ export class Ergo {
    * releases it and rethrows; a connection that was never made (refused, or the node's
    * name did not resolve) releases it and throws ErgoNotSubmittedError; any other failure
    * keeps it tracked and throws ErgoSubmitOutcomeUnknownError carrying the transaction id.
+   * A definite answer is given only once its release is written to the pending file: if
+   * that write fails, the entry stays tracked (a restart would read it back and post it
+   * again) and the answer is ErgoSubmitOutcomeUnknownError, so the caller polls.
    *
    * A transaction with fixed inputs (a contract box such as a pool) must go through
    * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
@@ -538,7 +549,7 @@ export class Ergo {
       txId = await this.node.submitTransaction(signed.json);
     } catch (error) {
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
-        this.pending.release(signed.id);
+        this.releaseBeforeDefiniteAnswer(signed.id, error);
         const fixed = built.inputBoxes.slice(0, built.fixedInputCount).map((b) => b.boxId);
         const gone = fixed.length > 0 ? await this.spentFixedInputs(fixed, error) : [];
         if (gone.length > 0) {
@@ -552,7 +563,7 @@ export class Ergo {
       }
       if (error instanceof ErgoNodeError && error.status === 0 && failedBeforeConnecting(error)) {
         // no byte reached the node: nothing from this submit can confirm
-        this.pending.release(signed.id);
+        this.releaseBeforeDefiniteAnswer(signed.id, error);
         throw new ErgoNotSubmittedError(signed.id, error);
       }
       throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
@@ -567,6 +578,24 @@ export class Ergo {
     }
     logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
     return txId;
+  }
+
+  /**
+   * Release a transaction about to be answered as not taken. If the release cannot be
+   * written to the pending file, the entry stays tracked and the answer becomes an unknown
+   * outcome: a restart would read the entry back and post it again, so "not taken" would
+   * not hold.
+   */
+  private releaseBeforeDefiniteAnswer(txId: string, cause: ErgoNodeError): void {
+    try {
+      this.pending.release(txId, { mustPersist: true });
+    } catch (writeError) {
+      logger.error(
+        `Ergo ${this.network}: transaction ${txId} is kept and answered as an unknown outcome: ` +
+          `${writeError instanceof Error ? writeError.message : String(writeError)}`,
+      );
+      throw new ErgoSubmitOutcomeUnknownError(txId, cause);
+    }
   }
 
   /**
@@ -722,13 +751,7 @@ export class Ergo {
       };
     }
 
-    // Released earlier because it can never confirm. Asked only after the mempool and the
-    // index: a transaction the chain shows confirmed is confirmed, whatever this says.
     const tracked = this.pending.get(id);
-    const failed = tracked ? undefined : this.pending.failedReason(id);
-    if (failed) {
-      return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: failed.reason, txData: null };
-    }
 
     // The indexer can lag the chain; a transaction in a block it has not indexed yet looks
     // unknown. Read the index height before any input box, so box reads are at least as
@@ -738,13 +761,13 @@ export class Ergo {
     const indexBehind = indexed.indexedHeight < chainHeight;
 
     // Neither indexed nor in the mempool. Failed only on proof: one of its inputs spent by a
-    // different transaction that has the network's confirmations, which we can check for
-    // transactions we submitted.
+    // different transaction that has the network's failedAfterConfirmations, which we can
+    // check for transactions we submitted.
     const inputs = tracked ? await this.readTrackedInputs(tracked) : undefined;
     if (inputs?.spentElsewhere) {
       const { boxId, by } = inputs.spentElsewhere;
       const depth = await this.confirmationsOfTransaction(by, fullHeight);
-      if (depth >= this.config.confirmations) {
+      if (depth >= this.failedAfterConfirmations) {
         const reason = `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`;
         this.pending.releaseFailed(id, reason);
         return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: reason, txData: null };
@@ -755,7 +778,7 @@ export class Ergo {
         txStatus: TransactionStatusCode.PENDING,
         txData: {
           note:
-            `input ${boxId} is spent by transaction ${by}, which has ${depth} of the ${this.config.confirmations} ` +
+            `input ${boxId} is spent by transaction ${by}, which has ${depth} of the ${this.failedAfterConfirmations} ` +
             'confirmations that make it final; this transaction can no longer confirm once that one is final',
         },
       };
@@ -768,6 +791,14 @@ export class Ergo {
         txStatus: TransactionStatusCode.PENDING,
         txData: { note: `node index at ${indexed.indexedHeight}, chain at ${chainHeight}; status not yet known` },
       };
+    }
+
+    // Released earlier because it can never confirm. Asked only after the mempool, the index
+    // and the index-lag check: a transaction the chain shows confirmed is confirmed, and one
+    // in a block the index has not reached yet is not known, whatever this says.
+    const failed = tracked ? undefined : this.pending.failedReason(id);
+    if (failed) {
+      return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: failed.reason, txData: null };
     }
 
     // Ours, every input still unspent on an index that has caught up, and the node holds
@@ -901,6 +932,9 @@ export class Ergo {
    * The index's view of a tracked transaction's inputs: the first one spent by a different
    * transaction (evidence it failed), or else which are not indexed, split into those a
    * transaction we track creates (`waitingOn` holds that transaction's id) and the rest.
+   * A spend by the id in the entry's own signed JSON is a spend by this transaction too:
+   * when the node answered the submit with another id, the entry is tracked under the
+   * node's id, while the transaction posted (the one that confirms) carries ours.
    */
   private async readTrackedInputs(tracked: PendingTransaction): Promise<{
     spentElsewhere?: { boxId: string; by: string };
@@ -912,9 +946,12 @@ export class Ergo {
     const unindexed = new Set<string>();
     const waitingOn: string[] = [];
     const unknown: string[] = [];
+    const self = new Set([tracked.txId]);
+    const postedId = signedJsonId(tracked.json);
+    if (postedId !== undefined) self.add(postedId);
     for (const boxId of tracked.inputBoxIds) {
       const box = await this.node.getBox(boxId);
-      if (box?.spentTransactionId && box.spentTransactionId !== tracked.txId) {
+      if (box?.spentTransactionId && !self.has(box.spentTransactionId)) {
         return {
           spentElsewhere: { boxId, by: box.spentTransactionId },
           unindexed,
@@ -940,7 +977,7 @@ export class Ergo {
    * Check overdue pending transactions against the node, so that an entry is settled even
    * when nobody polls it:
    * - confirmed: released;
-   * - an input spent by a different transaction that has the network's confirmations:
+   * - an input spent by a different transaction that has the network's failedAfterConfirmations:
    *   released as failed, with every tracked transaction that spends its outputs;
    *   below that depth it is kept;
    * - every input indexed and unspent, and the node holds it in no mempool: it was dropped,
@@ -985,7 +1022,7 @@ export class Ergo {
     if (inputs.spentElsewhere) {
       const { boxId, by } = inputs.spentElsewhere;
       // not final yet: the spender may still be undone, and this one confirm
-      if ((await this.confirmationsOfTransaction(by, fullHeight)) < this.config.confirmations) return;
+      if ((await this.confirmationsOfTransaction(by, fullHeight)) < this.failedAfterConfirmations) return;
       const reason = `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`;
       const released = this.pending.releaseFailed(id, reason);
       const others = released.filter((r) => r !== id);
@@ -1004,8 +1041,14 @@ export class Ergo {
       this.pending.release(id);
       return;
     }
-    // dropped by the node while it can still confirm: post it again (a refusal keeps it)
-    if (inputs.allUnspent) await this.postAgain(tx);
+    // dropped by the node while it can still confirm: post it again (a refusal keeps it). A
+    // refusal is checked against the mempool as poll does: the node may hold it after all
+    // (posted by a poll at the same moment, or relayed back by a peer), and then it is not
+    // marked refused.
+    if (inputs.allUnspent) {
+      const refusal = await this.postAgain(tx);
+      if (refusal) await this.refusedAnswer(tx, refusal);
+    }
   }
 
   private feeOf(tx: NodeTransaction): number | null {
@@ -1031,6 +1074,16 @@ function confirmationsOf(tx: NodeTransaction, fullHeight: number): number {
   const inclusionHeight = typeof tx.inclusionHeight === 'number' ? tx.inclusionHeight : null;
   if (typeof tx.numConfirmations === 'number') return tx.numConfirmations + 1;
   return inclusionHeight !== null ? fullHeight - inclusionHeight + 1 : 0;
+}
+
+/** The transaction id carried in a tracked entry's signed JSON, or undefined when it cannot be read. */
+function signedJsonId(json: string): string | undefined {
+  try {
+    const id = parseNodeJson<{ id?: unknown }>(json)?.id;
+    return typeof id === 'string' ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function summarize(tx: NodeTransaction, confirmations: number): Record<string, unknown> {

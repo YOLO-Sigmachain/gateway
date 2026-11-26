@@ -21,7 +21,14 @@ export interface ErgoNetworkConfig {
   tokenListSource: string;
   blockTimeSeconds: number;
   pendingTxTimeoutBlocks: number;
+  /** Blocks on top of (and including) the one holding a transaction before poll reports it confirmed. */
   confirmations: number;
+  /**
+   * Blocks on top of (and including) the one holding a different transaction that spent one
+   * of a pending transaction's inputs, before that pending transaction is reported failed.
+   * Unset: `confirmations`.
+   */
+  failedAfterConfirmations?: number;
   nodeTimeoutMs: number;
   boxPageSize: number;
   swapProvider?: string;
@@ -76,6 +83,8 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
   if (maxMinerFee < minerFee) {
     throw new Error(`${namespaceId}.maxMinerFee must be at least minerFee`);
   }
+  const confirmations = Number(required<number>(namespaceId, 'confirmations'));
+  const failedAfterConfirmations = Number(optional<number>(namespaceId, 'failedAfterConfirmations') ?? confirmations);
   return {
     nodeURL: String(required<string>(namespaceId, 'nodeURL')).trim().replace(/\/+$/, ''),
     addressPrefix,
@@ -87,7 +96,8 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
     tokenListSource: required<string>(namespaceId, 'tokenListSource'),
     blockTimeSeconds: Number(required<number>(namespaceId, 'blockTimeSeconds')),
     pendingTxTimeoutBlocks: Number(required<number>(namespaceId, 'pendingTxTimeoutBlocks')),
-    confirmations: Number(required<number>(namespaceId, 'confirmations')),
+    confirmations,
+    failedAfterConfirmations,
     nodeTimeoutMs: Number(optional<number>(namespaceId, 'nodeTimeoutMs') ?? DEFAULT_NODE_TIMEOUT_MS),
     boxPageSize: Number(optional<number>(namespaceId, 'boxPageSize') ?? DEFAULT_BOX_PAGE_SIZE),
     swapProvider: optional<string>(namespaceId, 'swapProvider'),
