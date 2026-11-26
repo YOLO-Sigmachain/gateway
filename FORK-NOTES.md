@@ -32,7 +32,7 @@ Not built: LithosDex order mode, deposit and redeem; Dexy; any network file for 
 
 ## 2. What is proven and what is not
 
-State of the code at `5d9480f7`.
+State of the code at `b9502f24`.
 
 ### Proven
 
@@ -43,9 +43,9 @@ State of the code at `5d9480f7`.
 | Contract proof on mainnet pool boxes kept as fixtures, LithosDex | The same two results (true for ours, false one unit over; also false for a successor register one unit off), on the signing library alpha build named below. Fixtures: an ERG/LIT pool and a LIT/RSN pool. | `test/connectors/ergodex/lithos-contract-proof.test.ts` |
 | Read-only run of the server against a mainnet node | Gateway started as a server, read pool boxes from a mainnet node, answered status, tokens, balances, pool-info and quotes for ERG/RSN, ERG/SigUSD, and a poll of an unknown id. Nothing was signed or sent. | Run on 25 November 2026, on an earlier commit than `5d9480f7` (see below). |
 
-Test counts, as of the latest commit (`5d9480f7`) and taken from its message: 206 suites pass and 1 is skipped; 1,946 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
+Test counts, as of commit `b9502f24` and taken from its message: 209 suites pass and 1 is skipped; 2,258 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
 
-The read-only server run happened before the commits that add `pendingData`, the `failedAfterConfirmations` depth and the LithosDex venue. It has not been repeated on `5d9480f7`. Its output shows a token list without ERG and a network config without `failedAfterConfirmations`, which the current templates have.
+The read-only server run happened before the commits that add `pendingData`, the `failedAfterConfirmations` depth, the LithosDex venue and `submitMode`. It has not been repeated since. Its output shows a token list without ERG and a network config without `failedAfterConfirmations`, which the current templates have.
 
 ### Not proven
 
@@ -53,6 +53,7 @@ The read-only server run happened before the commits that add `pendingData`, the
 - What a live node answers at submit, and when a transaction is posted again, was read from node source code. It was not observed. The HTTP codes in section 4 rest on that reading.
 - LithosDex pool boxes are at ErgoTree version 3, which `ergo-lib-wasm-nodejs` 0.28.0 cannot read. A transaction with a version-3 input is therefore signed with `ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3`. That is an unreleased build of the library, installed under the alias `ergo-lib-wasm-nodejs-alpha` and loaded only when such a transaction is signed (its wasm file is about 17 MB). Everything else signs with 0.28.0. Whether a node accepts a LithosDex swap built and signed this way has not been tested.
 - The pool allowlist for LithosDex ships empty, so no LithosDex pool is offered until you list one.
+- The check-only mode (section 3.5) exists so that a real node can judge a real signed swap without anything being broadcast. It has been tested against stand-in nodes only. What the node's check endpoint does was read from the node's API description and source, not observed.
 
 ## 3. Running it for Ergo
 
@@ -120,6 +121,8 @@ The testnet file differs only in `nodeURL` (`http://127.0.0.1:9052`), `addressPr
 | `failedAfterConfirmations` | How deep a different transaction that spent one of our inputs must be before ours is reported FAILED. Unset: the value of `confirmations`. | `3` |
 | `nodeTimeoutMs` | Node request timeout. Default 10000. | `10000` |
 | `boxPageSize` | Page size for box queries, 1 to 500. Default 100. | `100` |
+| `submitMode` | What happens to a signed transaction: `send`, `check`, or not set. **Not set, nothing is signed or sent** (section 3.5). | not set (a commented example line) |
+| `checkAllowsRemoteNode` | Lets `check` mode run against a node that is not on this machine. In `check` mode the node receives the signed transaction in full. | not set |
 | `swapProvider` | Connector used on the unified trading routes when a request names none (`connector/type`). | `ergodex/amm` |
 
 With `failedAfterConfirmations: 3` and 120-second blocks, a lost race is reported about six minutes after the winning transaction lands.
@@ -177,6 +180,29 @@ The deployment check rebuilds the pool's contract tree from its own ids and requ
 - the fees are in range;
 - the pool's size is enough for what you want to trade.
 
+#### 3.5 Sending is off until you turn it on: `submitMode`
+
+A fresh config sends nothing on Ergo. The network file (`conf/chains/ergo/<network>.yml`) must say what to do with a signed transaction, in one top-level key:
+
+| `submitMode` | What happens |
+|---|---|
+| not set (no line) | Every swap and transfer is refused with a 503 that names the line to add. The wallet key is not loaded. Quotes, pool info, balances, status and poll work. |
+| `check` | The swap or transfer is built, bounded and signed as usual, then posted to the node's `POST /transactions/check`, which validates it against the node's boxes, scripts included, and does not take or relay it. Nothing is recorded or kept. The answer is never PENDING: a 409 "Check only: the node accepted transaction ... as valid; nothing was sent" with what it would move, a 400 with the node's reason if the node refuses it, or a 503 if the check gave no verdict. |
+| `send` | The transaction is submitted to the node, which relays it. |
+
+Use `check` for a dry run with a real wallet before you send anything.
+
+Rules that keep the mode from being something other than what you wrote:
+
+- **Change it only with Gateway stopped.** Edit the file, start Gateway, make one read request on the network (status or balances), and read the log line `ergo-<network>.submitMode is ...` before you execute anything. It is written when the network is first used, in every state.
+- At every submit, the mode Gateway started with, the config in memory and the file on disk must agree. If they do not, nothing is sent, the answer is a 503, and the network refuses to send or check until Gateway is restarted.
+- A value other than exactly `send` or `check` stops the config from loading. A key that looks like `submitMode` but is not it (another case, a typo, a prefix such as `ergo-mainnet.submitMode`, a nested copy, a near-synonym such as `dryRun` or `mode`), in the network file or in `conf/chains/ergo.yml`, stops the network.
+- If an Ergo config file was edited by hand while Gateway runs, an update of that namespace through the config API is refused with a 409 until Gateway is restarted. Without this the API update would rewrite the file from memory and erase the edit.
+- `check` mode starts only when `nodeURL` is on this machine (`localhost`, `127.0.0.0/8` or `::1`), unless `checkAllowsRemoteNode: true`, and never when Node is set to route `fetch` through a proxy from the environment. The node in a check receives the whole signed transaction; whoever runs or can watch it could broadcast it.
+- In `check` mode a transaction tracked from an earlier `send` run is kept and not posted again.
+
+A check validates against the node's current boxes and mempool. It does not prove that a later send is accepted (the pool box may have moved by then), and if the pool box was spent first, a check answers 400 where a send would rebuild; run the check again.
+
 ## 4. How a swap behaves here
 
 Route: `POST /trading/amm/execute-swap`, with `chainNetwork` `ergo-mainnet`. A request that names no connector on chain `ergo` uses the network's `swapProvider`. A request with no `poolAddress` lets `ergodex` choose; a pool NFT id pins one pool.
@@ -210,9 +236,11 @@ The strictest of these binds. Every build, the first and each rebuild, must meet
 | 409 | The pool moved. Either the swap would now fall outside the bound, or the pool box was spent first and still was after `maxRebuilds` re-reads. Nothing that can still execute was submitted. Retry with a fresh quote. |
 | 503 | Not submitted: the connection to the node was refused or its name did not resolve, so no byte was sent. Also any other node error with status 0. |
 | 504 (`TRANSACTION_TIMEOUT`) | The outcome is unknown: the connection broke after it may have been made, the node answered 5xx, or it answered 200 with no id. The message carries the transaction id. Poll it; do not send the swap again. Gateway does not rebuild or re-post in this case. |
+| 409 ("Check only") | `submitMode` is `check` and the node found the transaction valid. Nothing was sent. |
+| 503 (`submitMode` not set, or in doubt) | Nothing was signed or sent. Set the mode, or restart Gateway, as the message says (section 3.5). |
 | 500 | Any other error from the node. |
 
-A 400 or 503 at submit is definite only after Gateway has written the release of that transaction to the pending file. If that write fails, the answer is the 504 case instead, so a restart cannot post something the caller was told was not sent.
+Text the node sends back is cut and stripped of signature bytes before it goes into any answer or log. A 400 or 503 at submit is definite only after Gateway has written the release of that transaction to the pending file. If that write fails, the answer is the 504 case instead, so a restart cannot post something the caller was told was not sent.
 
 ## 5. Differences from upstream that affect everyone
 
@@ -224,7 +252,7 @@ A 400 or 503 at submit is definite only after Gateway has written the release of
 
 4. **`openapi.json`** is regenerated to match these changes.
 
-Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `5d9480f7`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
+Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `b9502f24`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
 
 ## 6. Shared upstream files this fork touches
 
@@ -238,7 +266,7 @@ Everything outside `src/chains/ergo`, `src/connectors/ergodex`, `test/chains/erg
 | `src/chains/default-wallet.ts` | Returns `ergo.defaultWallet` for chain `ergo`. |
 | `src/config/routes/getChains.ts` | Lists `ergo` among known chains. |
 | `src/config/routes/getConnectors.ts` | Lists `ergodex`; adds the optional `binds_price_limit` field. |
-| `src/config/utils.ts` | Adds `ergo` to the known chains used to read config namespaces. |
+| `src/config/utils.ts` | Adds `ergo` to the known chains used to read config namespaces. An update through the config API to the `ergo` namespace or an `ergo-<network>` namespace is refused with a 409 when that namespace's config file was changed on disk while Gateway was running (section 3.5). Other chains' updates are unchanged. |
 | `src/services/config-manager-v2.ts` | Adds `ergo` to the chains whose network namespaces are collected. |
 | `src/services/connection-manager.ts` | Adds `Ergo` to the chain instances and to the supported chain list. |
 | `src/services/pool-service.ts` | Maps `ergo` to the Ergo chain enum; a pool and its tokens must be 64-hex ids. |
@@ -293,7 +321,7 @@ The fork is additive. Ergo code lives in its own folders. The edits to shared fi
    `pnpm test` runs `GATEWAY_TEST_MODE=dev jest --verbose`. `pnpm lint` runs eslint with `--fix`, so it can edit files; review its changes.
 
    Tests need Node 22 or newer: `package.json` has `"engines": { "node": ">=22.0.0" }`. Upstream's CI workflow currently sets up Node 20, which is below that range. `package.json` has no pnpm entry under `engines`; it lists `"pnpm": "^10.10.0"` among its dependencies, and CI installs pnpm 10. Use pnpm 10.10 or newer.
-7. **Compare with the last known counts.** At `5d9480f7`: 206 suites pass and 1 is skipped; 1,946 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
+7. **Compare with the last known counts.** At `b9502f24`: 209 suites pass and 1 is skipped; 2,258 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
 8. **Commit the merge** and push the branch to the fork.
 
 ## 8. Known limits and open items
