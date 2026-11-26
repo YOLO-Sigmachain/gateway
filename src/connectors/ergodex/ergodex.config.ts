@@ -12,6 +12,9 @@ import { getAvailableErgoNetworks, isErgoId, isHexBytes, parseUnits } from '../.
 import { AvailableNetworks } from '../../services/base';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
 
+import { encodeLong } from './venues/lithos/lithos.math';
+import { ergoTreeConstants } from './venues/spectrum/spectrum.math';
+
 /** Spectrum-style pools (ERG/token "n2t" and token/token "t2t") on one network. */
 export interface SpectrumVenueConfig {
   /** Exact ErgoTrees (hex) of ERG/token pools. A box is a pool of this kind only at one of these. */
@@ -189,11 +192,33 @@ function lithos(value: unknown, where: string): LithosVenueConfig | undefined {
   };
 }
 
-/** The Spectrum LP constant when set: positive and at most the largest Long, as the contracts hold it. */
-function spectrumLockedLiquidity(value: unknown, where: string): { lockedLiquidity?: bigint } {
+/**
+ * The Spectrum LP constant when set: positive, at most the largest Long, and the value
+ * the pool contracts themselves carry. Every configured Spectrum pool tree must hold it
+ * as a Long constant: with any other value the connector would price deposits and
+ * redeems differently from the contract, and the contract accepts a deposit that pays
+ * the depositor fewer LP tokens than it allows.
+ */
+function spectrumLockedLiquidity(
+  value: unknown,
+  where: string,
+  poolTrees: Record<'n2tPoolTrees' | 't2tPoolTrees', string[]>,
+): { lockedLiquidity?: bigint } {
   if (value === undefined || value === null || value === '') return {};
   const v = amount(value, 0n, where);
   if (v <= 0n || v > 2n ** 63n - 1n) throw new Error(`${where} must be positive and at most 9223372036854775807`);
+  const encoded = encodeLong(v);
+  const spectrum = where.replace(/\.lockedLiquidity$/, '');
+  for (const key of ['n2tPoolTrees', 't2tPoolTrees'] as const) {
+    poolTrees[key].forEach((tree, i) => {
+      if (!(ergoTreeConstants(tree) ?? []).includes(encoded)) {
+        throw new Error(
+          `${spectrum}.${key}[${i}] does not hold ${where} (${v}) as a Long constant: set the LP constant ` +
+            "the pool contract carries, which is not the LP token's emission",
+        );
+      }
+    });
+  }
   return { lockedLiquidity: v };
 }
 
@@ -272,7 +297,10 @@ export namespace ErgodexConfig {
         t2tPoolTrees,
         feeDenominator,
         n2tMinSuccessorValue: amount(spectrum.n2tMinSuccessorValue, 0n, `${where}.spectrum.n2tMinSuccessorValue`),
-        ...spectrumLockedLiquidity(spectrum.lockedLiquidity, `${where}.spectrum.lockedLiquidity`),
+        ...spectrumLockedLiquidity(spectrum.lockedLiquidity, `${where}.spectrum.lockedLiquidity`, {
+          n2tPoolTrees,
+          t2tPoolTrees,
+        }),
       },
       ...(lithosConfig ? { lithos: lithosConfig } : {}),
     };

@@ -9,9 +9,14 @@
  * whole balance would pay on that box, rounded down as the contract rounds them. `price`
  * is the pool's marginal price, quote per base, from its reserves.
  *
- * A pool counts only if it passes every check a swap requires (venue, NFT supply, guards
- * and allowlist); a pool that fails is refused by position-info and skipped by
- * positions-owned. An LP token that more than one pool box claims is skipped as ambiguous.
+ * A pool counts if it is a pool (venue, NFT supply 1) and the real pool of its LP token
+ * (it holds more than half of that token's emission). The entry guards (fee ceiling, size
+ * floors, allowlist) do not apply: a holder must see a position in a pool they could no
+ * longer enter, to leave it. When more than one box at a pool tree holds the same LP
+ * token, the real pool among them is used and the others are ignored. An error the
+ * caller should retry (status 500 or above, or 409) while reading a pool fails the
+ * request, unless another box holding that LP token is its real pool: a list missing a
+ * position because of it would look complete.
  */
 import { Ergo } from '../../../chains/ergo/ergo';
 import { PositionInfo } from '../../../schemas/amm-schema';
@@ -73,43 +78,65 @@ export async function getPositionInfo(
   try {
     const dex = await Ergodex.getInstance(network);
     const held = await confirmedHoldings(dex.ergo, walletAddress);
-    const fresh = await dex.freshLiquidityPool(poolAddress, { confirmedOnly: true });
+    const fresh = await dex.freshLiquidityPool(poolAddress, { confirmedOnly: true, exit: true });
     return positionOf(fresh, walletAddress, held.get(fresh.lpToken.tokenId!) ?? 0n);
   } catch (error) {
     throw ergodexError(error, 'Failed to get ergodex position info');
   }
 }
 
+/** An error the caller should retry, or that is not a refusal of this one pool. */
+function mustRethrow(error: unknown): boolean {
+  const status = (error as { statusCode?: number }).statusCode;
+  return status === undefined || status >= 500 || status === 409;
+}
+
 /**
- * Every position the wallet holds: each LP token in its confirmed boxes that is the LP
- * token of a pool found at the configured pool trees, for pools that pass the checks.
+ * Every position the wallet holds: each LP token in its confirmed boxes whose real pool
+ * is found at the configured pool trees.
  */
 export async function getPositionsOwned(network: string, walletAddress: string): Promise<PositionInfo[]> {
   try {
     const dex = await Ergodex.getInstance(network);
     dex.assertLiquidityOffered();
     const held = await confirmedHoldings(dex.ergo, walletAddress);
+    const { pools, complete } = await dex.discoverPoolList();
+    if (!complete) {
+      logger.warn(
+        `ergodex: positions-owned on ${network} read only part of a pool tree (more than maxDiscoveredBoxes ` +
+          'boxes); a position can be missing from the list',
+      );
+    }
     const byLp = new Map<string, string[]>();
-    for (const found of await dex.discoverPools()) {
+    for (const found of pools) {
       if (!found.lpTokenId || !held.get(found.lpTokenId)) continue;
       byLp.set(found.lpTokenId, [...(byLp.get(found.lpTokenId) ?? []), found.poolId]);
     }
     const positions: PositionInfo[] = [];
     for (const [lpTokenId, poolIds] of byLp) {
-      if (poolIds.length > 1) {
-        logger.warn(`ergodex: LP token ${lpTokenId} is claimed by ${poolIds.length} pool boxes; not counted`);
-        continue;
+      // Only one box can be the real pool of an LP token (see freshLiquidityPool); any
+      // other box holding it is refused there with a 400 and ignored here.
+      let position: PositionInfo | null = null;
+      let retry: unknown;
+      for (const poolId of poolIds) {
+        let fresh: FreshLiquidityPool;
+        try {
+          fresh = await dex.freshLiquidityPool(poolId, { confirmedOnly: true, exit: true });
+        } catch (error) {
+          if (mustRethrow(error)) {
+            retry ??= error;
+          } else {
+            logger.info(`ergodex: pool ${poolId} not counted for LP token ${lpTokenId}: ${(error as Error).message}`);
+          }
+          continue;
+        }
+        if (fresh.lpToken.tokenId !== lpTokenId) continue;
+        position = positionOf(fresh, walletAddress, held.get(lpTokenId)!);
+        break;
       }
-      let fresh: FreshLiquidityPool;
-      try {
-        fresh = await dex.freshLiquidityPool(poolIds[0], { confirmedOnly: true });
-      } catch (error) {
-        if ((error as { statusCode?: number }).statusCode === undefined) throw error;
-        logger.info(`ergodex: pool ${poolIds[0]} not counted as a position: ${(error as Error).message}`);
-        continue;
-      }
-      if (fresh.lpToken.tokenId !== lpTokenId) continue;
-      positions.push(positionOf(fresh, walletAddress, held.get(lpTokenId)!));
+      if (position) positions.push(position);
+      else if (retry !== undefined) throw retry;
+      // else: no box is the real pool of this token, so it is not a position
     }
     return positions.sort((a, b) => (a.poolAddress < b.poolAddress ? -1 : 1));
   } catch (error) {

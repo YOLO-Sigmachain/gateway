@@ -248,7 +248,7 @@ export function numberToPlainString(value: number): string {
 }
 
 /** `d.ddd` times 10^exp as a plain decimal string. */
-function expandExponent(whole: string, fraction: string, exp: number): string {
+export function expandExponent(whole: string, fraction: string, exp: number): string {
   const digits = (whole + fraction).replace(/^0+(?=\d)/, '');
   const point = whole.replace(/^0+(?=\d)/, '').length + exp;
   if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`.replace(/\.?0+$/, '') || '0';

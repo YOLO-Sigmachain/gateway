@@ -16,7 +16,9 @@
  *
  * Protections, as for a swap, all before signing: the pool box read fresh (the mempool
  * successor under the same rule, and then also bound by the confirmed box when someone
- * else's transaction made it); the pool guards and allowlist; a bound on the pool price
+ * else's transaction made it); the box the real pool of its LP token; on a deposit the
+ * pool guards and allowlist (a redeem leaves the pool, and they would only keep the
+ * caller's funds in it); a bound on the pool price
  * (y per x) between the first fresh read and every build, of `slippagePct` (or the config
  * default) either way, and on what the change pays (LP tokens out on a deposit, each side
  * out on a redeem) of the same percentage below the first read; the built transaction
@@ -30,7 +32,7 @@
 import { ErgoCheckOnlyError, ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
-import { formatUnits, parseUnits, symbolForMessage, tokenForMessage } from '../../../chains/ergo/ergo.utils';
+import { expandExponent, formatUnits, symbolForMessage, tokenForMessage } from '../../../chains/ergo/ergo.utils';
 import { ErgoWalletAccount } from '../../../chains/ergo/ergo.wallet';
 import {
   AddLiquidityResponseType,
@@ -53,6 +55,7 @@ import {
   TokenRef,
   units,
 } from '../ergodex';
+import { VenueRuleError } from '../venues/venue';
 
 import { ergodexError } from './errors';
 
@@ -392,18 +395,93 @@ export async function addLiquidity(
   }
 }
 
-/** `percentageToRemove` as an exact integer with 8 decimal places; a 400 unless above 0 and at most 100. */
-function percentToRemove(pct: number): bigint {
-  let scaled: bigint;
-  try {
-    scaled = parseUnits(pct, 8);
-  } catch (error) {
-    throw httpErrors.badRequest(`percentageToRemove: ${(error as Error).message}`);
+/** 100% with 8 decimal places, the scale of `percentToRemove`. */
+const HUNDRED_PCT = 100n * 10n ** 8n;
+
+/**
+ * `percentageToRemove` as an integer with 8 decimal places. Digits past the 8th are cut
+ * off (toward zero), whatever their number, as other connectors read this field: the
+ * result can only remove less than asked. The cut is made on the number's shortest
+ * decimal text (its exponent form expanded by moving the point), never by float
+ * arithmetic. A 400 for a value that is not a finite number, is not above 0 (also once
+ * cut), or is above 100.
+ */
+export function percentToRemove(pct: number): bigint {
+  const refused = () => httpErrors.badRequest('percentageToRemove must be above 0 and at most 100');
+  if (typeof pct !== 'number' || !Number.isFinite(pct)) {
+    throw httpErrors.badRequest(`percentageToRemove must be a finite number, not ${String(pct)}`);
   }
-  if (scaled <= 0n || scaled > 100n * 10n ** 8n) {
-    throw httpErrors.badRequest('percentageToRemove must be above 0 and at most 100');
-  }
+  if (pct <= 0 || pct > 100) throw refused();
+  const text = pct.toString();
+  const match = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/i.exec(text);
+  if (!match) throw httpErrors.badRequest(`percentageToRemove: cannot read ${text}`);
+  const plain = match[3] === undefined ? text : expandExponent(match[1], match[2] ?? '', Number(match[3]));
+  const [whole, fraction = ''] = plain.split('.');
+  const scaled = BigInt(whole + fraction.slice(0, 8).padEnd(8, '0'));
+  if (scaled <= 0n || scaled > HUNDRED_PCT) throw refused();
   return scaled;
+}
+
+/**
+ * The most LP tokens, at most `upTo`, whose redeem the pool can pay now: one whose
+ * successor keeps both sides above zero, an ERG/token pool above its storage floor, and
+ * every other rule of the venue. What a redeem takes of each side only grows with the LP
+ * returned, so the redeems the pool can pay are all those up to some amount, found here
+ * by binary search with the venue's own successor check. A redeem so small that a side
+ * rounds to zero counts as payable in the search (it is refused for that, on its own).
+ */
+function largestPayableRedeem(fresh: FreshLiquidityPool, upTo: bigint): bigint {
+  const { venue, pool } = fresh;
+  const payable = (lp: bigint): boolean => {
+    try {
+      const change = venue.redeemFor!(pool, lp);
+      if (change.x <= 0n || change.y <= 0n) return true;
+      venue.liquiditySuccessor!(pool, change);
+      return true;
+    } catch (error) {
+      if (error instanceof VenueRuleError) return false;
+      throw error;
+    }
+  };
+  if (payable(upTo)) return upTo;
+  let lo = 0n; // payable
+  let hi = upTo; // not payable
+  while (hi - lo > 1n) {
+    const mid = (lo + hi) / 2n;
+    if (payable(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * The redeem of `lp` the pool cannot pay (it would empty a side or cross the storage
+ * floor): the refusal, naming the most LP tokens and the share of the wallet's `held`
+ * that can be removed now. Null when the refusal is for something else.
+ */
+function cannotPayRefusal(error: unknown, fresh: FreshLiquidityPool, lp: bigint, held: bigint): Error | null {
+  if ((error as { statusCode?: number }).statusCode !== 400) return null;
+  try {
+    const change = fresh.venue.redeemFor!(fresh.pool, lp);
+    if (change.x <= 0n || change.y <= 0n) return null; // a side rounds to zero: too little, not too much
+  } catch (e) {
+    if (!(e instanceof VenueRuleError)) throw e;
+  }
+  const most = largestPayableRedeem(fresh, lp);
+  if (most >= lp) return null;
+  const message = (error as Error).message;
+  let payableNow = most > 0n;
+  if (payableNow) {
+    const change = fresh.venue.redeemFor!(fresh.pool, most);
+    payableNow = change.x > 0n && change.y > 0n;
+  }
+  if (!payableNow) return httpErrors.badRequest(`${message}; none of the wallet's LP tokens can be removed now`);
+  const pct = (most * HUNDRED_PCT) / held; // rounded down: removing this share takes at most `most`
+  const lpDecimals = fresh.lpToken.decimals;
+  return httpErrors.badRequest(
+    `${message}; at most ${formatUnits(most, lpDecimals)} LP tokens, ${formatUnits(pct, 8)}% of the wallet's ` +
+      `${formatUnits(held, lpDecimals)}, can be removed now`,
+  );
 }
 
 /**
@@ -427,7 +505,8 @@ export async function removeLiquidity(
     const applied = slippagePct ?? dex.root.slippagePct;
     const slip = pctToScaled(applied);
     const pct = percentToRemove(percentageToRemove);
-    const fresh = await dex.freshLiquidityPool(poolAddress);
+    // leaving a pool: the entry guards do not apply (see freshLiquidityPool)
+    const fresh = await dex.freshLiquidityPool(poolAddress, { exit: true });
     const lpId = fresh.lpToken.tokenId!;
     const boxes = await dex.ergo.getSpendableBoxes(walletAddress);
     const held = boxes
@@ -444,8 +523,13 @@ export async function removeLiquidity(
       );
     }
     const replan = async (options: { confirmedOnly?: boolean } = {}) =>
-      dex.planRedeem(await dex.freshLiquidityPool(poolAddress, options), lp);
-    const first = dex.planRedeem(fresh, lp);
+      dex.planRedeem(await dex.freshLiquidityPool(poolAddress, { ...options, exit: true }), lp);
+    let first: LiquidityPlan;
+    try {
+      first = dex.planRedeem(fresh, lp);
+    } catch (error) {
+      throw cannotPayRefusal(error, fresh, lp, held) ?? error;
+    }
     const refs = await referencePlans(dex, first, () => replan({ confirmedOnly: true }));
     const minX = refs.map((r) => slipDown(r.change.x, slip)).reduce((a, b) => (b > a ? b : a));
     const minY = refs.map((r) => slipDown(r.change.y, slip)).reduce((a, b) => (b > a ? b : a));

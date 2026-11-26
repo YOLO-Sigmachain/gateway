@@ -185,3 +185,57 @@ export function decodeSInt(hex: string | undefined): number | null {
   }
   return null;
 }
+
+/**
+ * The serialized constants (type byte and value, as hex) of a constant-segregated
+ * ErgoTree, in order: the table after the header byte and, when the header says so, the
+ * tree's size. Read only as far as constants of plain types go (Boolean, Byte, Short,
+ * Int, Long, BigInt, GroupElement, Coll[Byte]); the rest of the table is not returned.
+ * Null for a tree without a constants table, or one that cannot be read.
+ */
+export function ergoTreeConstants(treeHex: string): string[] | null {
+  if (!/^([0-9a-f]{2})+$/i.test(treeHex)) return null;
+  const bytes = Buffer.from(treeHex, 'hex');
+  let pos = 0;
+  const byte = (): number => {
+    if (pos >= bytes.length) throw new Error('truncated');
+    return bytes[pos++];
+  };
+  const vlq = (): number => {
+    let value = 0;
+    for (let i = 0, shift = 0; i < 5; i++, shift += 7) {
+      const b = byte();
+      value += (b & 0x7f) * 2 ** shift;
+      if ((b & 0x80) === 0) return value;
+    }
+    throw new Error('VLQ too long');
+  };
+  const skip = (n: number) => {
+    if (pos + n > bytes.length) throw new Error('truncated');
+    pos += n;
+  };
+  const skipVlq = () => {
+    while (byte() & 0x80);
+  };
+  try {
+    const header = byte();
+    if ((header & 0x10) === 0) return null; // constants are not segregated: no table
+    if (header & 0x08) vlq(); // the tree's size
+    const count = vlq();
+    const constants: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const start = pos;
+      const type = byte();
+      if (type === 0x01 || type === 0x02) skip(1);
+      else if (type === 0x03 || type === 0x04 || type === 0x05) skipVlq();
+      else if (type === 0x06) skip(vlq());
+      else if (type === 0x07) skip(33);
+      else if (type === 0x0e) skip(vlq());
+      else break; // a type this reader does not size
+      constants.push(bytes.subarray(start, pos).toString('hex'));
+    }
+    return constants;
+  } catch {
+    return null;
+  }
+}

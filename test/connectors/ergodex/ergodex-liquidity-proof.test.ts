@@ -9,7 +9,9 @@
  * side as the one that limits it. Nothing is sent: there is no node here.
  *
  * Also here: our own bigint contract rule agrees with the script on every case, and the
- * pre-signing check refuses a built transaction that is not its plan.
+ * pre-signing check refuses a built transaction that is not its plan. And why a pool box
+ * must be the real pool of the LP token it holds: the deployed script accepts a redeem of
+ * a real pool's LP tokens into a box anyone can create at the pool tree.
  */
 import { buildUnsignedTransaction, changeDelta, ErgoOutputSpec } from '../../../src/chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
@@ -20,6 +22,7 @@ import { FEE_TREE, GENERATOR_PK } from '../../chains/ergo/ergo-test-helpers';
 import {
   ERG,
   HEADERS,
+  makeBox,
   makeDex,
   ME_TREE,
   newNodeState,
@@ -30,7 +33,9 @@ import {
   signer,
   SIGUSD,
   SIGUSD_POOL,
+  R4,
   T2T_POOL,
+  T2T_TREE,
   TIP,
   walletBox,
   WT_ADA,
@@ -276,5 +281,39 @@ describe('the pre-signing check refuses a built liquidity transaction that is no
     expect(() => verifyLiquidityTransaction(other, build(RSN_POOL, plan.successor, wallet))).toThrow(
       'the pool must be input 0',
     );
+  });
+});
+
+describe('a box anyone can create at the pool tree: the contract does not tell it from the real pool', () => {
+  it("the deployed token/token script accepts a redeem of the real ERG/RSN pool's LP tokens for junk tokens", async () => {
+    const realLp = RSN_POOL.assets[1].tokenId;
+    // an NFT of one's own, one unit of the real LP token, and two junk tokens of near-largest supply
+    const fake = makeBox({
+      ergoTree: T2T_TREE,
+      value: 4000000n,
+      creationHeight: TIP - 5,
+      assets: [
+        { tokenId: 'f1'.repeat(32), amount: 1n },
+        { tokenId: realLp, amount: 1n },
+        { tokenId: 'f2'.repeat(32), amount: 2n ** 63n - 2n },
+        { tokenId: 'f3'.repeat(32), amount: 2n ** 63n - 2n },
+      ],
+      registers: { R4: R4(997) },
+    });
+    const f = fresh(fake, tok('f2'.repeat(32), 'FX', 0), tok('f3'.repeat(32), 'FY', 0));
+    expect(f.lpToken.tokenId).toBe(realLp);
+    // the holding a deposit of 1 ERG into the real pool buys
+    const held = 4867691n;
+    const plan = dex.planRedeem(f, held);
+    expect([plan.change.x, plan.change.y]).toEqual([held, held]);
+    const wallet = walletBox(ERG / 10n, [{ tokenId: realLp, amount: held }]);
+    const built = build(fake, plan.successor, wallet);
+    const signed = await sign(built);
+    // the pool input signs with an empty proof: the script reduced to true
+    expect(signed.parsed.inputs[0].spendingProof.proofBytes).toBe('');
+    const delta = changeDelta(built);
+    expect(delta.get(realLp)).toBe(-held);
+    expect(delta.get('f2'.repeat(32))).toBe(held);
+    expect(delta.get('f3'.repeat(32))).toBe(held);
   });
 });

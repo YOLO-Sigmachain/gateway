@@ -49,7 +49,10 @@ export interface DiscoveredPool {
 }
 
 /** Discovery results per chain instance (one per network), by trees and limit. */
-const discoveryCache = new WeakMap<Ergo, Map<string, { height: number; at: number; pools: DiscoveredPool[] }>>();
+const discoveryCache = new WeakMap<
+  Ergo,
+  Map<string, { height: number; at: number; pools: DiscoveredPool[]; complete: boolean }>
+>();
 
 function holdsPairIds(ids: Array<string | null>, a: TokenRef, b: TokenRef): boolean {
   return a.tokenId !== b.tokenId && ids.includes(a.tokenId) && ids.includes(b.tokenId);
@@ -361,6 +364,32 @@ export class Ergodex {
     }
   }
 
+  /**
+   * The box must be the pool of the LP token it holds. Anyone can create a box at a pool
+   * tree with an NFT of their own and one unit of a real pool's LP token, and the pool
+   * contract lets a redeem there take the caller's real LP tokens for whatever that box
+   * holds. The real pool is told apart by how much of the LP token it holds: a pool is
+   * created holding nearly all of its LP token's emission and pays LP out only against
+   * deposits, so it keeps more than half of it unless more than half is in circulation,
+   * which would take reserves near the largest amount a box can hold. The boxes holding a
+   * token cannot together hold more than its emission, so only one box can hold more than
+   * half: a box holding half or less is not the pool of that LP token. The emission is
+   * the node's answer, cached by the chain layer (a token is minted once).
+   */
+  private async assertPoolOfLpToken(pool: VenuePool, lpTokenId: string): Promise<void> {
+    const emission = await this.ergo.getTokenEmission(lpTokenId);
+    if (emission === null) {
+      throw httpErrors.serviceUnavailable(`The node does not report the supply of LP token ${lpTokenId} yet; retry`);
+    }
+    const held = pool.box.assets[1].amount;
+    if (2n * held <= emission) {
+      throw httpErrors.badRequest(
+        `Box ${pool.box.boxId} (pool NFT ${pool.poolId}) is not the pool of LP token ${lpTokenId}: it holds ` +
+          `${held} of the ${emission} minted, and that LP token's pool holds more than half`,
+      );
+    }
+  }
+
   /** The reason a pool may not be traded, or null when every guard passes. */
   guardFailure(pool: VenuePool): string | null {
     const venueFailure = this.venues.find((v) => v.name === pool.venue)?.guardFailure?.(pool);
@@ -398,6 +427,11 @@ export class Ergodex {
    * every pool box.
    */
   async discoverPools(): Promise<DiscoveredPool[]> {
+    return (await this.discoverPoolList()).pools;
+  }
+
+  /** The same list, and whether every pool tree was read whole (false: a pool can be missing). */
+  async discoverPoolList(): Promise<{ pools: DiscoveredPool[]; complete: boolean }> {
     this.assertConfigured();
     const trees = this.venues.flatMap((venue) => (venue === this.spectrum ? this.spectrum.trees : []));
     const key = `${this.config.maxDiscoveredBoxes}:${trees.join(',')}`;
@@ -406,8 +440,11 @@ export class Ergodex {
     if (!cache) discoveryCache.set(this.ergo, (cache = new Map()));
     const hit = cache.get(key);
     const ttlMs = this.ergo.config.blockTimeSeconds * 1000;
-    if (hit && hit.height === fullHeight && Date.now() - hit.at < ttlMs) return hit.pools;
+    if (hit && hit.height === fullHeight && Date.now() - hit.at < ttlMs) {
+      return { pools: hit.pools, complete: hit.complete };
+    }
     const found: DiscoveredPool[] = [];
+    let allRead = true;
     for (const venue of this.venues) {
       const venueTrees = venue === this.spectrum ? this.spectrum.trees : [];
       for (const tree of venueTrees) {
@@ -416,6 +453,7 @@ export class Ergodex {
           this.config.maxDiscoveredBoxes,
         );
         if (!complete) {
+          allRead = false;
           logger.warn(
             `ergodex: more than ${this.config.maxDiscoveredBoxes} unspent boxes at a ${venue.name} pool tree on ` +
               `${this.network}; choosing among the ${boxes.length} read. Raise maxDiscoveredBoxes or set poolAllowlist.`,
@@ -437,8 +475,8 @@ export class Ergodex {
         }
       }
     }
-    cache.set(key, { height: fullHeight, at: Date.now(), pools: found });
-    return found;
+    cache.set(key, { height: fullHeight, at: Date.now(), pools: found, complete: allRead });
+    return { pools: found, complete: allRead };
   }
 
   // ------------------------------------------------------------------------------------
@@ -519,12 +557,31 @@ export class Ergodex {
 
   /**
    * Read the pool fresh for a deposit or redeem: only a venue that offers liquidity (else
-   * 501), every guard a swap applies, and the pool's two tokens and LP token resolved.
+   * 501), the box the real pool of the LP token it holds (else 400), and the pool's two
+   * tokens and LP token resolved.
+   * Entering (quote, add) applies every guard a swap applies. Leaving (`exit`: remove and
+   * the position reads) does not: the fee ceiling, the size floors and the allowlist keep
+   * a caller out of a pool, and applied to a redeem they would only keep the caller's
+   * funds in it. A redeem pays no pool fee and takes the holder's share as the contract
+   * fixes it. A guard that would have refused an entry is logged as a warning.
    */
-  async freshLiquidityPool(poolId: string, options: { confirmedOnly?: boolean } = {}): Promise<FreshLiquidityPool> {
-    const fresh = await this.getFreshPool(poolId, { ...options, forLiquidity: true });
-    this.assertAllowed(fresh.pool);
+  async freshLiquidityPool(
+    poolId: string,
+    options: { confirmedOnly?: boolean; exit?: boolean } = {},
+  ): Promise<FreshLiquidityPool> {
+    const { exit, ...read } = options;
+    const fresh = await this.getFreshPool(poolId, { ...read, forLiquidity: true });
+    if (!exit) this.assertAllowed(fresh.pool);
     const { lpTokenId, supply } = this.liquidityOf(fresh);
+    await this.assertPoolOfLpToken(fresh.pool, lpTokenId);
+    if (exit) {
+      const failure = this.guardFailure(fresh.pool);
+      if (failure) {
+        logger.warn(
+          `ergodex: ${failure}; a deposit would be refused, but leaving the pool or reading a position is not`,
+        );
+      }
+    }
     const base = await this.tokenOfSide(fresh.pool.x.tokenId);
     const quote = await this.tokenOfSide(fresh.pool.y.tokenId);
     const lpToken = await this.tokenOfSide(lpTokenId);

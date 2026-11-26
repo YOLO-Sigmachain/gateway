@@ -6,8 +6,11 @@
  * exactly the plan; the rebuild when the pool box was spent first; the pool price bound
  * (on a rebuild, and against the confirmed box when someone else's unconfirmed box moved
  * it); submitMode not set (refused before the key is loaded) and `check` (checked only);
- * the guards; positions from confirmed LP balances, skipping a pool that fails a guard;
- * LithosDex pools and create-pool answering 501.
+ * the guards on entry only (remove and the position reads go ahead on a pool an entry
+ * guard refuses); a box at a pool tree that is not the pool of the LP token it holds,
+ * refused everywhere and ignored by positions-owned; a removal the pool cannot pay naming
+ * what it can; positions from confirmed LP balances; LithosDex pools and create-pool
+ * answering 501.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -17,9 +20,14 @@ import * as yaml from 'js-yaml';
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { normalizeNodeBox } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
+import { parseUnits } from '../../../src/chains/ergo/ergo.utils';
+import { percentToRemove } from '../../../src/connectors/ergodex/amm-routes/liquidity';
 import { Ergodex, NATIVE_TOKEN_ID } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
+import { encodeLong } from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
+import { ergoTreeConstants } from '../../../src/connectors/ergodex/venues/spectrum/spectrum.math';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { logger } from '../../../src/services/logger';
 import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
 
@@ -34,9 +42,11 @@ import {
   n2tPool,
   newNodeState,
   NodeState,
+  R4,
   ROOT,
   RSN,
   RSN_POOL,
+  T2T_TREE,
   testConfig,
   TIP,
   TOKENS,
@@ -127,6 +137,47 @@ function changeHolds(txJson: string, tokenId: string | null): bigint {
 
 const rejectSpent = { status: 400, body: { error: 400, reason: 'bad.request', detail: 'Double spending attempt' } };
 
+/** The LP token's emission as the node reports it: the contract's constant less 1000. */
+const LP_EMISSION = 9223372036854774807n;
+
+/**
+ * A box anyone can create: at the real token/token pool tree, with an NFT of its own, one
+ * unit of the ERG/RSN pool's LP token, and two junk tokens of near-largest supply.
+ */
+const FAKE_NFT = 'f1'.repeat(32);
+const FX = 'f2'.repeat(32);
+const FY = 'f3'.repeat(32);
+const FAKE_POOL = makeBox({
+  ergoTree: T2T_TREE,
+  value: 4000000n,
+  creationHeight: TIP - 5,
+  assets: [
+    { tokenId: FAKE_NFT, amount: 1n },
+    { tokenId: LP, amount: 1n },
+    { tokenId: FX, amount: 2n ** 63n - 2n },
+    { tokenId: FY, amount: 2n ** 63n - 2n },
+  ],
+  registers: { R4: R4(997) },
+});
+
+/** The same, at the ERG/token pool tree. */
+const FAKE_N2T_NFT = 'f4'.repeat(32);
+const FAKE_N2T_POOL = makeBox({
+  ergoTree: N2T_TREE,
+  value: ERG,
+  creationHeight: TIP - 5,
+  assets: [
+    { tokenId: FAKE_N2T_NFT, amount: 1n },
+    { tokenId: LP, amount: 1n },
+    { tokenId: FX, amount: 1000n },
+  ],
+  registers: { R4: R4(997) },
+});
+
+const positionsOwnedUrl = `/trading/amm/positions-owned?connector=ergodex&chainNetwork=ergo-mainnet&walletAddress=${ME}`;
+const positionInfoUrl = (pool: string) =>
+  `/trading/amm/position-info?connector=ergodex&chainNetwork=ergo-mainnet&poolAddress=${pool}&walletAddress=${ME}`;
+
 describe('ergodex liquidity through /trading/amm', () => {
   let app: ReturnType<typeof fastifyWithTypeProvider>;
   let state: NodeState;
@@ -152,7 +203,7 @@ describe('ergodex liquidity through /trading/amm', () => {
     state = newNodeState();
     state.pools.set(NFT, [RSN_POOL]);
     // the LP token as the node's index knows it: 0 decimals
-    state.emission.set(LP, 9223372036854774807n);
+    state.emission.set(LP, LP_EMISSION);
     state.wallet = [walletBox(5n * ERG, [{ tokenId: RSN, amount: 100000n }])];
     useDex(makeDex(state));
   });
@@ -471,6 +522,52 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(JSON.parse(res.body).message).toContain('a redeem of 2433845 LP tokens');
       expect(posts()).toBe(0);
     });
+
+    /** The LP tokens a posted redeem returns to the pool. */
+    const redeemedLp = () => BigInt(parseNodeJson<PostedTx>(state.posted[0]).outputs[0].assets[1].amount) - LP0;
+
+    it.each([
+      // 100/3 as a JSON number has 17 significant digits; cut to 33.33333333
+      [100 / 3, 3333333333n],
+      [12.123456789, 1212345678n],
+    ])('a percentage of %p is cut to 8 decimals, never refused for its precision', async (pct, scaled) => {
+      const res = await remove({ percentageToRemove: pct });
+      expect(res.statusCode).toBe(200);
+      expect(redeemedLp()).toBe((HELD * scaled) / 10n ** 10n);
+    });
+
+    it('a percentage that is 0 once cut to 8 decimals is a 400, nothing posted', async () => {
+      const res = await remove({ percentageToRemove: 0.000000001 });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toContain('percentageToRemove must be above 0 and at most 100');
+      expect(posts()).toBe(0);
+    });
+
+    it('a sole provider asking for all of it on an ERG/token pool: a 400 naming what can be removed now', async () => {
+      // the wallet holds every LP token minted: the supply less the 1000 that never exist
+      const all = SUPPLY - 1000n;
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: all }])];
+      const res = await remove({ percentageToRemove: 100 });
+      expect(res.statusCode).toBe(400);
+      const message: string = JSON.parse(res.body).message;
+      expect(message).toContain('not above its storage floor 10000000');
+      const m = /at most (\d+) LP tokens, ([\d.]+)% of the wallet's (\d+), can be removed now/.exec(message);
+      expect(m).not.toBeNull();
+      const most = BigInt(m![1]);
+      expect(BigInt(m![3])).toBe(all);
+      // the most is exact: the pool keeps more than its floor and some RSN for it, and not for one more
+      const pays = (lp: bigint) => X0 - (lp * X0) / SUPPLY > 10000000n && Y0 - (lp * Y0) / SUPPLY > 0n;
+      expect(pays(most)).toBe(true);
+      expect(pays(most + 1n)).toBe(false);
+      expect(posts()).toBe(0);
+      // the percentage named, sent back, removes at most that much and is submitted
+      const pct = m![2];
+      expect(parseUnits(pct, 8)).toBe((most * 10n ** 10n) / all);
+      const ok = await remove({ percentageToRemove: Number(pct) });
+      expect(ok.statusCode).toBe(200);
+      expect(redeemedLp() <= most).toBe(true);
+      expect(redeemedLp()).toBe((all * ((most * 10n ** 10n) / all)) / 10n ** 10n);
+    });
   });
 
   describe('positions', () => {
@@ -511,10 +608,11 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(pos).toMatchObject({ lpTokenAmount: '0', baseTokenAmount: '0', quoteTokenAmount: '0' });
     });
 
-    it('positions-owned: each pool whose LP token the wallet holds, skipping a pool that fails a guard', async () => {
+    it('positions-owned: each pool whose LP token the wallet holds, a pool an entry guard refuses included', async () => {
       const small = n2tPool({ x: 50n * ERG, y: 1000000n, fee: 997, token: RSN, nft: 'fd'.repeat(32) });
       state.byTree.set(N2T_TREE, [RSN_POOL, small]);
       state.pools.set('fd'.repeat(32), [small]);
+      state.emission.set(small.assets[1].tokenId, LP_EMISSION);
       state.wallet = [
         walletBox(ERG, [
           { tokenId: LP, amount: 4867691n },
@@ -522,15 +620,93 @@ describe('ergodex liquidity through /trading/amm', () => {
           { tokenId: RSN, amount: 5n },
         ]),
       ];
+      // the small pool holds 50 ERG, below this floor: a deposit there is refused, its position is not
       useDex(makeDex(state, dexConfig({ minPoolNativeReserve: 100n * ERG })));
-      const res = await app.inject({
-        method: 'GET',
-        url: `/trading/amm/positions-owned?connector=ergodex&chainNetwork=ergo-mainnet&walletAddress=${ME}`,
-      });
+      const warn = jest.spyOn(logger, 'warn');
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(200);
+      const list = JSON.parse(res.body);
+      expect(list.map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT, 'fd'.repeat(32)].sort());
+      expect(list.find((p: { poolAddress: string }) => p.poolAddress === NFT).lpTokenAmount).toBe('4867691');
+      expect(list.find((p: { poolAddress: string }) => p.poolAddress !== NFT).lpTokenAmount).toBe('1000');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`pool ${'fd'.repeat(32)} holds`));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('below minPoolNativeReserve'));
+    });
+
+    it('positions-owned: a box planted at a pool tree with one unit of the LP token does not hide the position', async () => {
+      // one at each pool tree, the one at the ERG/token tree listed before the real pool
+      state.byTree.set(N2T_TREE, [FAKE_N2T_POOL, RSN_POOL]);
+      state.byTree.set(T2T_TREE, [FAKE_POOL]);
+      state.pools.set(FAKE_NFT, [FAKE_POOL]);
+      state.pools.set(FAKE_N2T_NFT, [FAKE_N2T_POOL]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
       expect(res.statusCode).toBe(200);
       const list = JSON.parse(res.body);
       expect(list.map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
-      expect(list[0].lpTokenAmount).toBe('4867691');
+      expect(list[0]).toMatchObject({ lpTokenAmount: '4867691', baseTokenAmount: '0.999999877' });
+    });
+
+    it('positions-owned: an LP token that only a box which is not its pool holds is not a position', async () => {
+      const orphanLp = 'f5'.repeat(32);
+      const orphan = makeBox({
+        ergoTree: N2T_TREE,
+        value: ERG,
+        creationHeight: TIP - 5,
+        assets: [
+          { tokenId: 'f6'.repeat(32), amount: 1n },
+          { tokenId: orphanLp, amount: 1n },
+          { tokenId: FX, amount: 1000n },
+        ],
+        registers: { R4: R4(997) },
+      });
+      state.byTree.set(N2T_TREE, [RSN_POOL, orphan]);
+      state.pools.set('f6'.repeat(32), [orphan]);
+      state.emission.set(orphanLp, 1000n);
+      state.wallet = [
+        walletBox(ERG, [
+          { tokenId: LP, amount: 4867691n },
+          { tokenId: orphanLp, amount: 999n },
+        ]),
+      ];
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
+    });
+
+    it('positions-owned: a pool tree read only in part is logged as a warning, since a position can be missing', async () => {
+      // boxes with no tokens at the pool tree: cheap to create, never spendable
+      const junk = Array.from({ length: 200 }, (_, i) =>
+        makeBox({ ergoTree: N2T_TREE, value: 200000n + BigInt(i), assets: [], creationHeight: TIP - 1 }),
+      );
+      state.byTree.set(N2T_TREE, [RSN_POOL, ...junk]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+      useDex(makeDex(state, dexConfig({ maxDiscoveredBoxes: 200 })));
+      const warn = jest.spyOn(logger, 'warn');
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('a position can be missing from the list'));
+    });
+
+    it('a retryable error while reading a pool fails positions-owned and position-info, not an empty list', async () => {
+      state.byTree.set(N2T_TREE, [RSN_POOL]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+      // the node does not know the LP token yet
+      state.emission.delete(LP);
+      for (const url of [positionsOwnedUrl, positionInfoUrl(NFT)]) {
+        const res = await app.inject({ method: 'GET', url });
+        expect(res.statusCode).toBe(503);
+        expect(JSON.parse(res.body).message).toContain('retry');
+      }
+    });
+
+    it('positions-owned: two confirmed boxes holding the pool NFT is a 409, not an empty list', async () => {
+      state.byTree.set(N2T_TREE, [RSN_POOL]);
+      state.pools.set(NFT, [RSN_POOL, RSN_POOL]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(409);
     });
 
     it('positions-owned with nothing held: an empty list', async () => {
@@ -542,6 +718,82 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual([]);
     });
+  });
+
+  describe('a box at a pool tree that is not the pool of the LP token it holds', () => {
+    beforeEach(() => {
+      state.pools.set(FAKE_NFT, [FAKE_POOL]);
+      state.emission.set(FX, 2n ** 63n - 1n);
+      state.emission.set(FY, 2n ** 63n - 1n);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+    });
+
+    it('is refused by remove, add, quote-liquidity and position-info; nothing is posted', async () => {
+      const results = [
+        await remove({ poolAddress: FAKE_NFT, percentageToRemove: 100 }),
+        await add({ poolAddress: FAKE_NFT }),
+        await app.inject({ method: 'GET', url: quoteUrl({ poolAddress: FAKE_NFT }) }),
+        await app.inject({ method: 'GET', url: positionInfoUrl(FAKE_NFT) }),
+      ];
+      for (const r of results) {
+        expect(r.statusCode).toBe(400);
+        expect(JSON.parse(r.body).message).toContain(`is not the pool of LP token ${LP}`);
+      }
+      expect(posts()).toBe(0);
+    });
+
+    it('the real pool of that LP token still works', async () => {
+      const res = await remove({ percentageToRemove: 100 });
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+    });
+
+    it('the node not knowing the LP token yet is a 503 to retry, nothing posted', async () => {
+      state.emission.delete(LP);
+      const res = await remove();
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).message).toContain(`supply of LP token ${LP} yet; retry`);
+      expect(posts()).toBe(0);
+    });
+  });
+
+  describe('leaving a pool an entry guard refuses', () => {
+    const HELD = 4867691n;
+    beforeEach(() => {
+      state.byTree.set(N2T_TREE, [RSN_POOL]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: HELD }])];
+    });
+
+    it.each([
+      ['minPoolNativeReserve', { minPoolNativeReserve: 10n ** 6n * ERG }],
+      ['minPoolTokenReserve', { minPoolTokenReserve: Y0 + 1n }],
+      ['maxPoolFeePct', { maxPoolFeePct: '0.1' }],
+      ['allowlist', { poolAllowlist: ['fe'.repeat(32)] }],
+    ])(
+      'under %s: add is refused; remove posts, position-info answers, positions-owned lists it',
+      async (guard, over) => {
+        useDex(makeDex(state, dexConfig(over)));
+        const warn = jest.spyOn(logger, 'warn');
+        const entry = await add();
+        expect(entry.statusCode).toBe(400);
+        expect(JSON.parse(entry.body).message).toContain(guard);
+        expect(posts()).toBe(0);
+
+        const info = await app.inject({ method: 'GET', url: positionInfoUrl(NFT) });
+        expect(info.statusCode).toBe(200);
+        expect(JSON.parse(info.body).lpTokenAmount).toBe('4867691');
+        const owned = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+        expect(owned.statusCode).toBe(200);
+        expect(JSON.parse(owned.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
+
+        const res = await remove({ percentageToRemove: 100 });
+        expect(res.statusCode).toBe(200);
+        expect(posts()).toBe(1);
+        expect(changeHolds(state.posted[0], LP)).toBe(0n);
+        // each skipped guard is logged, naming the pool and the guard
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`pool ${NFT} .*${guard}`)));
+      },
+    );
   });
 
   describe('not offered', () => {
@@ -585,6 +837,61 @@ describe('ergodex liquidity through /trading/amm', () => {
   });
 });
 
+describe('the LP constant must be the one the configured pool trees carry', () => {
+  type Spectrum = { n2tPoolTrees: string[]; t2tPoolTrees: string[]; lockedLiquidity: string };
+  /** The shipped template with mainnet's spectrum block changed, as the config manager hands it over. */
+  const loadPatched = (patch: (spectrum: Spectrum) => void) => {
+    const template = yaml.load(
+      fs.readFileSync(path.join(__dirname, '../../../src/templates/connectors/ergodex.yml'), 'utf8'),
+    ) as { networks: { mainnet: { spectrum: Spectrum } } };
+    patch(template.networks.mainnet.spectrum);
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({
+      get: (k: string) => (template as unknown as Record<string, unknown>)[k.replace(/^ergodex\./, '')],
+    } as never);
+  };
+  const key = 'ergodex.networks.mainnet.spectrum';
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('both shipped trees hold it as a Long constant, twice', () => {
+    for (const tree of [N2T_TREE, T2T_TREE]) {
+      const constants = ergoTreeConstants(tree)!;
+      expect(constants.filter((c) => c === encodeLong(2n ** 63n - 1n)).length).toBe(2);
+    }
+    expect(ergoTreeConstants(N2T_TREE)!.length).toBe(15);
+  });
+
+  it.each([
+    ["the LP token's emission, 1000 lower", '9223372036854774807'],
+    ['a value 10^11 lower', '9223371936854775807'],
+  ])('%s is refused at load, naming the tree and the key', (_what, value) => {
+    loadPatched((spectrum) => {
+      spectrum.lockedLiquidity = value;
+    });
+    expect(() => ErgodexConfig.network('mainnet')).toThrow(
+      `${key}.n2tPoolTrees[0] does not hold ${key}.lockedLiquidity (${value}) as a Long constant`,
+    );
+  });
+
+  it('a configured tree that lacks the constant is refused at load, naming that tree', () => {
+    loadPatched((spectrum) => {
+      // the same tree with its LP constant one lower (2^63 - 2), so the configured value is not in it
+      spectrum.t2tPoolTrees = [spectrum.t2tPoolTrees[0].replace(/05feffffffffffffffff01/g, '05fcffffffffffffffff01')];
+    });
+    expect(() => ErgodexConfig.network('mainnet')).toThrow(
+      `${key}.t2tPoolTrees[0] does not hold ${key}.lockedLiquidity (9223372036854775807) as a Long constant`,
+    );
+  });
+
+  it('without the key there is nothing to check, and the trees load for swaps', () => {
+    loadPatched((spectrum) => {
+      spectrum.t2tPoolTrees = [spectrum.t2tPoolTrees[0].replace(/05feffffffffffffffff01/g, '05fcffffffffffffffff01')];
+      delete (spectrum as Partial<Spectrum>).lockedLiquidity;
+    });
+    expect(ErgodexConfig.network('mainnet').spectrum.lockedLiquidity).toBeUndefined();
+  });
+});
+
 it('the shipped ergodex template sets the LP constant for both networks', () => {
   const template = yaml.load(
     fs.readFileSync(path.join(__dirname, '../../../src/templates/connectors/ergodex.yml'), 'utf8'),
@@ -595,4 +902,32 @@ it('the shipped ergodex template sets the LP constant for both networks', () => 
   expect(ErgodexConfig.network('mainnet').spectrum.lockedLiquidity).toBe(9223372036854775807n);
   expect(ErgodexConfig.network('testnet').spectrum.lockedLiquidity).toBe(9223372036854775807n);
   jest.restoreAllMocks();
+});
+
+describe('percentageToRemove as read for a remove', () => {
+  it.each([
+    [100, 10n ** 10n],
+    [50, 5n * 10n ** 9n],
+    [100 / 3, 3333333333n],
+    [33.333333333333336, 3333333333n],
+    [12.123456789, 1212345678n],
+    [0.00000001, 1n],
+    [1e-7, 10n],
+    [99.999999999999, 9999999999n],
+  ])('%p is cut toward zero to 8 decimals', (pct, scaled) => {
+    expect(percentToRemove(pct)).toBe(scaled);
+  });
+
+  it.each([0, -1, 0.000000009, 1e-9, 100.000000001, 101, 1e21, NaN, Infinity, -Infinity])(
+    '%p is refused with a 400',
+    (pct) => {
+      let refused: unknown;
+      try {
+        percentToRemove(pct);
+      } catch (error) {
+        refused = error;
+      }
+      expect((refused as { statusCode?: number } | undefined)?.statusCode).toBe(400);
+    },
+  );
 });
