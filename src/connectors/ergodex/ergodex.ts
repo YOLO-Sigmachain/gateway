@@ -24,7 +24,7 @@ import { logger } from '../../services/logger';
 import { ErgodexConfig, ErgodexNetworkConfig, ErgodexRootConfig } from './ergodex.config';
 import { LithosVenue } from './venues/lithos/lithos.venue';
 import { SpectrumVenue } from './venues/spectrum/spectrum.venue';
-import { PoolSwap, SideName, Venue, VenuePool, VenueRuleError } from './venues/venue';
+import { PoolLiquidityChange, PoolSwap, SideName, Venue, VenuePool, VenueRuleError } from './venues/venue';
 
 /** The id under which the native coin appears in responses (`tokenIn`, `baseTokenAddress`). */
 export const NATIVE_TOKEN_ID = NATIVE_COIN_ID;
@@ -44,6 +44,8 @@ export interface DiscoveredPool {
   venue: string;
   kind: string;
   tokenIds: [string | null, string | null];
+  /** The pool's LP token, for a venue that offers liquidity on this network. */
+  lpTokenId?: string;
 }
 
 /** Discovery results per chain instance (one per network), by trees and limit. */
@@ -67,6 +69,23 @@ export interface SwapPlan extends FreshPool {
   swap: PoolSwap;
   tokenIn: TokenRef;
   tokenOut: TokenRef;
+  successor: ErgoOutputSpec;
+}
+
+/**
+ * A deposit or redeem priced against one fresh pool box, all amounts in the smallest
+ * units. Base is the pool's x side and quote its y side, as pool-info reports them.
+ */
+export interface FreshLiquidityPool extends FreshPool {
+  base: TokenRef;
+  quote: TokenRef;
+  lpToken: TokenRef;
+  /** LP tokens in circulation, as the contract counts them, before any change. */
+  supply: bigint;
+}
+
+export interface LiquidityPlan extends FreshLiquidityPool {
+  change: PoolLiquidityChange;
   successor: ErgoOutputSpec;
 }
 
@@ -107,6 +126,17 @@ export function units(amount: bigint, decimals: number): number {
 export function ratio(num: bigint, den: bigint, digits = 18): number {
   if (den === 0n) return 0;
   return Number(formatUnits((num * 10n ** BigInt(digits)) / den, digits));
+}
+
+/**
+ * Whether the pool price of `current` (y per x) lies within `slippageScaled` of the price
+ * of `reference`, above or below, in exact integers:
+ * |y1/x1 - y0/x0| <= slippage * y0/x0.
+ */
+export function ratioWithin(reference: VenuePool, current: VenuePool, slippageScaled: bigint): boolean {
+  const lhs = current.y.reserve * reference.x.reserve * HUNDRED_PCT;
+  const base = reference.y.reserve * current.x.reserve;
+  return lhs <= base * (HUNDRED_PCT + slippageScaled) && lhs >= base * (HUNDRED_PCT - slippageScaled);
 }
 
 export function feePctOf(pool: VenuePool): number {
@@ -255,9 +285,13 @@ export class Ergodex {
    * (for LithosDex: the operator allowlist and the deployment check); the connector's
    * guards do not.
    */
-  async getFreshPool(poolId: string, options: { confirmedOnly?: boolean } = {}): Promise<FreshPool> {
+  async getFreshPool(
+    poolId: string,
+    options: { confirmedOnly?: boolean; forLiquidity?: boolean } = {},
+  ): Promise<FreshPool> {
     const { box, source } = await this.fetchPoolBox(poolId, options);
     const venue = this.venueForTree(box.ergoTree)!;
+    if (options.forLiquidity) this.assertLiquidityVenue(venue, poolId);
     const pool = venue.parsePool(box);
     if (!pool) {
       throw httpErrors.badRequest(`Box ${box.boxId} holds pool NFT ${poolId} but is not a valid ${venue.name} pool`);
@@ -268,6 +302,44 @@ export class Ergodex {
     }
     await this.assertSingleNft(pool.poolId);
     return { pool, venue, source };
+  }
+
+  /**
+   * Liquidity is offered only by a venue whose deposit and redeem are one direct spend of
+   * the pool box. A LithosDex deposit or redeem goes through provision boxes, which this
+   * connector does not build: a 501, before the pool is admitted or read further.
+   */
+  private assertLiquidityVenue(venue: Venue, poolId: string): void {
+    if (!venue.liquidity || !venue.depositFor || !venue.redeemFor || !venue.liquiditySuccessor) {
+      throw httpErrors.createError(
+        501,
+        `Liquidity on ${venue.name} pools is not supported by ergodex (pool ${poolId}): a deposit or redeem ` +
+          'there goes through provision boxes, which this connector does not build. Spectrum-style pools only',
+      );
+    }
+    const refusal = venue.liquidityRefusal?.();
+    if (refusal) throw httpErrors.createError(501, `Liquidity is not offered on ${this.network}: ${refusal}`);
+  }
+
+  /** A 501 unless some venue on this network offers liquidity. */
+  assertLiquidityOffered(): void {
+    this.assertConfigured();
+    const offering = this.venues.filter((v) => v.liquidity && v.depositFor && v.redeemFor && v.liquiditySuccessor);
+    if (offering.length === 0) {
+      throw httpErrors.createError(501, `No ergodex venue on ${this.network} offers liquidity`);
+    }
+    const refusals = offering.map((v) => v.liquidityRefusal?.() ?? null);
+    if (refusals.every((r) => r !== null)) {
+      throw httpErrors.createError(501, `Liquidity is not offered on ${this.network}: ${refusals.join('; ')}`);
+    }
+  }
+
+  /** The pool's LP token and supply; a 400 when the pool box does not allow a deposit or redeem. */
+  liquidityOf(fresh: FreshPool): { lpTokenId: string; supply: bigint } {
+    const liq = fresh.venue.liquidity?.(fresh.pool) ?? null;
+    if (!liq) throw httpErrors.badRequest(`Pool ${fresh.pool.poolId} does not allow a deposit or redeem`);
+    if (liq.supply <= 0n) throw httpErrors.badRequest(`Pool ${fresh.pool.poolId} has no LP tokens in circulation`);
+    return liq;
   }
 
   /**
@@ -353,11 +425,13 @@ export class Ergodex {
           if (box.ergoTree.toLowerCase() !== tree) continue;
           const pool = venue.parsePool(box);
           if (pool) {
+            const lpTokenId = venue.liquidity?.(pool)?.lpTokenId;
             found.push({
               poolId: pool.poolId,
               venue: pool.venue,
               kind: pool.kind,
               tokenIds: [pool.x.tokenId, pool.y.tokenId],
+              ...(lpTokenId ? { lpTokenId } : {}),
             });
           }
         }
@@ -437,6 +511,82 @@ export class Ergodex {
       throw error;
     }
     return { ...fresh, side, base, quote, swap, tokenIn, tokenOut, successor };
+  }
+
+  // ------------------------------------------------------------------------------------
+  // Liquidity (Spectrum-style pools): a deposit or redeem is one direct spend of the pool
+  // box, as a swap is.
+
+  /**
+   * Read the pool fresh for a deposit or redeem: only a venue that offers liquidity (else
+   * 501), every guard a swap applies, and the pool's two tokens and LP token resolved.
+   */
+  async freshLiquidityPool(poolId: string, options: { confirmedOnly?: boolean } = {}): Promise<FreshLiquidityPool> {
+    const fresh = await this.getFreshPool(poolId, { ...options, forLiquidity: true });
+    this.assertAllowed(fresh.pool);
+    const { lpTokenId, supply } = this.liquidityOf(fresh);
+    const base = await this.tokenOfSide(fresh.pool.x.tokenId);
+    const quote = await this.tokenOfSide(fresh.pool.y.tokenId);
+    const lpToken = await this.tokenOfSide(lpTokenId);
+    return { ...fresh, base, quote, lpToken, supply };
+  }
+
+  /**
+   * Price a deposit of at most `offerX` of base and `offerY` of quote (null: no limit on
+   * that side) on a fresh pool: the most LP tokens the offer buys and the least of each
+   * side that buys them (see `depositFor` in the venue math). A 400 when it buys none.
+   */
+  planDeposit(fresh: FreshLiquidityPool, offerX: bigint | null, offerY: bigint | null): LiquidityPlan {
+    const { pool, venue, base, quote } = fresh;
+    const change = venue.depositFor!(pool, offerX, offerY);
+    if (change.lp <= 0n) {
+      throw httpErrors.badRequest(
+        `A deposit of ${this.offerText(offerX, base)} and ${this.offerText(offerY, quote)} into pool ` +
+          `${pool.poolId} buys no LP token (it rounds to zero); deposit more`,
+      );
+    }
+    if ((offerX !== null && change.x > offerX) || (offerY !== null && change.y > offerY)) {
+      throw new Error('deposit plan takes more than offered'); // cannot happen: see depositFor
+    }
+    return this.liquidityPlan(fresh, change);
+  }
+
+  /** Price a redeem of `lp` LP tokens on a fresh pool: the most it may take of each side. */
+  planRedeem(fresh: FreshLiquidityPool, lp: bigint): LiquidityPlan {
+    const { pool, venue, base, quote, lpToken } = fresh;
+    if (lp <= 0n) throw httpErrors.badRequest('The LP amount to redeem must be greater than zero');
+    let change: PoolLiquidityChange;
+    try {
+      change = venue.redeemFor!(pool, lp);
+    } catch (error) {
+      if (error instanceof VenueRuleError) throw httpErrors.badRequest(`Pool ${pool.poolId}: ${error.message}`);
+      throw error;
+    }
+    if (change.x <= 0n || change.y <= 0n) {
+      throw httpErrors.badRequest(
+        `Redeeming ${formatUnits(lp, lpToken.decimals)} LP tokens of pool ${pool.poolId} pays ` +
+          `${formatUnits(change.x, base.decimals)} ${symbolForMessage(base.symbol, base.tokenId)} and ` +
+          `${formatUnits(change.y, quote.decimals)} ${symbolForMessage(quote.symbol, quote.tokenId)}: one side rounds ` +
+          'to zero; redeem more',
+      );
+    }
+    return this.liquidityPlan(fresh, change);
+  }
+
+  private liquidityPlan(fresh: FreshLiquidityPool, change: PoolLiquidityChange): LiquidityPlan {
+    let successor: ErgoOutputSpec;
+    try {
+      successor = fresh.venue.liquiditySuccessor!(fresh.pool, change);
+    } catch (error) {
+      if (error instanceof VenueRuleError) throw httpErrors.badRequest(`Pool ${fresh.pool.poolId}: ${error.message}`);
+      throw error;
+    }
+    return { ...fresh, change, successor };
+  }
+
+  private offerText(offer: bigint | null, token: TokenRef): string {
+    const sym = symbolForMessage(token.symbol, token.tokenId);
+    return offer === null ? `any amount of ${sym}` : `${formatUnits(offer, token.decimals)} ${sym}`;
   }
 
   /** The other token of a pool that holds `base`. */

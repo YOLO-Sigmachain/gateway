@@ -1,7 +1,7 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
-import { ergodexNotSupported } from '../../connectors/ergodex/amm-routes/notSupported';
+import { quoteLiquidity as ergodexQuoteLiquidity } from '../../connectors/ergodex/amm-routes/liquidity';
 import { quoteLiquidity as meteoraQuoteLiquidity } from '../../connectors/meteora/amm-routes/quoteLiquidity';
 import { quoteLiquidity as pancakeswapQuoteLiquidity } from '../../connectors/pancakeswap/amm-routes/quoteLiquidity';
 import { quoteLiquidity as raydiumQuoteLiquidity } from '../../connectors/raydium/amm-routes/quoteLiquidity';
@@ -70,7 +70,7 @@ export const quoteLiquidityRoute: FastifyPluginAsync = async (fastify) => {
                 slippagePct,
               );
             case 'ergodex':
-              return ergodexNotSupported('quote-liquidity');
+              return await ergodexQuoteLiquidity(network, poolAddress, baseTokenAmount, quoteTokenAmount, slippagePct);
             default:
               throw httpErrors.badRequest(
                 `Unsupported AMM connector: ${connector}. Supported: ${AMM_CONNECTORS.join(', ')}`,

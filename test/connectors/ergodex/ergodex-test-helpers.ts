@@ -139,6 +139,7 @@ export function dexConfig(
       t2tPoolTrees: [T2T_TREE],
       feeDenominator: 1000n,
       n2tMinSuccessorValue: 10000000n,
+      lockedLiquidity: 9223372036854775807n,
       ...spectrum,
     },
   };

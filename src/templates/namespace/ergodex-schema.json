@@ -42,7 +42,8 @@
             "n2tPoolTrees": { "type": "array", "items": { "$ref": "#/definitions/tree" } },
             "t2tPoolTrees": { "type": "array", "items": { "$ref": "#/definitions/tree" } },
             "feeDenominator": { "$ref": "#/definitions/amount" },
-            "n2tMinSuccessorValue": { "$ref": "#/definitions/amount" }
+            "n2tMinSuccessorValue": { "$ref": "#/definitions/amount" },
+            "lockedLiquidity": { "$ref": "#/definitions/amount" }
           },
           "additionalProperties": false
         },

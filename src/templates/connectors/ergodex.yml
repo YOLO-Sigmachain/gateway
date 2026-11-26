@@ -50,6 +50,10 @@ networks:
       feeDenominator: 1000
       # An ERG/token pool's successor must hold more than this many nanoERG.
       n2tMinSuccessorValue: 10000000
+      # The pool contracts' LP constant: a pool's LP supply is this minus the LP tokens it
+      # holds. Needed for liquidity (quote, add, remove, positions); without it those
+      # routes answer 501 and swaps work as before. Quoted: beyond a JS number.
+      lockedLiquidity: '9223372036854775807'
     # LithosDex pools (ERG/token and token/token), traded by direct swap: the trader's own
     # transaction spends the pool box. Every deployment is the same pinned contract
     # templates below with its own ids written in place of the sentinel terms; these are
@@ -111,3 +115,4 @@ networks:
       t2tPoolTrees: []
       feeDenominator: 1000
       n2tMinSuccessorValue: 10000000
+      lockedLiquidity: '9223372036854775807'

@@ -52,6 +52,25 @@ export interface PoolSwap {
   amountOut: bigint;
 }
 
+/** A pool's liquidity token and how many of them are outside the pool. */
+export interface PoolLiquidity {
+  lpTokenId: string;
+  /** LP tokens in circulation, as the contract counts them. */
+  supply: bigint;
+}
+
+/**
+ * A deposit into a pool or a redeem out of it. `x` and `y` are what goes into the pool
+ * (deposit) or comes out of it (redeem); `lp` is the LP tokens the pool pays out
+ * (deposit) or takes back (redeem). All positive.
+ */
+export interface PoolLiquidityChange {
+  action: 'deposit' | 'redeem';
+  x: bigint;
+  y: bigint;
+  lp: bigint;
+}
+
 export class VenueRuleError extends Error {
   constructor(message: string) {
     super(message);
@@ -115,4 +134,19 @@ export interface Venue {
   guardFailure?(pool: VenuePool): string | null;
   /** Pool ids this venue offers when a pool is chosen by pair (beside discovery by tree). */
   candidatePoolIds?(): string[];
+  /**
+   * Liquidity by direct spend of the pool box (a deposit or redeem in the trader's own
+   * transaction). Absent: this venue offers no liquidity routes. `liquidityRefusal` says
+   * why a venue that has them cannot offer them on this network (a constant missing from
+   * config), or null.
+   */
+  liquidityRefusal?(): string | null;
+  /** The pool's LP token and supply, or null when the box does not allow a deposit or redeem. */
+  liquidity?(pool: VenuePool): PoolLiquidity | null;
+  /** The deposit for an offer of at most `offerX` and `offerY` (null: no limit on that side). */
+  depositFor?(pool: VenuePool, offerX: bigint | null, offerY: bigint | null): PoolLiquidityChange;
+  /** The most a redeem of `lp` LP tokens may take out. */
+  redeemFor?(pool: VenuePool, lp: bigint): PoolLiquidityChange;
+  /** The pool's successor for a deposit or redeem. Throws VenueRuleError when the contract would refuse it. */
+  liquiditySuccessor?(pool: VenuePool, change: PoolLiquidityChange): ErgoOutputSpec;
 }

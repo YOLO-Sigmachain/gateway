@@ -5,8 +5,9 @@
  * a retryable 409); the price bound at execute (the caller's limit, and the confirmed
  * pool when the box traded is someone else's unconfirmed one); an unknown submit outcome
  * (one POST, the id, poll); a rejection that does not name the pool box; a pair-only
- * quote choosing the best pool; and the liquidity routes answering 501. Also the shipped
- * ergodex template as the connector reads it.
+ * quote choosing the best pool; and create-pool answering 501 (liquidity and positions are
+ * in ergodex-liquidity-routes.test.ts). Also the shipped ergodex template as the connector
+ * reads it.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -596,48 +597,22 @@ describe('ergodex through /trading/amm', () => {
     expect(info.feePct).toBe('1'); // DecimalNumber: a decimal string on the wire
   });
 
-  it('liquidity and position routes answer 501 not supported yet', async () => {
-    const q = new URLSearchParams({
-      connector: 'ergodex',
-      chainNetwork: 'ergo-mainnet',
-      poolAddress: NFT,
-      baseTokenAmount: '1',
-      quoteTokenAmount: '1',
+  it('create-pool answers 501 not supported yet', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/create-pool',
+      payload: {
+        connector: 'ergodex',
+        chainNetwork: 'ergo-mainnet',
+        walletAddress: ME,
+        baseToken: 'ERG',
+        quoteToken: 'RSN',
+        baseTokenAmount: 1,
+        quoteTokenAmount: 1,
+      },
     });
-    const results = [
-      await app.inject({ method: 'GET', url: `/trading/amm/quote-liquidity?${q}` }),
-      await app.inject({
-        method: 'POST',
-        url: '/trading/amm/add',
-        payload: {
-          connector: 'ergodex',
-          chainNetwork: 'ergo-mainnet',
-          walletAddress: ME,
-          poolAddress: NFT,
-          baseTokenAmount: 1,
-          quoteTokenAmount: 1,
-        },
-      }),
-      await app.inject({
-        method: 'POST',
-        url: '/trading/amm/remove',
-        payload: {
-          connector: 'ergodex',
-          chainNetwork: 'ergo-mainnet',
-          walletAddress: ME,
-          poolAddress: NFT,
-          percentageToRemove: 50,
-        },
-      }),
-      await app.inject({
-        method: 'GET',
-        url: `/trading/amm/position-info?connector=ergodex&chainNetwork=ergo-mainnet&poolAddress=${NFT}&walletAddress=${ME}`,
-      }),
-    ];
-    for (const r of results) {
-      expect(r.statusCode).toBe(501);
-      expect(JSON.parse(r.body).message).toContain('not supported yet for ergodex');
-    }
+    expect(res.statusCode).toBe(501);
+    expect(JSON.parse(res.body).message).toContain('not supported yet for ergodex');
     expect(posts()).toBe(0);
   });
 });

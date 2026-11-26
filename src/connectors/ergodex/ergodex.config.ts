@@ -22,6 +22,11 @@ export interface SpectrumVenueConfig {
   feeDenominator: bigint;
   /** An ERG/token pool's successor must hold strictly more than this, in the smallest native unit. */
   n2tMinSuccessorValue: bigint;
+  /**
+   * The contracts' LP constant: the LP supply is this minus the LP tokens the pool holds.
+   * Absent: deposits and redeems are not offered on this network (swaps do not need it).
+   */
+  lockedLiquidity?: bigint;
 }
 
 /** The pinned contract templates of one LithosDex pool kind, with sentinel ids in place of a deployment's. */
@@ -184,6 +189,14 @@ function lithos(value: unknown, where: string): LithosVenueConfig | undefined {
   };
 }
 
+/** The Spectrum LP constant when set: positive and at most the largest Long, as the contracts hold it. */
+function spectrumLockedLiquidity(value: unknown, where: string): { lockedLiquidity?: bigint } {
+  if (value === undefined || value === null || value === '') return {};
+  const v = amount(value, 0n, where);
+  if (v <= 0n || v > 2n ** 63n - 1n) throw new Error(`${where} must be positive and at most 9223372036854775807`);
+  return { lockedLiquidity: v };
+}
+
 /** A percentage as given (number or string), checked to be a plain decimal; kept as text for exact math. */
 function percent(value: unknown, fallback: string, where: string): string {
   if (value === undefined || value === null || value === '') return fallback;
@@ -259,6 +272,7 @@ export namespace ErgodexConfig {
         t2tPoolTrees,
         feeDenominator,
         n2tMinSuccessorValue: amount(spectrum.n2tMinSuccessorValue, 0n, `${where}.spectrum.n2tMinSuccessorValue`),
+        ...spectrumLockedLiquidity(spectrum.lockedLiquidity, `${where}.spectrum.lockedLiquidity`),
       },
       ...(lithosConfig ? { lithos: lithosConfig } : {}),
     };
