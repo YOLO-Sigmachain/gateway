@@ -13,16 +13,18 @@
  * (it holds more than half of that token's emission). The entry guards (fee ceiling, size
  * floors, allowlist) do not apply: a holder must see a position in a pool they could no
  * longer enter, to leave it. When more than one box at a pool tree holds the same LP
- * token, the real pool among them is used and the others are ignored. An error the
- * caller should retry (status 500 or above, or 409) while reading a pool fails the
- * request, unless another box holding that LP token is its real pool: a list missing a
- * position because of it would look complete.
+ * token, the box holding more than half of it is used and the others are logged and
+ * ignored, unless another of them holds at least the wallet's balance: then the pool
+ * cannot be told apart for that amount, and the request is a 409 (as position-info and
+ * remove are on such a pool). An error the caller should retry (status 500 or above, or
+ * 409) while reading a pool fails the request, unless another box holding that LP token
+ * is its real pool: a list missing a position because of it would look complete.
  */
 import { Ergo } from '../../../chains/ergo/ergo';
 import { PositionInfo } from '../../../schemas/amm-schema';
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
-import { Ergodex, FreshLiquidityPool, ratio, units } from '../ergodex';
+import { DiscoveredPool, Ergodex, FreshLiquidityPool, ratio, units } from '../ergodex';
 import { VenueRuleError } from '../venues/venue';
 
 import { ergodexError } from './errors';
@@ -79,7 +81,10 @@ export async function getPositionInfo(
     const dex = await Ergodex.getInstance(network);
     const held = await confirmedHoldings(dex.ergo, walletAddress);
     const fresh = await dex.freshLiquidityPool(poolAddress, { confirmedOnly: true, exit: true });
-    return positionOf(fresh, walletAddress, held.get(fresh.lpToken.tokenId!) ?? 0n);
+    const balance = held.get(fresh.lpToken.tokenId!) ?? 0n;
+    // a balance of zero is no claim on any box, so there is nothing to tell apart
+    if (balance > 0n) await dex.assertSoleLpClaimant(fresh, balance);
+    return positionOf(fresh, walletAddress, balance);
   } catch (error) {
     throw ergodexError(error, 'Failed to get ergodex position info');
   }
@@ -107,36 +112,71 @@ export async function getPositionsOwned(network: string, walletAddress: string):
           'boxes); a position can be missing from the list',
       );
     }
-    const byLp = new Map<string, string[]>();
+    // every box at a pool tree holding an LP token the wallet holds, by that token
+    const byLp = new Map<string, DiscoveredPool[]>();
     for (const found of pools) {
       if (!found.lpTokenId || !held.get(found.lpTokenId)) continue;
-      byLp.set(found.lpTokenId, [...(byLp.get(found.lpTokenId) ?? []), found.poolId]);
+      byLp.set(found.lpTokenId, [...(byLp.get(found.lpTokenId) ?? []), found]);
     }
+    const skipped = (lpTokenId: string, poolId: string, reason: string) =>
+      logger.warn(`ergodex: positions-owned: pool ${poolId} not counted for LP token ${lpTokenId}: ${reason}`);
     const positions: PositionInfo[] = [];
-    for (const [lpTokenId, poolIds] of byLp) {
-      // Only one box can be the real pool of an LP token (see freshLiquidityPool); any
-      // other box holding it is refused there with a 400 and ignored here.
-      let position: PositionInfo | null = null;
-      let retry: unknown;
-      for (const poolId of poolIds) {
+    for (const [lpTokenId, claimants] of byLp) {
+      const balance = held.get(lpTokenId)!;
+      // Only a box holding more than half of the LP token's emission can be its pool (see
+      // freshLiquidityPool); the others are dropped before any fresh read.
+      const candidates: DiscoveredPool[] = [];
+      for (const found of claimants) {
+        if (await dex.holdsMostOfLpToken(lpTokenId, found.lpReserve ?? 0n)) candidates.push(found);
+        else skipped(lpTokenId, found.poolId, `it holds ${found.lpReserve ?? 0n}, half or less of the LP token minted`);
+      }
+      let chosen: { position: PositionInfo; poolId: string } | null = null;
+      const errors: Array<{ poolId: string; error: unknown }> = [];
+      for (const { poolId } of candidates) {
         let fresh: FreshLiquidityPool;
         try {
           fresh = await dex.freshLiquidityPool(poolId, { confirmedOnly: true, exit: true });
         } catch (error) {
-          if (mustRethrow(error)) {
-            retry ??= error;
-          } else {
-            logger.info(`ergodex: pool ${poolId} not counted for LP token ${lpTokenId}: ${(error as Error).message}`);
-          }
+          if (mustRethrow(error)) errors.push({ poolId, error });
+          else skipped(lpTokenId, poolId, (error as Error).message);
           continue;
         }
-        if (fresh.lpToken.tokenId !== lpTokenId) continue;
-        position = positionOf(fresh, walletAddress, held.get(lpTokenId)!);
+        if (fresh.lpToken.tokenId !== lpTokenId) {
+          skipped(lpTokenId, poolId, `its fresh box holds LP token ${fresh.lpToken.tokenId} instead`);
+          continue;
+        }
+        chosen = { position: positionOf(fresh, walletAddress, balance), poolId };
         break;
       }
-      if (position) positions.push(position);
-      else if (retry !== undefined) throw retry;
-      // else: no box is the real pool of this token, so it is not a position
+      if (!chosen) {
+        if (errors.length > 0) {
+          for (const { poolId, error } of errors.slice(1)) skipped(lpTokenId, poolId, (error as Error).message);
+          throw errors[0].error;
+        }
+        logger.warn(
+          `ergodex: positions-owned: LP token ${lpTokenId} is not counted: no box at a pool tree is its pool`,
+        );
+        continue;
+      }
+      for (const { poolId, error } of errors) skipped(lpTokenId, poolId, (error as Error).message);
+      // The box holding most of the LP token is chosen only when no other box holds as
+      // much as the wallet: else the wallet's tokens could have come from either.
+      const rivals = claimants.filter((p) => p.poolId !== chosen!.poolId && (p.lpReserve ?? 0n) >= balance);
+      if (rivals.length > 0) {
+        throw httpErrors.createError(
+          409,
+          `Two boxes at pool trees hold LP token ${lpTokenId}: pool ${chosen.poolId}, and ` +
+            rivals.map((p) => `pool ${p.poolId} holding ${p.lpReserve}`).join(', ') +
+            `, at least the wallet's ${balance}; the pool of this LP token cannot be told apart for this amount`,
+        );
+      }
+      if (!complete) {
+        logger.warn(
+          `ergodex: positions-owned: pool ${chosen.poolId}: a pool tree was read only in part, so another box ` +
+            `holding LP token ${lpTokenId} may have been missed; listing the box that holds most of it`,
+        );
+      }
+      positions.push(chosen.position);
     }
     return positions.sort((a, b) => (a.poolAddress < b.poolAddress ? -1 : 1));
   } catch (error) {

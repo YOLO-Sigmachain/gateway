@@ -522,6 +522,8 @@ export async function removeLiquidity(
         `${percentageToRemove}% of the wallet's ${formatUnits(held, fresh.lpToken.decimals)} LP tokens rounds to zero`,
       );
     }
+    // another box at a pool tree holding as much of this LP token: refused, not guessed
+    await dex.assertSoleLpClaimant(fresh, lp);
     const replan = async (options: { confirmedOnly?: boolean } = {}) =>
       dex.planRedeem(await dex.freshLiquidityPool(poolAddress, { ...options, exit: true }), lp);
     let first: LiquidityPlan;

@@ -8,7 +8,9 @@
  * it); submitMode not set (refused before the key is loaded) and `check` (checked only);
  * the guards on entry only (remove and the position reads go ahead on a pool an entry
  * guard refuses); a box at a pool tree that is not the pool of the LP token it holds,
- * refused everywhere and ignored by positions-owned; a removal the pool cannot pay naming
+ * refused everywhere and ignored by positions-owned; two boxes at pool trees holding enough
+ * of one LP token that the pool cannot be told apart (a 409); an NFT of supply 2 in two
+ * boxes (a 400, skipped by positions-owned); a removal the pool cannot pay naming
  * what it can; positions from confirmed LP balances; LithosDex pools and create-pool
  * answering 501.
  */
@@ -674,6 +676,68 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(JSON.parse(res.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
     });
 
+    it('positions-owned: each box and token not counted is logged as a warning, with the token, the pool and why', async () => {
+      // a box holding 1 of its LP token's 1000: dropped for holding half or less
+      const orphanLp = 'f5'.repeat(32);
+      const orphan = makeBox({
+        ergoTree: N2T_TREE,
+        value: ERG,
+        creationHeight: TIP - 5,
+        assets: [
+          { tokenId: 'f6'.repeat(32), amount: 1n },
+          { tokenId: orphanLp, amount: 1n },
+          { tokenId: FX, amount: 1000n },
+        ],
+        registers: { R4: R4(997) },
+      });
+      // a box holding all of its LP token, refused on its fresh read: its NFT's supply is 2
+      const refusedLp = 'f7'.repeat(32);
+      const refusedNft = 'f8'.repeat(32);
+      const refused = makeBox({
+        ergoTree: N2T_TREE,
+        value: ERG,
+        creationHeight: TIP - 5,
+        assets: [
+          { tokenId: refusedNft, amount: 1n },
+          { tokenId: refusedLp, amount: 999n },
+          { tokenId: FX, amount: 1000n },
+        ],
+        registers: { R4: R4(997) },
+      });
+      state.byTree.set(N2T_TREE, [RSN_POOL, orphan, refused]);
+      state.pools.set('f6'.repeat(32), [orphan]);
+      state.pools.set(refusedNft, [refused]);
+      state.emission.set(orphanLp, 1000n);
+      state.emission.set(refusedLp, 1000n);
+      state.emission.set(refusedNft, 2n);
+      state.wallet = [
+        walletBox(ERG, [
+          { tokenId: LP, amount: 4867691n },
+          { tokenId: orphanLp, amount: 999n },
+          { tokenId: refusedLp, amount: 1n },
+        ]),
+      ];
+      const warn = jest.spyOn(logger, 'warn');
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
+      expect(warn).toHaveBeenCalledWith(
+        `ergodex: positions-owned: pool ${'f6'.repeat(32)} not counted for LP token ${orphanLp}: it holds 1, ` +
+          'half or less of the LP token minted',
+      );
+      expect(warn).toHaveBeenCalledWith(
+        `ergodex: positions-owned: LP token ${orphanLp} is not counted: no box at a pool tree is its pool`,
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(
+          new RegExp(`pool ${refusedNft} not counted for LP token ${refusedLp}: .*supply of 2, not 1`),
+        ),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        `ergodex: positions-owned: LP token ${refusedLp} is not counted: no box at a pool tree is its pool`,
+      );
+    });
+
     it('positions-owned: a pool tree read only in part is logged as a warning, since a position can be missing', async () => {
       // boxes with no tokens at the pool tree: cheap to create, never spendable
       const junk = Array.from({ length: 200 }, (_, i) =>
@@ -754,6 +818,187 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(res.statusCode).toBe(503);
       expect(JSON.parse(res.body).message).toContain(`supply of LP token ${LP} yet; retry`);
       expect(posts()).toBe(0);
+    });
+  });
+
+  describe('two boxes at pool trees holding the same LP token', () => {
+    /**
+     * A real pool whose creator kept 60% of its LP token's emission, so its box holds 40%,
+     * and a box the creator placed at the same tree with a fresh NFT, 55% of that LP token
+     * and a junk token: it holds more than half, so the majority rule takes it for the pool.
+     */
+    const SPLIT_LP = 'e0'.repeat(32);
+    const SPLIT_NFT = 'e1'.repeat(32);
+    const PLANTED_NFT = 'e2'.repeat(32);
+    const SPLIT_POOL = makeBox({
+      ergoTree: N2T_TREE,
+      value: 1000n * ERG,
+      creationHeight: TIP - 5,
+      assets: [
+        { tokenId: SPLIT_NFT, amount: 1n },
+        { tokenId: SPLIT_LP, amount: (LP_EMISSION * 40n) / 100n },
+        { tokenId: RSN, amount: 1000000000n },
+      ],
+      registers: { R4: R4(997) },
+    });
+    const PLANTED = makeBox({
+      ergoTree: N2T_TREE,
+      value: ERG,
+      creationHeight: TIP - 5,
+      assets: [
+        { tokenId: PLANTED_NFT, amount: 1n },
+        { tokenId: SPLIT_LP, amount: (LP_EMISSION * 55n) / 100n },
+        { tokenId: FX, amount: 1000n },
+      ],
+      registers: { R4: R4(997) },
+    });
+    const HELD = 10n ** 16n;
+
+    describe('a real pool holding half or less of its LP token, and a planted box holding more', () => {
+      beforeEach(() => {
+        state.byTree.set(N2T_TREE, [SPLIT_POOL, PLANTED]);
+        state.pools.set(SPLIT_NFT, [SPLIT_POOL]);
+        state.pools.set(PLANTED_NFT, [PLANTED]);
+        state.emission.set(SPLIT_LP, LP_EMISSION);
+        state.emission.set(FX, 1000n);
+        state.wallet = [walletBox(ERG, [{ tokenId: SPLIT_LP, amount: HELD }])];
+      });
+
+      it('positions-owned is a 409 naming the LP token and both pools, not a position in the planted box', async () => {
+        const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+        expect(res.statusCode).toBe(409);
+        const message: string = JSON.parse(res.body).message;
+        expect(message).toContain(`Two boxes at pool trees hold LP token ${SPLIT_LP}`);
+        expect(message).toContain(`pool ${PLANTED_NFT}`);
+        expect(message).toContain(`pool ${SPLIT_NFT} holding ${(LP_EMISSION * 40n) / 100n}`);
+        expect(message).toContain('cannot be told apart for this amount');
+      });
+
+      it('remove and position-info naming the planted box are 409s, nothing posted', async () => {
+        const results = [
+          await remove({ poolAddress: PLANTED_NFT, percentageToRemove: 100 }),
+          await app.inject({ method: 'GET', url: positionInfoUrl(PLANTED_NFT) }),
+        ];
+        for (const r of results) {
+          expect(r.statusCode).toBe(409);
+          const message: string = JSON.parse(r.body).message;
+          expect(message).toContain(`Two boxes at pool trees hold LP token ${SPLIT_LP}: pool ${PLANTED_NFT}`);
+          expect(message).toContain(`pool ${SPLIT_NFT} holding`);
+          expect(message).toContain(`at least the ${HELD} in question`);
+        }
+        expect(posts()).toBe(0);
+      });
+
+      it('naming the real pool is still refused by the majority rule', async () => {
+        const results = [
+          await remove({ poolAddress: SPLIT_NFT, percentageToRemove: 100 }),
+          await app.inject({ method: 'GET', url: positionInfoUrl(SPLIT_NFT) }),
+        ];
+        for (const r of results) {
+          expect(r.statusCode).toBe(400);
+          expect(JSON.parse(r.body).message).toContain(`is not the pool of LP token ${SPLIT_LP}`);
+        }
+        expect(posts()).toBe(0);
+      });
+    });
+
+    describe('a box with one unit of the LP token beside a normal real pool', () => {
+      beforeEach(() => {
+        state.byTree.set(N2T_TREE, [FAKE_N2T_POOL, RSN_POOL]);
+        state.pools.set(FAKE_N2T_NFT, [FAKE_N2T_POOL]);
+      });
+
+      it('a remove of a normal amount on the real pool goes ahead', async () => {
+        state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+        const res = await remove({ percentageToRemove: 50 });
+        expect(res.statusCode).toBe(200);
+        expect(posts()).toBe(1);
+      });
+
+      it('a remove or position read of one LP unit is a 409, nothing posted', async () => {
+        state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 1n }])];
+        const results = [
+          await remove({ percentageToRemove: 100 }),
+          await app.inject({ method: 'GET', url: positionInfoUrl(NFT) }),
+        ];
+        for (const r of results) {
+          expect(r.statusCode).toBe(409);
+          const message: string = JSON.parse(r.body).message;
+          expect(message).toContain(`pool ${NFT}, and pool ${FAKE_N2T_NFT} holding 1, at least the 1 in question`);
+        }
+        expect(posts()).toBe(0);
+      });
+
+      it('position-info with no LP tokens is not refused', async () => {
+        state.wallet = [walletBox(ERG)];
+        const res = await app.inject({ method: 'GET', url: positionInfoUrl(NFT) });
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).lpTokenAmount).toBe('0');
+      });
+    });
+
+    it('a pool tree read only in part: the remove goes ahead, and a warning names the pool', async () => {
+      const junk = Array.from({ length: 200 }, (_, i) =>
+        makeBox({ ergoTree: N2T_TREE, value: 200000n + BigInt(i), assets: [], creationHeight: TIP - 1 }),
+      );
+      state.byTree.set(N2T_TREE, [...junk, RSN_POOL]);
+      state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: 4867691n }])];
+      useDex(makeDex(state, dexConfig({ maxDiscoveredBoxes: 200 })));
+      const warn = jest.spyOn(logger, 'warn');
+      const res = await remove();
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(`pool ${NFT}: a pool tree on mainnet was read only in part`)),
+      );
+    });
+  });
+
+  describe('an NFT minted with a supply of 2, held by two boxes at a pool tree', () => {
+    const NFT2 = 'e3'.repeat(32);
+    const Z = 'e4'.repeat(32);
+    const twin = (value: bigint) =>
+      makeBox({
+        ergoTree: N2T_TREE,
+        value,
+        creationHeight: TIP - 5,
+        assets: [
+          { tokenId: NFT2, amount: 1n },
+          { tokenId: Z, amount: 1n },
+          { tokenId: FX, amount: 10n },
+        ],
+        registers: { R4: R4(997) },
+      });
+    const TWINS = [twin(ERG), twin(ERG + 1n)];
+
+    beforeEach(() => {
+      state.byTree.set(N2T_TREE, [...TWINS, RSN_POOL]);
+      state.pools.set(NFT2, TWINS);
+      state.emission.set(NFT2, 2n);
+      state.emission.set(Z, 1000n);
+      state.emission.set(FX, 1000n);
+      // one unit of Z sent to the wallet, beside a real position
+      state.wallet = [
+        walletBox(ERG, [
+          { tokenId: LP, amount: 4867691n },
+          { tokenId: Z, amount: 1n },
+        ]),
+      ];
+    });
+
+    it('positions-owned lists the real position, and never reads the twin boxes fresh', async () => {
+      const res = await app.inject({ method: 'GET', url: positionsOwnedUrl });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).map((p: { poolAddress: string }) => p.poolAddress)).toEqual([NFT]);
+      expect(state.calls.some((c) => c.path.startsWith(`/blockchain/box/unspent/byTokenId/${NFT2}`))).toBe(false);
+      // the real pool was read fresh, so the path matched here is the one such a read uses
+      expect(state.calls.some((c) => c.path.startsWith(`/blockchain/box/unspent/byTokenId/${NFT}`))).toBe(true);
+    });
+
+    it('naming that NFT is a 400 for its supply, not a 409 to retry', async () => {
+      const res = await app.inject({ method: 'GET', url: positionInfoUrl(NFT2) });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toContain('supply of 2, not 1');
     });
   });
 

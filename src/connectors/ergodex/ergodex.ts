@@ -46,6 +46,8 @@ export interface DiscoveredPool {
   tokenIds: [string | null, string | null];
   /** The pool's LP token, for a venue that offers liquidity on this network. */
   lpTokenId?: string;
+  /** How much of that LP token the box holds, when `lpTokenId` is set. */
+  lpReserve?: bigint;
 }
 
 /** Discovery results per chain instance (one per network), by trees and limit. */
@@ -258,6 +260,9 @@ export class Ergodex {
     });
     const confirmed = confirmedAll.filter((b) => holdsNft(b) && this.venueForTree(b.ergoTree));
     if (confirmed.length > 1) {
+      // An NFT minted with a supply other than 1 is not a pool (a 400); only a real NFT
+      // seen in two boxes is a state to retry.
+      await this.assertSingleNft(id);
       throw httpErrors.createError(409, `${confirmed.length} unspent boxes hold pool NFT ${id}; refusing to guess`);
     }
     if (this.config.useMempoolSuccessor && !options.confirmedOnly) {
@@ -267,6 +272,7 @@ export class Ergodex {
       const live: ErgoBox[] = [];
       for (const box of pending) if (!(await node.isSpentInMempool(box.boxId))) live.push(box);
       if (live.length > 1) {
+        await this.assertSingleNft(id);
         throw httpErrors.createError(
           409,
           `The mempool holds ${live.length} unspent successors of pool ${id}; retry once it settles`,
@@ -377,15 +383,59 @@ export class Ergodex {
    * the node's answer, cached by the chain layer (a token is minted once).
    */
   private async assertPoolOfLpToken(pool: VenuePool, lpTokenId: string): Promise<void> {
-    const emission = await this.ergo.getTokenEmission(lpTokenId);
-    if (emission === null) {
-      throw httpErrors.serviceUnavailable(`The node does not report the supply of LP token ${lpTokenId} yet; retry`);
-    }
+    const emission = await this.lpEmission(lpTokenId);
     const held = pool.box.assets[1].amount;
     if (2n * held <= emission) {
       throw httpErrors.badRequest(
         `Box ${pool.box.boxId} (pool NFT ${pool.poolId}) is not the pool of LP token ${lpTokenId}: it holds ` +
           `${held} of the ${emission} minted, and that LP token's pool holds more than half`,
+      );
+    }
+  }
+
+  /** An LP token's emission as the node reports it; a 503 to retry when it does not yet. */
+  private async lpEmission(lpTokenId: string): Promise<bigint> {
+    const emission = await this.ergo.getTokenEmission(lpTokenId);
+    if (emission === null) {
+      throw httpErrors.serviceUnavailable(`The node does not report the supply of LP token ${lpTokenId} yet; retry`);
+    }
+    return emission;
+  }
+
+  /** Whether a box holding `held` of an LP token holds more than half of its emission. */
+  async holdsMostOfLpToken(lpTokenId: string, held: bigint): Promise<boolean> {
+    return 2n * held > (await this.lpEmission(lpTokenId));
+  }
+
+  /**
+   * The majority rule cannot tell a pool apart when the real pool's box holds half or less
+   * of its LP token: its creator kept the rest, and can place a box at a pool tree that
+   * holds more than half. A redeem in that box pays out its reserves, not the pool's. So a
+   * redeem or position read of `amount` LP tokens is refused with a 409 when another box
+   * at a pool tree (from the discovered pool list) holds at least `amount` of the same LP
+   * token. A box holding less cannot be the pool those tokens came from, so it does not
+   * block. A pool tree read only in part may hide such a box: that is logged, and the
+   * request goes ahead.
+   */
+  async assertSoleLpClaimant(fresh: FreshLiquidityPool, amount: bigint): Promise<void> {
+    const lpTokenId = fresh.lpToken.tokenId!;
+    const poolId = fresh.pool.poolId;
+    const { pools, complete } = await this.discoverPoolList();
+    const others = pools.filter(
+      (p) => p.poolId !== poolId && p.lpTokenId === lpTokenId && (p.lpReserve ?? 0n) >= amount,
+    );
+    if (others.length > 0) {
+      throw httpErrors.createError(
+        409,
+        `Two boxes at pool trees hold LP token ${lpTokenId}: pool ${poolId}, and ` +
+          others.map((p) => `pool ${p.poolId} holding ${p.lpReserve}`).join(', ') +
+          `, at least the ${amount} in question; the pool of this LP token cannot be told apart for this amount`,
+      );
+    }
+    if (!complete) {
+      logger.warn(
+        `ergodex: pool ${poolId}: a pool tree on ${this.network} was read only in part, so another box holding ` +
+          `LP token ${lpTokenId} may have been missed; going ahead on the box that holds most of it`,
       );
     }
   }
@@ -469,7 +519,7 @@ export class Ergodex {
               venue: pool.venue,
               kind: pool.kind,
               tokenIds: [pool.x.tokenId, pool.y.tokenId],
-              ...(lpTokenId ? { lpTokenId } : {}),
+              ...(lpTokenId ? { lpTokenId, lpReserve: pool.box.assets[1].amount } : {}),
             });
           }
         }
