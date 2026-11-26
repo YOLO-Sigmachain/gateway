@@ -54,6 +54,7 @@ import {
   assertErgoId,
   decodeErgoAddress,
   decodeErgoAddressForPrefix,
+  fetchUsesEnvProxy,
   formatUnits,
   isErgoId,
   isLoopbackUrl,
@@ -313,12 +314,25 @@ export class ErgoSubmitModeMismatchError extends Error {
 /** The submit mode as one of its three states: `send`, `check`, or not set. */
 type SubmitModeState = ErgoSubmitMode | 'not set';
 
-/** A submitMode value as read: the state it names, or why it names none. Absent is not set. */
+/**
+ * A submitMode value as read: the state it names, or why it names none. Absent is not set.
+ * A value that is neither `send` nor `check` is described by its type only: its text is
+ * never repeated, since a person may have pasted anything there.
+ */
 function readSubmitModeValue(value: unknown): { mode?: SubmitModeState; text: string } {
   if (value === undefined) return { mode: 'not set', text: 'not set' };
   if (value === 'send' || value === 'check') return { mode: value, text: value };
-  const shown = JSON.stringify(value) ?? String(value);
-  return { text: `${shown.length > 40 ? `${shown.slice(0, 40)}…` : shown} (neither send nor check)` };
+  const type =
+    value === null
+      ? 'null'
+      : Array.isArray(value)
+        ? 'a list'
+        : value instanceof Date
+          ? 'a date'
+          : typeof value === 'object'
+            ? 'a mapping'
+            : `a ${typeof value}`;
+  return { text: `a value that is neither send nor check (${type})` };
 }
 
 /** Node rejection text that means an input is not (or no longer) in the UTXO set. */
@@ -377,6 +391,14 @@ export class Ergo {
           'check mode the node receives every signed transaction in full, and whoever runs or can watch that node ' +
           'could broadcast it. Point nodeURL at a node on this machine (localhost, 127.0.0.0/8 or ::1), or set ' +
           `ergo-${network}.checkAllowsRemoteNode: true to accept that; this network does not start until then`,
+      );
+    }
+    if (this.submitMode === 'check' && fetchUsesEnvProxy(process.env, process.execArgv)) {
+      throw new Error(
+        `ergo-${network}.submitMode is check and Node is set to send fetch requests through a proxy from the ` +
+          'environment (NODE_USE_ENV_PROXY or --use-env-proxy, with HTTP_PROXY or HTTPS_PROXY set). In check mode ' +
+          'every signed transaction is posted in full to the node, and the proxy would receive it and could ' +
+          'broadcast it. Start Gateway without the environment proxy; this network does not start until then',
       );
     }
     if (this.submitMode === 'check') {
@@ -438,7 +460,7 @@ export class Ergo {
    * disk, read now (a hand edit changes it). Each is `send`, `check` or not set (no key);
    * not set is a state of its own. All three agreeing gives that state; any disagreement, a
    * value that cannot be read, one that is neither `send` nor `check`, or a key that looks
-   * like submitMode in the network's file or memory or in the chain's memory (see
+   * like submitMode in the network's file or memory or in the chain's memory or file (see
    * findSubmitModeLookalike) gives `mismatch`, and then nothing may be recorded or posted.
    * A mismatch is kept: from then on every answer is that mismatch until Gateway restarts,
    * even if the three values agree again (an update through the API rewrites the whole

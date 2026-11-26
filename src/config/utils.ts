@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 
+import { assertErgoConfigFileUnchanged } from '../chains/ergo/ergo.config';
 import { ConfigManagerV2 } from '../services/config-manager-v2';
 import { logger } from '../services/logger';
 
@@ -108,6 +109,7 @@ export const updateConfig = (fastify: FastifyInstance, configPath: string, confi
         const chainConfigPath = `${parsed.chain}.${pathParts.join('.')}`;
         logger.info(`Routing chain-level field to: ${chainConfigPath}`);
         assertKnownNetworks(fastify, parsed.chain, pathParts, configValue);
+        if (parsed.chain === 'ergo') assertErgoConfigFileUnchanged(parsed.chain);
         ConfigManagerV2.getInstance().set(chainConfigPath, configValue);
         logger.info(`Successfully updated configuration: ${chainConfigPath}`);
         return;
@@ -119,6 +121,7 @@ export const updateConfig = (fastify: FastifyInstance, configPath: string, confi
     }
 
     // Update the configuration using ConfigManagerV2
+    if (namespace === 'ergo' || namespace.startsWith('ergo-')) assertErgoConfigFileUnchanged(namespace);
     ConfigManagerV2.getInstance().set(configPath, configValue);
     logger.info(`Successfully updated configuration: ${configPath}`);
   } catch (error) {

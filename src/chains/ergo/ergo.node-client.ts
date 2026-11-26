@@ -127,11 +127,33 @@ export function normalizeNodeBox(raw: Record<string, unknown>): ErgoBox {
  * while the network's submit mode is not `send`: nothing was posted to the node.
  */
 export class ErgoSubmitRefusedError extends Error {
-  constructor() {
-    super('The submit mode in force is not send: the transaction was not posted to the node, and nothing was sent');
+  constructor(
+    message = 'The submit mode in force is not send: the transaction was not posted to the node, and nothing was sent',
+  ) {
+    super(message);
     this.name = 'ErgoSubmitRefusedError';
   }
 }
+
+/** The node's submit endpoint: a post there sends a transaction. */
+const SUBMIT_PATH = '/transactions';
+
+/**
+ * Every path this client posts to: the submit endpoint (only while the mode is send), the
+ * check endpoint, and the two unspent-box queries that take their address or tree as the
+ * body. A post to any other path, such as the node's other submit endpoint
+ * /transactions/bytes, is refused before any request.
+ */
+const POST_PATHS: readonly string[] = [
+  SUBMIT_PATH,
+  '/transactions/check',
+  '/blockchain/box/unspent/byAddress',
+  '/blockchain/box/unspent/byErgoTree',
+];
+
+const POST_NOT_ALLOWED_MESSAGE =
+  'The node client posts only to its submit, check and unspent-box paths: nothing was posted to the node, and ' +
+  'nothing was sent';
 
 export class ErgoNodeClient {
   private readonly baseUrl: string;
@@ -162,8 +184,13 @@ export class ErgoNodeClient {
     options: { body?: string; contentType?: string; notFoundIsNull?: boolean; plainTextOk?: boolean } = {},
   ): Promise<T | null> {
     const url = `${this.baseUrl}${path}`;
-    // whoever the caller, nothing is posted to the submit endpoint unless the mode is send
-    if (method === 'POST' && this.isSubmitPath(url) && !this.canSubmit()) throw new ErgoSubmitRefusedError();
+    if (method === 'POST') {
+      // whoever the caller, a post goes only to a path this client posts to, and nothing is
+      // posted to the submit endpoint unless the mode is send
+      const target = this.postTarget(url);
+      if (target === undefined) throw new ErgoSubmitRefusedError(POST_NOT_ALLOWED_MESSAGE);
+      if (target === SUBMIT_PATH && !this.canSubmit()) throw new ErgoSubmitRefusedError();
+    }
     let response: Awaited<ReturnType<FetchLike>>;
     try {
       response = await this.fetchImpl(url, {
@@ -208,11 +235,12 @@ export class ErgoNodeClient {
   }
 
   /**
-   * Whether a URL is the node's submit endpoint (`/transactions` under the node's base URL),
-   * as the node would read it: dot segments resolved, percent escapes decoded, repeated and
-   * trailing slashes dropped, case ignored. A URL that cannot be read counts as one.
+   * Which of the paths this client posts to (POST_PATHS) a URL is, under the node's base
+   * URL, as the node would read it: dot segments resolved, percent escapes decoded,
+   * repeated and trailing slashes dropped, case ignored, the query left out. Undefined for
+   * any other path and for a URL that cannot be read.
    */
-  private isSubmitPath(url: string): boolean {
+  private postTarget(url: string): string | undefined {
     const normalize = (pathname: string) => {
       let decoded = pathname;
       try {
@@ -226,9 +254,11 @@ export class ErgoNodeClient {
         .toLowerCase();
     };
     try {
-      return normalize(new URL(url).pathname) === normalize(`${new URL(`${this.baseUrl}/`).pathname}transactions`);
+      const asked = normalize(new URL(url).pathname);
+      const base = new URL(`${this.baseUrl}/`).pathname;
+      return POST_PATHS.find((p) => normalize(`${base}${p.slice(1)}`) === asked);
     } catch {
-      return true;
+      return undefined;
     }
   }
 

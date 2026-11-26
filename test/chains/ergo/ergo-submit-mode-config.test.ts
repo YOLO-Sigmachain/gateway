@@ -10,12 +10,16 @@
  * network started with, the mode in the config held in memory and the mode in the config
  * file, and looks for such keys again: on any doubt nothing is recorded or posted, the
  * answer is a 503 that says to restart, and the network refuses every later submit until
- * it restarts.
+ * it restarts. The chain's config file is searched for such keys too, at start and at each
+ * submit decision. An update through the config API to an Ergo namespace whose file was
+ * edited by hand while Gateway runs is refused with a 409 and writes nothing, so the hand
+ * edit stays and the next submit decision sees it.
  */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+import { FastifyInstance } from 'fastify';
 import * as yaml from 'js-yaml';
 
 import {
@@ -24,13 +28,16 @@ import {
   ErgoSubmitModeMismatchError,
   ErgoSubmitModeNotSetError,
 } from '../../../src/chains/ergo/ergo';
-import { getErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
+import * as ergoConfig from '../../../src/chains/ergo/ergo.config';
+import { getErgoNetworkConfig, isSubmitModeLookalike } from '../../../src/chains/ergo/ergo.config';
 import { ErgoSubmitRefusedError } from '../../../src/chains/ergo/ergo.node-client';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { addressFromPublicKey } from '../../../src/chains/ergo/ergo.utils';
 import { toHttpError } from '../../../src/chains/ergo/routes/errors';
+import { updateConfig } from '../../../src/config/utils';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { httpErrors } from '../../../src/services/error-handler';
 import { logger } from '../../../src/services/logger';
 
 import {
@@ -217,13 +224,56 @@ const LOOKALIKES: Array<[name: string, text: string, shown: string, where: () =>
     '"\\u{ff53}\\u{ff55}\\u{ff42}\\u{ff4d}\\u{ff49}\\u{ff54}Mode"',
     () => `in ${configFile}`,
   ],
-  ['a nested key', 'mainnet:\n  submitMode: check', '"submitMode"', () => `under "mainnet" in ${configFile}`],
+  ['a nested key', 'mainnet:\n  submitMode: check', '"submitMode"', () => `under another key in ${configFile}`],
   [
     'a nested misspelt key',
     'networks:\n  sumbitMode: check',
     '"sumbitMode"',
-    () => `under "networks" in ${configFile}`,
+    () => `under another key in ${configFile}`,
   ],
+  [
+    'the namespace and a dot before it',
+    'ergo-mainnet.submitMode: check',
+    '"ergo-mainnet.submitMode"',
+    () => `in ${configFile}`,
+  ],
+  ['the network and a dot before it', 'mainnet.submitMode: check', '"mainnet.submitMode"', () => `in ${configFile}`],
+  ['the chain and a dot before it', 'ergo.submitMode: check', '"ergo.submitMode"', () => `in ${configFile}`],
+  [
+    'the namespace and a slash before it',
+    'ergo-mainnet/submitMode: check',
+    '"ergo-mainnet/submitMode"',
+    () => `in ${configFile}`,
+  ],
+  ['a part before a colon', "'x:submitMode': check", '"x:submitMode"', () => `in ${configFile}`],
+  ['a misspelt last part', 'ergo-mainnet.sumbitMode: check', '"ergo-mainnet.sumbitMode"', () => `in ${configFile}`],
+  ['a word after it', 'submitModeOverride: check', '"submitModeOverride"', () => `in ${configFile}`],
+  ['a word before it', 'mainnetSubmitMode: check', '"mainnetSubmitMode"', () => `in ${configFile}`],
+  [
+    'two levels down',
+    'networks:\n  mainnet:\n    submitMode: check',
+    '"submitMode"',
+    () => `under another key in ${configFile}`,
+  ],
+  [
+    'eight levels down',
+    'a:\n b:\n  c:\n   d:\n    e:\n     f:\n      g:\n       submitMode: check',
+    '"submitMode"',
+    () => `under another key in ${configFile}`,
+  ],
+  ['in a list', 'overrides:\n  - submitMode: check', '"submitMode"', () => `under another key in ${configFile}`],
+  ['mode', 'mode: check', '"mode"', () => `in ${configFile}`],
+  ['dryRun', 'dryRun: true', '"dryRun"', () => `in ${configFile}`],
+  ['dry_run', 'dry_run: true', '"dry_run"', () => `in ${configFile}`],
+  ['checkOnly', 'checkOnly: true', '"checkOnly"', () => `in ${configFile}`],
+  ['checkMode', 'checkMode: true', '"checkMode"', () => `in ${configFile}`],
+  ['simulate', 'simulate: true', '"simulate"', () => `in ${configFile}`],
+  ['simulation', 'simulation: true', '"simulation"', () => `in ${configFile}`],
+  ['noSend', 'noSend: true', '"noSend"', () => `in ${configFile}`],
+  ['sendMode', 'sendMode: check', '"sendMode"', () => `in ${configFile}`],
+  ['submit', 'submit: check', '"submit"', () => `in ${configFile}`],
+  ['a word for it as the last part', 'ergo-mainnet.dryRun: true', '"ergo-mainnet.dryRun"', () => `in ${configFile}`],
+  ['a word for it nested', 'mainnet:\n  mode: check', '"mode"', () => `under another key in ${configFile}`],
 ];
 
 describe('a key that looks like submitMode in a real config file, at start', () => {
@@ -241,6 +291,40 @@ describe('a key that looks like submitMode in a real config file, at start', () 
     load('submitMode: send\nsumbitMode: check');
     await expect(Ergo.getInstance('mainnet')).rejects.toThrow('the key "sumbitMode" in');
   });
+
+  it.each(LOOKALIKES)(
+    '%s next to a correct submitMode: send: the network does not start',
+    async (_n, text, shown, where) => {
+      load(`submitMode: send\n${text}`);
+      await expect(Ergo.getInstance('mainnet')).rejects.toThrow(
+        `ergo-mainnet: ${lookalikeText(shown, where())}. Correct it; this network does not start until then`,
+      );
+    },
+  );
+
+  it.each([
+    ['nested nine levels deep', 'a:\n b:\n  c:\n   d:\n    e:\n     f:\n      g:\n       h:\n        i: 1'],
+    ['more than 5000 keys and list entries', `many: [${Array.from({ length: 5001 }, (_, i) => i).join(', ')}]`],
+  ])('a config file %s is not searched to the end: the network does not start', async (_name, text) => {
+    load(`submitMode: send\n${text}`);
+    await expect(Ergo.getInstance('mainnet')).rejects.toThrow(
+      `ergo-mainnet: ${configFile} is nested more than 8 levels deep or holds more than 5000 keys and list ` +
+        'entries, so it was not searched to the end for a key like "submitMode". Correct it; this network does not ' +
+        'start until then',
+    );
+  });
+
+  it.each([
+    ['submitMode', 'submitMode: check'],
+    ['ergo-mainnet.submitMode', 'ergo-mainnet.submitMode: check'],
+    ['dryRun nested', 'mainnet:\n  dryRun: true'],
+  ])(
+    '%s in the chain file conf/chains/ergo.yml next to a network in send: the network does not start',
+    async (_name, chainExtra) => {
+      load('submitMode: send', { chainExtra });
+      await expect(Ergo.getInstance('mainnet')).rejects.toThrow(`in the ergo chain config (${chainFile}) is not read`);
+    },
+  );
 
   it('submitMode in the chain file conf/chains/ergo.yml: the network does not start', async () => {
     load('submitMode: send', { chainExtra: 'submitMode: check' });
@@ -435,7 +519,46 @@ describe('the mode compared at each submit decision while Gateway runs', () => {
     load('submitMode: send');
     const run = live();
     editFile('submitMode: true');
-    await expectNothingSent(run, { running: 'send', inMemory: 'send', inFile: 'true (neither send nor check)' });
+    await expectNothingSent(run, {
+      running: 'send',
+      inMemory: 'send',
+      inFile: 'a value that is neither send nor check (a boolean)',
+    });
+  });
+
+  it('a value that looks like a secret: the answer and the log give its type only, never its text', async () => {
+    load('submitMode: send');
+    const run = live();
+    editFile('submitMode: "http://u:S3CRETPW@host:1/abc"');
+    await expectNothingSent(run, {
+      running: 'send',
+      inMemory: 'send',
+      inFile: 'a value that is neither send nor check (a string)',
+    });
+    const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+    const http = toHttpError(error, 'Failed to transfer') as Error;
+    const logged = [logs.info, logs.warn, logs.error].flatMap((spy) =>
+      spy.mock.calls.map((c) => c.map(String).join(' ')),
+    );
+    for (const text of [error.message, http.message, ...logged]) {
+      expect(text).not.toContain('S3CRETPW');
+      expect(text).not.toContain('host:1');
+    }
+  });
+
+  it('a key that looks like a secret with a submitMode under it: the answer names the key found, not the one above it', async () => {
+    load('submitMode: send');
+    const run = live();
+    appendToFile('"http://u:S3CRETPW@h":\n  submitMode: check');
+    const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoSubmitModeMismatchError);
+    expect(error.message).toContain(`the key "submitMode" under another key in ${configFile} is not read`);
+    const http = toHttpError(error, 'Failed to transfer') as Error;
+    const logged = [logs.info, logs.warn, logs.error].flatMap((spy) =>
+      spy.mock.calls.map((c) => c.map(String).join(' ')),
+    );
+    for (const text of [error.message, http.message, ...logged]) expect(text).not.toContain('S3CRETPW');
+    expect(run.posted).toEqual([]);
   });
 
   it('a config file that cannot be read: nothing sent, a 503', async () => {
@@ -609,6 +732,281 @@ describe('a key that looks like submitMode added while the network runs', () => 
       `the key "submitMode" in the ergo chain config (${chainFile}) is not read`,
     );
     expect(run.posted).toEqual([]);
+  });
+
+  it.each([
+    ['submitMode', 'submitMode: check', '"submitMode"', ''],
+    ['sumbitMode', 'sumbitMode: check', '"sumbitMode"', ''],
+    ['ergo-mainnet.submitMode', 'ergo-mainnet.submitMode: check', '"ergo-mainnet.submitMode"', ''],
+    ['a nested dryRun', 'mainnet:\n  dryRun: true', '"dryRun"', 'under another key '],
+  ])(
+    '%s added by hand to the chain file conf/chains/ergo.yml: the next transfer is refused, and the refusal is kept',
+    async (_name, text, shown, under) => {
+      load('submitMode: send');
+      const run = live();
+      const chainText = fs.readFileSync(chainFile, 'utf8');
+      fs.appendFileSync(chainFile, `\n${text}\n`);
+      const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+      expect(error).toBeInstanceOf(ErgoSubmitModeMismatchError);
+      expect(error.message).toBe(
+        `The submit mode for ergo-mainnet is in doubt: the key ${shown} ${under}in the ergo chain config file ` +
+          `${chainFile} is not read: the submit mode is set only by the key "submitMode" at the top level of ` +
+          `${configFile}. The mode changed while Gateway was running; correct the config, then restart ` +
+          `Gateway${DOUBT_TAIL}`,
+      );
+      expect((toHttpError(error, 'Failed to transfer') as Error & { statusCode: number }).statusCode).toBe(503);
+      expect(run.posted).toEqual([]);
+      // the line removed again: still refused until a restart
+      fs.writeFileSync(chainFile, chainText);
+      await expect(run.ergo.transfer(ME, OTHER, ERG)).rejects.toBe(error);
+      expect(run.posted).toEqual([]);
+    },
+  );
+
+  it('a chain file that cannot be read at a submit decision: refused by the error kind only, and kept', async () => {
+    load('submitMode: send');
+    const run = live();
+    fs.rmSync(chainFile);
+    const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoSubmitModeMismatchError);
+    expect(error.message).toContain(`the ergo chain config file ${chainFile} cannot be read (ENOENT)`);
+    fs.writeFileSync(chainFile, fs.readFileSync(CHAIN_TEMPLATE, 'utf8'));
+    await expect(run.ergo.transfer(ME, OTHER, ERG)).rejects.toBe(error);
+    expect(run.posted).toEqual([]);
+  });
+
+  it('a chain file that cannot be parsed at a submit decision: refused, and no line of it is quoted', async () => {
+    load('submitMode: send');
+    const run = live();
+    fs.writeFileSync(chainFile, 'defaultWallet: s3cretpass\n  unclosed: indented\n');
+    const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+    expect(error.message).toContain(`the ergo chain config file ${chainFile} cannot be read (YAMLException)`);
+    expect(error.message).not.toContain('s3cretpass');
+    expect(run.posted).toEqual([]);
+  });
+
+  it('a chain file that cannot be read when the network starts: the network does not start', async () => {
+    load('submitMode: send');
+    fs.rmSync(chainFile);
+    await expect(Ergo.getInstance('mainnet')).rejects.toThrow(
+      `ergo-mainnet: the ergo chain config file ${chainFile} cannot be read (ENOENT). Correct it; this network ` +
+        'does not start until then',
+    );
+  });
+
+  it('a config file grown past the search limits while running: refused, and kept', async () => {
+    load('submitMode: send');
+    const run = live();
+    appendToFile('a:\n b:\n  c:\n   d:\n    e:\n     f:\n      g:\n       h:\n        i: 1');
+    const error = await errorOf(run.ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoSubmitModeMismatchError);
+    expect(error.message).toContain(`${configFile} is nested more than 8 levels deep`);
+    expect(run.posted).toEqual([]);
+  });
+});
+
+describe('every key of the shipped Ergo schemas and templates passes the submitMode lookalike test', () => {
+  const keysOf = (tree: unknown, into: string[] = []): string[] => {
+    if (tree && typeof tree === 'object') {
+      for (const [key, value] of Object.entries(tree)) {
+        if (!Array.isArray(tree)) into.push(key);
+        keysOf(value, into);
+      }
+    }
+    return into;
+  };
+  const shipped = [
+    ...Object.keys(JSON.parse(fs.readFileSync(SCHEMA, 'utf8')).properties),
+    ...Object.keys(JSON.parse(fs.readFileSync(CHAIN_SCHEMA, 'utf8')).properties),
+    ...keysOf(yaml.load(fs.readFileSync(TEMPLATE, 'utf8'))),
+    ...keysOf(yaml.load(fs.readFileSync(path.join(TEMPLATES, 'chains/ergo/testnet.yml'), 'utf8'))),
+    ...keysOf(yaml.load(fs.readFileSync(CHAIN_TEMPLATE, 'utf8'))),
+  ];
+
+  it.each([...new Set(shipped)].filter((key) => key !== 'submitMode'))('%s is not taken for submitMode', (key) => {
+    expect(isSubmitModeLookalike(key)).toBe(false);
+  });
+
+  it('checkAllowsRemoteNode is among them', () => {
+    expect(shipped).toContain('checkAllowsRemoteNode');
+    expect(isSubmitModeLookalike('checkAllowsRemoteNode')).toBe(false);
+  });
+
+  it('the shipped template with submitMode: send and checkAllowsRemoteNode set starts', async () => {
+    load('submitMode: send\ncheckAllowsRemoteNode: true', { remoteOk: false });
+    await expect(Ergo.getInstance('mainnet')).resolves.toBeInstanceOf(Ergo);
+  });
+});
+
+describe('an update through the config API after the config file was edited by hand', () => {
+  const fastify = { httpErrors } as unknown as FastifyInstance;
+
+  /** A network running in send, built the way getInstance builds it, on a node stand-in. */
+  function live() {
+    const posted: string[] = [];
+    const node = fakeNode((method, p, body) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(big)] };
+      if (method === 'GET' && p === '/blocks/lastHeaders/10') return { body: HEADERS };
+      if (method === 'POST' && p.startsWith('/transactions')) {
+        posted.push(body!);
+        return { body: JSON.stringify(JSON.parse(body!).id) };
+      }
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { fetch: node.fetch });
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
+    return { ergo, posted };
+  }
+
+  const refusalFor = (namespace: string, file: string) =>
+    `The ${namespace} config file ${file} was changed on disk while Gateway was running, so this update was not ` +
+    'applied. Restart Gateway, which reads the file, before changing the config through the API.';
+
+  /** The update's error, with its status code. */
+  const updateError = (configPath: string, value: unknown) => {
+    try {
+      updateConfig(fastify, configPath, value);
+    } catch (error) {
+      return error as Error & { statusCode?: number };
+    }
+    return undefined;
+  };
+
+  it('a hand edit to check, then an update of nodeTimeoutMs: a 409, the file still says check, and the next transfer is refused with nothing posted', async () => {
+    const manager = load('submitMode: send');
+    const run = live();
+    editFile('submitMode: check');
+    const error = updateError('ergo-mainnet.nodeTimeoutMs', 20000);
+    expect(error?.statusCode).toBe(409);
+    expect(error?.message).toBe(refusalFor('ergo-mainnet', configFile));
+    expect(fs.readFileSync(configFile, 'utf8')).toMatch(/^submitMode: check$/m);
+    expect(manager.get('ergo-mainnet.nodeTimeoutMs')).toBe(10000);
+    await expect(run.ergo.transfer(ME, OTHER, ERG)).rejects.toBeInstanceOf(ErgoSubmitModeMismatchError);
+    // still refused, and still nothing written
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)?.statusCode).toBe(409);
+    expect(fs.readFileSync(configFile, 'utf8')).toMatch(/^submitMode: check$/m);
+    await expect(run.ergo.transfer(ME, OTHER, ERG)).rejects.toBeInstanceOf(ErgoSubmitModeMismatchError);
+    expect(run.posted).toEqual([]);
+  });
+
+  it('no hand edit: the update is applied as before, a later one too, and the network still sends', async () => {
+    const manager = load('submitMode: send');
+    const run = live();
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+    expect(manager.get('ergo-mainnet.nodeTimeoutMs')).toBe(20000);
+    expect(yaml.load(fs.readFileSync(configFile, 'utf8'))).toMatchObject({ nodeTimeoutMs: 20000, submitMode: 'send' });
+    expect(updateError('ergo-mainnet.boxPageSize', 50)).toBeUndefined();
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 30000)).toBeUndefined();
+    expect(yaml.load(fs.readFileSync(configFile, 'utf8'))).toMatchObject({ nodeTimeoutMs: 30000, boxPageSize: 50 });
+    expect(updateError('ergo.defaultNetwork', 'mainnet')).toBeUndefined();
+    expect(updateError('ergo-mainnet.defaultWallet', 'someone')).toBeUndefined();
+    expect(manager.get('ergo.defaultWallet')).toBe('someone');
+    await run.ergo.transfer(ME, OTHER, ERG);
+    expect(run.posted).toHaveLength(1);
+  });
+
+  it('an update the schema refuses changes nothing, and a later update is applied', () => {
+    const manager = load('submitMode: send');
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 'soon')?.statusCode).toBe(400);
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+    expect(manager.get('ergo-mainnet.nodeTimeoutMs')).toBe(20000);
+  });
+
+  it('a file the loader merged with the template at start: the update is applied, and a later one too', () => {
+    load('submitMode: send');
+    // tokenListSource is required: without it the loader fills it in from the template
+    fs.writeFileSync(configFile, configText('submitMode: send').replace(/^tokenListSource: .*$/m, ''));
+    const manager = new ConfigManagerV2(path.join(dir, 'root.yml'));
+    manager.addNamespace('ergo', CHAIN_SCHEMA, chainFile, CHAIN_TEMPLATE);
+    manager.addNamespace('ergo-mainnet', SCHEMA, configFile, TEMPLATE);
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue(manager);
+    expect(manager.get('ergo-mainnet.tokenListSource')).toBe('tokens/ergo/mainnet.json');
+    expect(fs.readFileSync(configFile, 'utf8')).not.toContain('tokenListSource');
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 30000)).toBeUndefined();
+    expect(manager.get('ergo-mainnet.nodeTimeoutMs')).toBe(30000);
+  });
+
+  it.each([
+    ['the submitMode line removed', () => editFile('')],
+    [
+      'an optional line removed',
+      () => fs.writeFileSync(configFile, configText('submitMode: send').replace(/^boxPageSize: .*$/m, '')),
+    ],
+    ['a line added', () => appendToFile('note: added by hand')],
+    [
+      'a value changed',
+      () =>
+        fs.writeFileSync(configFile, configText('submitMode: send').replace(/^confirmations: 1$/m, 'confirmations: 2')),
+    ],
+    ['the file removed', () => fs.rmSync(configFile)],
+    ['the file made unparseable', () => appendToFile('  broken: indented')],
+  ])('%s by hand, before any update: the update is refused with a 409', (_name, edit) => {
+    load('submitMode: send');
+    edit();
+    const before = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : undefined;
+    const error = updateError('ergo-mainnet.nodeTimeoutMs', 20000);
+    expect(error?.statusCode).toBe(409);
+    expect(error?.message).toBe(refusalFor('ergo-mainnet', configFile));
+    expect(fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : undefined).toBe(before);
+  });
+
+  it.each([
+    ['a value changed', (text: string) => text.replace(/^nodeTimeoutMs: .*$/m, 'nodeTimeoutMs: 25000')],
+    ['a line removed', (text: string) => text.replace(/^boxPageSize: .*\n/m, '')],
+    ['a line added', (text: string) => `${text}note: by hand\n`],
+    ['a comment added', (text: string) => `${text}# by hand\n`],
+  ])('after an earlier update, %s by hand: the next update is refused with a 409', (_name, edit) => {
+    load('submitMode: send');
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+    const edited = edit(fs.readFileSync(configFile, 'utf8'));
+    fs.writeFileSync(configFile, edited);
+    expect(updateError('ergo-mainnet.boxPageSize', 50)?.statusCode).toBe(409);
+    expect(fs.readFileSync(configFile, 'utf8')).toBe(edited);
+  });
+
+  it('a hand edit of the chain file conf/chains/ergo.yml, then an update of an ergo key: a 409, the file kept', () => {
+    const manager = load('submitMode: send');
+    const edited = fs.readFileSync(chainFile, 'utf8').replace(/^defaultNetwork: mainnet$/m, 'defaultNetwork: testnet');
+    fs.writeFileSync(chainFile, edited);
+    for (const configPath of ['ergo.defaultWallet', 'ergo-mainnet.defaultWallet']) {
+      const error = updateError(configPath, 'someone');
+      expect(error?.statusCode).toBe(409);
+      expect(error?.message).toBe(refusalFor('ergo', chainFile));
+    }
+    expect(fs.readFileSync(chainFile, 'utf8')).toBe(edited);
+    expect(manager.get('ergo.defaultWallet')).not.toBe('someone');
+    // the network file was not touched: an update there is applied
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+  });
+
+  it('an update of a Solana or Ethereum namespace does not run the check, and is applied as before', () => {
+    const check = jest.spyOn(ergoConfig, 'assertErgoConfigFileUnchanged');
+    const manager = load('submitMode: send');
+    const others: Array<[namespace: string, chain: string, network: string, key: string, value: unknown]> = [
+      ['solana-mainnet-beta', 'solana', 'mainnet-beta', 'nodeURL', 'http://solana.test'],
+      ['ethereum-mainnet', 'ethereum', 'mainnet', 'nodeURL', 'http://ethereum.test'],
+    ];
+    for (const [namespace, chain, network, key, value] of others) {
+      const template = path.join(TEMPLATES, `chains/${chain}/${network}.yml`);
+      const file = path.join(dir, `${namespace}.yml`);
+      fs.writeFileSync(file, fs.readFileSync(template, 'utf8'));
+      manager.addNamespace(namespace, path.join(TEMPLATES, `namespace/${chain}-network-schema.json`), file, template);
+      // a hand edit is written over, as before
+      fs.appendFileSync(file, '\n# by hand\n');
+      expect(updateError(`${namespace}.${key}`, value)).toBeUndefined();
+      expect(manager.get(`${namespace}.${key}`)).toBe(value);
+      expect(fs.readFileSync(file, 'utf8')).not.toContain('by hand');
+    }
+    expect(check).not.toHaveBeenCalled();
+    // and it does run for an Ergo namespace
+    expect(updateError('ergo-mainnet.nodeTimeoutMs', 20000)).toBeUndefined();
+    expect(check).toHaveBeenCalledWith('ergo-mainnet');
   });
 });
 

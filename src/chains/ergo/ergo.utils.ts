@@ -159,6 +159,25 @@ export function isLoopbackUrl(url: string): boolean {
   return parts !== null && parts.slice(1).every((part) => Number(part) <= 255);
 }
 
+/**
+ * Whether Node is set to send `fetch` requests through a proxy named in the environment:
+ * proxying from the environment is turned on (NODE_USE_ENV_PROXY set to anything but empty
+ * or `0`, or `--use-env-proxy` among the process's own flags or in NODE_OPTIONS) and one
+ * of HTTP_PROXY, HTTPS_PROXY, http_proxy or https_proxy is set. Such a proxy then receives
+ * every request, to a node on this machine too.
+ */
+export function fetchUsesEnvProxy(env: NodeJS.ProcessEnv, execArgv: readonly string[]): boolean {
+  const isFlag = (arg: string) => arg === '--use-env-proxy' || arg.startsWith('--use-env-proxy=');
+  const optedIn =
+    (env.NODE_USE_ENV_PROXY !== undefined && env.NODE_USE_ENV_PROXY !== '' && env.NODE_USE_ENV_PROXY !== '0') ||
+    execArgv.some(isFlag) ||
+    (env.NODE_OPTIONS ?? '').split(/\s+/).some(isFlag);
+  const proxySet = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].some(
+    (name) => env[name] !== undefined && env[name] !== '',
+  );
+  return optedIn && proxySet;
+}
+
 // ---------------------------------------------------------------------------------------
 // Amounts. Whole-unit decimal strings are made from bigints digit by digit: no float ever
 // touches the integer part.

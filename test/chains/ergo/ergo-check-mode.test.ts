@@ -5,8 +5,10 @@
  * anything is selected, loaded or signed. A transaction tracked from an earlier run in
  * `send` mode is never posted again while the mode is `check` or not set: not by poll, not
  * by the overdue check, not as the parent of a chained one. Check mode needs a node on this
- * machine unless the config accepts a remote one. The node client refuses any post to the
- * submit endpoint unless the mode is send. Also the config key, its schema entry and the
+ * machine unless the config accepts a remote one, and never starts while Node sends fetch
+ * requests through a proxy from the environment. The node client refuses any post to the
+ * submit endpoint unless the mode is send, and any post to a path it does not use. Also the
+ * config key, its schema entry and the
  * shipped templates. Built with real fleet, signed with real wasm, posted to a node stand-in.
  */
 import * as fs from 'fs';
@@ -759,6 +761,164 @@ describe("the node client's general request method refuses a post to the submit 
       plainTextOk: true,
     });
     expect(posted).toHaveLength(1);
+  });
+});
+
+describe('the node client posts only to the paths it uses', () => {
+  /** A node stand-in that answers every post, so any refusal is the client's own. */
+  function anyPost(mode: ModeState) {
+    const node = fakeNode((method) => (method === 'POST' ? { body: JSON.stringify('ab'.repeat(32)) } : undefined));
+    const ergo = new Ergo('mainnet', { config: modeConfig(mode), fetch: node.fetch });
+    return { ergo, node };
+  }
+
+  it.each([['send' as const], ['check' as const], ['not set' as const]])(
+    "with the mode %s: a post to the node's other submit endpoint or to any other path is refused, and nothing is posted",
+    async (mode) => {
+      const { ergo, node } = anyPost(mode);
+      for (const p of [
+        '/transactions/bytes',
+        '/transactions/bytes/',
+        '//transactions/bytes',
+        '/Transactions/Bytes',
+        '/%74ransactions/bytes',
+        '/transactions%2Fbytes',
+        '/transactions/check/../bytes',
+        '/transactions/checkBytes',
+        '/wallet/transaction/send',
+        '/wallet/payment/send',
+        '/blockchain/box/unspent/byAddress/extra',
+        '/info',
+        '/unknown',
+      ]) {
+        const error = await errorOf(ergo.node.request('POST', p, { body: '{}', plainTextOk: true }));
+        expect(error).toBeInstanceOf(ErgoSubmitRefusedError);
+        expect(error.message).toBe(
+          'The node client posts only to its submit, check and unspent-box paths: nothing was posted to the node, ' +
+            'and nothing was sent',
+        );
+      }
+      expect(node.calls).toEqual([]);
+    },
+  );
+
+  it('with the mode send, every post the client makes still reaches the node', async () => {
+    const { ergo, node } = anyPost('send');
+    for (const p of [
+      '/transactions',
+      '/transactions/check',
+      '/blockchain/box/unspent/byAddress?offset=0&limit=100',
+      '/blockchain/box/unspent/byErgoTree?offset=0&limit=100',
+    ]) {
+      await ergo.node.request('POST', p, { body: '{}', plainTextOk: true });
+    }
+    expect(node.calls.map((c) => [c.method, c.path])).toEqual([
+      ['POST', '/transactions'],
+      ['POST', '/transactions/check'],
+      ['POST', '/blockchain/box/unspent/byAddress?offset=0&limit=100'],
+      ['POST', '/blockchain/box/unspent/byErgoTree?offset=0&limit=100'],
+    ]);
+  });
+
+  it.each([['check' as const], ['not set' as const]])(
+    'with the mode %s, the check and unspent-box posts reach the node and the submit post does not',
+    async (mode) => {
+      const { ergo, node } = anyPost(mode);
+      for (const p of [
+        '/transactions/check',
+        '/blockchain/box/unspent/byAddress?offset=0&limit=100',
+        '/blockchain/box/unspent/byErgoTree?offset=0&limit=100',
+      ]) {
+        await ergo.node.request('POST', p, { body: '{}', plainTextOk: true });
+      }
+      await expect(ergo.node.request('POST', '/transactions', { body: '{}' })).rejects.toBeInstanceOf(
+        ErgoSubmitRefusedError,
+      );
+      expect(node.calls.map((c) => c.path)).toEqual([
+        '/transactions/check',
+        '/blockchain/box/unspent/byAddress?offset=0&limit=100',
+        '/blockchain/box/unspent/byErgoTree?offset=0&limit=100',
+      ]);
+    },
+  );
+
+  it('the box reads that post go through the client as before', async () => {
+    const node = fakeNode((method, p) => {
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(big)] };
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byErgoTree')) return { body: [nodeBoxJson(big)] };
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { config: modeConfig('check'), fetch: node.fetch });
+    const query = { includeUnconfirmed: false, excludeMempoolSpent: false };
+    expect((await ergo.node.getUnspentBoxesByAddress(ME, query)).map((b) => b.boxId)).toEqual([big.boxId]);
+    expect((await ergo.node.getUnspentBoxesByErgoTree(ME_TREE, 1000)).map((b) => b.boxId)).toEqual([big.boxId]);
+  });
+});
+
+describe('check mode is refused when Node sends fetch requests through a proxy from the environment', () => {
+  const PROXY_VARS = ['NODE_USE_ENV_PROXY', 'NODE_OPTIONS', 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'];
+  let saved: Record<string, string | undefined>;
+  let savedArgv: string[];
+
+  beforeEach(() => {
+    saved = Object.fromEntries(PROXY_VARS.map((name) => [name, process.env[name]]));
+    savedArgv = [...process.execArgv];
+    for (const name of PROXY_VARS) delete process.env[name];
+  });
+
+  afterEach(() => {
+    for (const name of PROXY_VARS) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+    process.execArgv.splice(0, process.execArgv.length, ...savedArgv);
+  });
+
+  const PROXY_MESSAGE =
+    'ergo-mainnet.submitMode is check and Node is set to send fetch requests through a proxy from the environment ' +
+    '(NODE_USE_ENV_PROXY or --use-env-proxy, with HTTP_PROXY or HTTPS_PROXY set). In check mode every signed ' +
+    'transaction is posted in full to the node, and the proxy would receive it and could broadcast it. Start ' +
+    'Gateway without the environment proxy; this network does not start until then';
+  const local = (mode: ModeState) => modeConfig(mode, { nodeURL: 'http://127.0.0.1:9053' });
+
+  it.each([
+    ['NODE_USE_ENV_PROXY=1 and HTTP_PROXY', { NODE_USE_ENV_PROXY: '1', HTTP_PROXY: 'http://proxy.test:3128' }, []],
+    ['NODE_USE_ENV_PROXY=true and HTTPS_PROXY', { NODE_USE_ENV_PROXY: 'true', HTTPS_PROXY: 'http://p.test:1' }, []],
+    ['NODE_USE_ENV_PROXY=1 and http_proxy', { NODE_USE_ENV_PROXY: '1', http_proxy: 'http://p.test:1' }, []],
+    ['NODE_USE_ENV_PROXY=1 and https_proxy', { NODE_USE_ENV_PROXY: '1', https_proxy: 'http://p.test:1' }, []],
+    [
+      '--use-env-proxy in NODE_OPTIONS',
+      { NODE_OPTIONS: '--max-old-space-size=2048 --use-env-proxy', HTTP_PROXY: 'x' },
+      [],
+    ],
+    ['--use-env-proxy among the process flags', { HTTPS_PROXY: 'http://p.test:1' }, ['--use-env-proxy']],
+  ] as Array<[string, Record<string, string>, string[]]>)(
+    '%s: the network does not start in check mode, and the error says why',
+    (_name, env, argv) => {
+      Object.assign(process.env, env);
+      process.execArgv.push(...argv);
+      expect(() => new Ergo('mainnet', { config: local('check') })).toThrow(PROXY_MESSAGE);
+      // a remote node accepted for check mode does not make the proxy acceptable
+      expect(modeConfig('check').checkAllowsRemoteNode).toBe(true);
+      expect(() => new Ergo('mainnet', { config: modeConfig('check') })).toThrow(PROXY_MESSAGE);
+    },
+  );
+
+  it.each([
+    ['the proxy turned on with no proxy named', { NODE_USE_ENV_PROXY: '1' }],
+    ['a proxy named with proxying not turned on', { HTTP_PROXY: 'http://p.test:1', HTTPS_PROXY: 'http://p.test:1' }],
+    ['NODE_USE_ENV_PROXY=0', { NODE_USE_ENV_PROXY: '0', HTTP_PROXY: 'http://p.test:1' }],
+    ['NODE_USE_ENV_PROXY empty', { NODE_USE_ENV_PROXY: '', HTTP_PROXY: 'http://p.test:1' }],
+    ['an empty HTTP_PROXY', { NODE_USE_ENV_PROXY: '1', HTTP_PROXY: '' }],
+  ] as Array<[string, Record<string, string>]>)('%s: check mode starts', (_name, env) => {
+    Object.assign(process.env, env);
+    expect(new Ergo('mainnet', { config: local('check') }).submitMode).toBe('check');
+  });
+
+  it('send mode and the mode not set start as before through the proxy', () => {
+    Object.assign(process.env, { NODE_USE_ENV_PROXY: '1', HTTP_PROXY: 'http://p.test:1' });
+    expect(new Ergo('mainnet', { config: local('send') }).submitMode).toBe('send');
+    expect(new Ergo('mainnet', { config: local('not set') }).submitMode).toBeUndefined();
   });
 });
 

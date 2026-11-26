@@ -1,10 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { isDeepStrictEqual } from 'util';
 
+import Ajv, { ValidateFunction } from 'ajv';
 import yaml from 'js-yaml';
 
 import { rootPath } from '../../paths';
-import { ConfigManagerV2 } from '../../services/config-manager-v2';
+import { ConfigManagerV2, ConfigurationNamespace, deepCopy } from '../../services/config-manager-v2';
+import { httpErrors } from '../../services/error-handler';
 
 import { toAmount } from './ergo.json';
 import { getAvailableErgoNetworks } from './ergo.utils';
@@ -86,18 +89,94 @@ function editDistance(a: string, b: string): number {
   return previous[y.length];
 }
 
-/**
- * Whether a config key looks like submitMode: after Unicode NFKC normalisation, lower-casing
- * and removing every character that is not a letter or a digit, it is `submitmode` or within
- * two edits of it (`sumbitMode`, `submitMod`, `submit_mode`, `submit.mode`, a lookalike
- * letter from another alphabet, an invisible character). The exact key matches too.
- */
-export function isSubmitModeLookalike(key: string): boolean {
-  const folded = key
+/** A key as it is compared: Unicode NFKC normalisation, lower case, letters and digits only. */
+const foldKey = (text: string): string =>
+  text
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]/gu, '');
-  return folded === SUBMIT_MODE_FOLDED || editDistance(folded, SUBMIT_MODE_FOLDED) <= 2;
+
+/** Whether a folded key is `submitmode` or within two edits of it. */
+function nearSubmitMode(folded: string): boolean {
+  if (folded === SUBMIT_MODE_FOLDED) return true;
+  // more than two characters longer or shorter is more than two edits away
+  if (Math.abs(Array.from(folded).length - SUBMIT_MODE_FOLDED.length) > 2) return false;
+  return editDistance(folded, SUBMIT_MODE_FOLDED) <= 2;
+}
+
+/** Other words a person may write meaning "only check" or "the mode", after folding. */
+const SUBMIT_MODE_SYNONYMS = new Set([
+  'dryrun',
+  'checkonly',
+  'checkmode',
+  'simulate',
+  'simulation',
+  'nosend',
+  'sendmode',
+  'mode',
+  'submit',
+]);
+
+/**
+ * Whether a config key looks like submitMode or like another way of saying it. Folded
+ * (Unicode NFKC normalisation, lower case, letters and digits only), it matches when:
+ * - the whole key, or one of its parts split on `.`, `/` or `:` (each folded on its own),
+ *   is `submitmode` or within two edits of it (`sumbitMode`, `submitMod`, `submit_mode`,
+ *   `ergo-mainnet.submitMode`, a lookalike letter from another alphabet, an invisible
+ *   character);
+ * - the whole key contains `submitmode` (`submitModeOverride`, `mainnetSubmitMode`);
+ * - the whole key or its last part is one of dryrun, checkonly, checkmode, simulate,
+ *   simulation, nosend, sendmode, mode, submit.
+ * The exact key submitMode matches too.
+ */
+export function isSubmitModeLookalike(key: string): boolean {
+  const whole = foldKey(key);
+  const parts = key.normalize('NFKC').split(/[./:]/).map(foldKey);
+  if (nearSubmitMode(whole) || parts.some(nearSubmitMode)) return true;
+  if (whole.includes(SUBMIT_MODE_FOLDED)) return true;
+  return SUBMIT_MODE_SYNONYMS.has(whole) || SUBMIT_MODE_SYNONYMS.has(parts[parts.length - 1]);
+}
+
+/** How deep, and over how many keys and list entries, a config tree is searched for such a key. */
+const LOOKALIKE_MAX_DEPTH = 8;
+const LOOKALIKE_MAX_NODES = 5000;
+
+/** A mapping or a list as the YAML parser makes them; a date or binary value is a leaf. */
+const isTreeNode = (value: unknown): value is Record<string, unknown> | unknown[] =>
+  Array.isArray(value) ||
+  (value !== null &&
+    typeof value === 'object' &&
+    [Object.prototype, null].includes(Object.getPrototypeOf(value) as object | null));
+
+/**
+ * The first key in a config tree that looks like submitMode (see isSubmitModeLookalike),
+ * at any depth, with whether it is below the top level; `limit` when the tree is nested
+ * deeper than 8 levels or holds more than 5,000 keys and list entries, so it was not
+ * searched to the end. `exemptTopLevel` is a key not counted at the top level.
+ */
+function findLookalikeKey(
+  tree: unknown,
+  exemptTopLevel?: string,
+): { key: string; nested: boolean } | { limit: true } | undefined {
+  let nodes = 0;
+  const walk = (value: unknown, depth: number): { key: string; nested: boolean } | { limit: true } | undefined => {
+    if (!isTreeNode(value)) return undefined;
+    const entries: Array<[string | undefined, unknown]> = Array.isArray(value)
+      ? value.map((item) => [undefined, item])
+      : Object.entries(value);
+    if (entries.length === 0) return undefined;
+    if (depth > LOOKALIKE_MAX_DEPTH) return { limit: true };
+    for (const [key, inner] of entries) {
+      if (++nodes > LOOKALIKE_MAX_NODES) return { limit: true };
+      if (key !== undefined && !(depth === 1 && key === exemptTopLevel) && isSubmitModeLookalike(key)) {
+        return { key, nested: depth > 1 };
+      }
+      const found = walk(inner, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(tree, 1);
 }
 
 /** A key as it is shown in a message: quoted, cut at 60 characters, with every character outside printable ASCII escaped. */
@@ -131,41 +210,141 @@ const isMapping = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
 /**
- * A key that looks like submitMode and is not the one key the mode is read from, in words,
- * or undefined when there is none. Looked for in the network's config file as read
- * (`fileBody`: its top-level keys, and the keys of each mapping one level down), in the
- * network's config held in memory, and in the chain's config held in memory (where no key
- * like it belongs at all). Such a key is not read, so the mode would not be what it seems
- * to say.
+ * A key that looks like submitMode (see isSubmitModeLookalike) and is not the one key the
+ * mode is read from, in words, or undefined when there is none. Looked for at any depth in
+ * the network's config file as read (`fileBody`), in the network's config held in memory,
+ * in the chain's config held in memory, and in the chain's config file, read from disk now
+ * (in the chain's config no key like it belongs at all). Such a key is not read, so the
+ * mode would not be what it seems to say. A chain config file that cannot be read, and a
+ * tree too deep or too large to search to the end, are problems too. The words name the
+ * key found (quoted, cut and escaped), never a key it is nested under and never a value.
  */
 export function findSubmitModeLookalike(namespaceId: string, fileBody: unknown): string | undefined {
   const manager = ConfigManagerV2.getInstance();
   const namespace = manager.getNamespace(namespaceId);
   const file = namespace ? shownConfigPath(namespace.configurationPath) : `the ${namespaceId} config file`;
-  const found = (key: string, where: string) =>
-    `the key ${shownKey(key)} ${where} is not read: the submit mode is set only by the key "${SUBMIT_MODE_KEY}" ` +
-    `at the top level of ${file}`;
-  if (isMapping(fileBody)) {
-    for (const [key, value] of Object.entries(fileBody)) {
-      if (key !== SUBMIT_MODE_KEY && isSubmitModeLookalike(key)) return found(key, `in ${file}`);
-      if (!isMapping(value)) continue;
-      for (const inner of Object.keys(value)) {
-        if (isSubmitModeLookalike(inner)) return found(inner, `under ${shownKey(key)} in ${file}`);
-      }
+  const problemIn = (tree: unknown, where: string, exemptTopLevel?: string): string | undefined => {
+    const found = findLookalikeKey(tree, exemptTopLevel);
+    if (!found) return undefined;
+    if ('limit' in found) {
+      return (
+        `${where} is nested more than ${LOOKALIKE_MAX_DEPTH} levels deep or holds more than ` +
+        `${LOOKALIKE_MAX_NODES} keys and list entries, so it was not searched to the end for a key like ` +
+        `"${SUBMIT_MODE_KEY}"`
+      );
     }
-  }
-  for (const key of Object.keys(namespace?.configuration ?? {})) {
-    if (key !== SUBMIT_MODE_KEY && isSubmitModeLookalike(key)) {
-      return found(key, `in the ${namespaceId} config held in memory`);
-    }
-  }
+    return (
+      `the key ${shownKey(found.key)} ${found.nested ? 'under another key ' : ''}in ${where} is not read: the ` +
+      `submit mode is set only by the key "${SUBMIT_MODE_KEY}" at the top level of ${file}`
+    );
+  };
+  const inNetwork =
+    (isMapping(fileBody) ? problemIn(fileBody, file, SUBMIT_MODE_KEY) : undefined) ??
+    problemIn(namespace?.configuration, `the ${namespaceId} config held in memory`, SUBMIT_MODE_KEY);
+  if (inNetwork) return inNetwork;
   const chain = manager.getNamespace('ergo');
-  for (const key of Object.keys(chain?.configuration ?? {})) {
-    if (isSubmitModeLookalike(key)) {
-      return found(key, `in the ergo chain config${chain ? ` (${shownConfigPath(chain.configurationPath)})` : ''}`);
-    }
+  if (!chain) return undefined;
+  const chainFile = shownConfigPath(chain.configurationPath);
+  const inChainMemory = problemIn(chain.configuration, `the ergo chain config (${chainFile})`);
+  if (inChainMemory) return inChainMemory;
+  let chainBody: unknown;
+  try {
+    chainBody = yaml.load(fs.readFileSync(chain.configurationPath, 'utf8'));
+  } catch (error) {
+    // the error's code or class only: a parser's message quotes lines of the file
+    return `the ergo chain config file ${chainFile} cannot be read (${errorKind(error)})`;
   }
-  return undefined;
+  if (!isMapping(chainBody)) return `the ergo chain config file ${chainFile} cannot be read (not a mapping)`;
+  return problemIn(chainBody, `the ergo chain config file ${chainFile}`);
+}
+
+/** The text the config manager's loader puts in place of an unquoted 0x address before it parses a file. */
+const fixUnquotedHexAddresses = (text: string): string =>
+  text.replace(/(defaultWallet|walletAddress):\s*(0x[a-fA-F0-9]{40})(?!\s*['"])/g, "$1: '$2'");
+
+const schemaValidators = new Map<string, ValidateFunction>();
+
+/**
+ * The config the config manager loads from `text` for this namespace, the way its loader
+ * does: parsed, checked against the namespace's JSON schema and, when it does not pass,
+ * merged into the namespace's template and checked again. Throws where the loader would.
+ */
+function configLoadedFrom(namespace: ConfigurationNamespace, text: string): unknown {
+  let validate = schemaValidators.get(namespace.schemaPath);
+  if (!validate) {
+    validate = new Ajv().compile(JSON.parse(fs.readFileSync(namespace.schemaPath, 'utf8')));
+    schemaValidators.set(namespace.schemaPath, validate);
+  }
+  const candidate = yaml.load(fixUnquotedHexAddresses(text));
+  if (validate(candidate)) return candidate;
+  const merged = yaml.load(fixUnquotedHexAddresses(fs.readFileSync(namespace.templatePath, 'utf8')));
+  deepCopy(candidate, merged);
+  if (!validate(merged)) throw new Error('the config does not load');
+  return merged;
+}
+
+/**
+ * Per namespace, a config file's text and the config object in memory last seen to agree.
+ * The config manager replaces its config object whenever it writes the file, so while the
+ * object is the same one, the file must still be that text.
+ */
+const agreedConfigFiles = new WeakMap<ConfigurationNamespace, { configuration: object; text: string }>();
+
+/**
+ * Whether a config file's text is still what the config manager last read from it or wrote
+ * to it:
+ * - the text the manager writes from the config in memory, byte for byte (after any write
+ *   by the manager the file is exactly that);
+ * - otherwise, once a text was seen to agree with this same config object, that text, byte
+ *   for byte;
+ * - otherwise (nothing written since Gateway started and nothing seen yet), a text that
+ *   loads, the way the manager loads it, to exactly the config in memory: every key, value
+ *   and level the same, nothing added or removed.
+ */
+function configFileUnchanged(namespace: ConfigurationNamespace, text: string): boolean {
+  const memory = namespace.configuration;
+  try {
+    if (text === yaml.dump(memory)) return true;
+  } catch {
+    // a config that cannot be written as YAML is compared below
+  }
+  const agreed = agreedConfigFiles.get(namespace);
+  if (agreed) return agreed.configuration === memory && agreed.text === text;
+  try {
+    return isDeepStrictEqual(configLoadedFrom(namespace, text), memory);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuse, with a 409, an update through the config API to the namespace `ergo` or an
+ * `ergo-<network>` namespace whose config file on disk is no longer what the config manager
+ * last read from it or wrote to it (see configFileUnchanged). The manager writes the whole
+ * namespace from memory, so the update would erase a hand edit made while Gateway runs
+ * (`submitMode: check`, say). Nothing is written; the file stays as the person edited it.
+ * Called just before the update is applied.
+ */
+export function assertErgoConfigFileUnchanged(namespaceId: string): void {
+  const namespace = ConfigManagerV2.getInstance().getNamespace(namespaceId);
+  // no such namespace: the update itself answers that
+  if (!namespace) return;
+  let text: string | undefined;
+  try {
+    text = fs.readFileSync(namespace.configurationPath, 'utf8');
+  } catch {
+    text = undefined;
+  }
+  if (text !== undefined && configFileUnchanged(namespace, text)) {
+    agreedConfigFiles.set(namespace, { configuration: namespace.configuration, text });
+    return;
+  }
+  throw httpErrors.createError(
+    409,
+    `The ${namespaceId} config file ${shownConfigPath(namespace.configurationPath)} was changed on disk while ` +
+      'Gateway was running, so this update was not applied. Restart Gateway, which reads the file, before ' +
+      'changing the config through the API.',
+  );
 }
 
 export interface ErgoChainConfig {
