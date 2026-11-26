@@ -36,6 +36,12 @@ describe('App Integration - Route Registration', () => {
   };
 
   describe('Connector coverage', () => {
+    it('says which connectors bind a swap price limit: ergodex only, the others leave the key out', async () => {
+      const all = (await connectors()) as Array<{ name: string; binds_price_limit?: boolean }>;
+      expect(all.find((c) => c.name === 'ergodex')?.binds_price_limit).toBe(true);
+      for (const c of all.filter((c) => c.name !== 'ergodex')) expect(c).not.toHaveProperty('binds_price_limit');
+    });
+
     it('backs every advertised trading type with a unified surface', async () => {
       const registries: Record<string, string[]> = {
         router: ROUTER_CONNECTORS,

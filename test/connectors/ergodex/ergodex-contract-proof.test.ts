@@ -8,12 +8,12 @@
  * Long overflow rule, and the pre-signing check refusing a built transaction that does
  * not match its plan.
  */
-import { buildUnsignedTransaction, ErgoOutputSpec } from '../../../src/chains/ergo/ergo.tx-builder';
+import { buildUnsignedTransaction, changeDelta, ErgoOutputSpec } from '../../../src/chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
 import { verifySwapTransaction } from '../../../src/connectors/ergodex/amm-routes/executeSwap';
 import { Ergodex, TokenRef } from '../../../src/connectors/ergodex/ergodex';
 import { swapAllowed } from '../../../src/connectors/ergodex/venues/spectrum/spectrum.math';
-import { FEE_TREE } from '../../chains/ergo/ergo-test-helpers';
+import { FEE_TREE, GENERATOR_PK } from '../../chains/ergo/ergo-test-helpers';
 
 import {
   ERG,
@@ -275,6 +275,29 @@ describe('the pre-signing check refuses a built transaction that is not its plan
   it('a successor that pays one unit more than planned', () => {
     const built = build(RSN_POOL, payMore(plan.successor, 2, 1n), wallet);
     expect(() => verifySwapTransaction(plan, built)).toThrow('successor token 2 amount differs from the plan');
+  });
+
+  it('a transaction that also pays part of the wallet elsewhere', () => {
+    const elsewhere: ErgoOutputSpec = { ergoTree: '0008cd' + GENERATOR_PK, value: ERG / 10n };
+    const built = buildUnsignedTransaction({
+      height: TIP,
+      minValuePerByte: 360n,
+      fee: 1100000n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      inputs: [{ box: RSN_POOL }],
+      walletBoxes: [wallet],
+      outputs: [plan.successor, elsewhere],
+    });
+    expect(() => verifySwapTransaction(plan, built)).toThrow("the wallet's native balance change differs");
+  });
+
+  it('the wallet moves by exactly the swap and the fee', () => {
+    const built = build(RSN_POOL, plan.successor, wallet);
+    const delta = changeDelta(built);
+    expect(delta.get(null)).toBe(-plan.swap.amountIn - built.fee);
+    expect(delta.get(RSN)).toBe(plan.swap.amountOut);
+    expect(delta.size).toBe(2);
   });
 
   it('a plan whose amounts differ from its own successor', () => {

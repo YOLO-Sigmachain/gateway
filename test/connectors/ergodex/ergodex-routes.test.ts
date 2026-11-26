@@ -16,9 +16,10 @@ import * as yaml from 'js-yaml';
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { normalizeNodeBox } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
-import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
+import { Ergodex, NATIVE_TOKEN_ID } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { AMM_CONNECTORS } from '../../../src/trading/connector-registry';
 import { learnPool } from '../../../src/trading/learn-pool';
 import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
@@ -109,13 +110,34 @@ describe('ergodex through /trading/amm', () => {
 
   const posts = () => state.posted.length;
 
-  it('execute-swap: submitted and PENDING, with the id the node took, and no fill data', async () => {
+  it('execute-swap: submitted and PENDING, with the id the node took and the amounts its transaction fixes', async () => {
     const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(posts()).toBe(1);
     const tx = JSON.parse(state.posted[0]);
-    expect(body).toEqual({ signature: tx.id, status: 0 });
+    // still PENDING: the amounts are what it moves if it confirms, not a report that it did
+    expect(body).toEqual({
+      signature: tx.id,
+      status: 0,
+      data: {
+        tokenIn: NATIVE_TOKEN_ID,
+        tokenOut: RSN,
+        amountIn: '1',
+        amountOut: '23.693',
+        fee: '0.0011',
+        baseTokenBalanceChange: '-1.0011',
+        quoteTokenBalanceChange: '23.693',
+        slippagePct: '1',
+        poolAddress: NFT,
+      },
+    });
+    // the same amounts, read from the posted transaction itself
+    const changeAssets: Array<{ tokenId: string; amount: number }> = tx.outputs
+      .slice(1, -1)
+      .flatMap((o: { assets: Array<{ tokenId: string; amount: number }> }) => o.assets);
+    const rsnReceived = changeAssets.filter((a) => a.tokenId === RSN).reduce((n, a) => n + BigInt(a.amount), 0n);
+    expect(rsnReceived).toBe(23693n);
     // input 0 the pool, output 0 its successor with the same tree, tokens and R4
     expect(tx.inputs[0].boxId).toBe(RSN_POOL.boxId);
     expect(tx.outputs[0].ergoTree).toBe(RSN_POOL.ergoTree);
@@ -155,7 +177,7 @@ describe('ergodex through /trading/amm', () => {
     expect(posts()).toBe(2);
     const second = JSON.parse(state.posted[1]);
     expect(second.inputs[0].boxId).toBe(successor.boxId);
-    expect(JSON.parse(res.body)).toEqual({ signature: second.id, status: 0 });
+    expect(JSON.parse(res.body)).toMatchObject({ signature: second.id, status: 0, data: { amountIn: '1' } });
   });
 
   it('pool spent first and moved past the bound: a retryable 409, nothing more posted', async () => {
@@ -294,13 +316,141 @@ describe('ergodex through /trading/amm', () => {
     });
   });
 
-  it('a rejection that names a missing wallet input is not read as the pool spent: one POST, the node text', async () => {
+  it('a rejection that names a missing wallet input is not read as the pool spent: one POST, a 400 with the node text', async () => {
     const detail = 'Malformed transaction: Every input of the transaction should be in UTXO. Input 1 not found';
     state.submit = () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail } });
     const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
     expect(posts()).toBe(1);
-    expect(res.statusCode).not.toBe(409);
+    expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).message).toContain(detail);
+    expect(dex.ergo.pending.isSpent(RSN_POOL.boxId)).toBe(false);
+  });
+
+  it('any other definite node rejection is a 400 with the node text; nothing is kept as pending', async () => {
+    const detail = 'Malformed transaction: Scripts of all transaction inputs should pass verification';
+    state.submit = () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail } });
+    const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(posts()).toBe(1);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).message).toContain(detail);
+    expect(dex.ergo.pending.spentBoxIds().size).toBe(0);
+  });
+
+  it('a pool whose NFT was minted with a supply above 1 is refused, for quote and execute, nothing posted', async () => {
+    state.emission.set(NFT, 2n);
+    const quote = await app.inject({
+      method: 'GET',
+      url:
+        '/trading/amm/quote-swap?' +
+        new URLSearchParams({
+          chainNetwork: 'ergo-mainnet',
+          connector: 'ergodex',
+          baseToken: 'ERG',
+          quoteToken: 'RSN',
+          amount: '1',
+          side: 'SELL',
+          poolAddress: NFT,
+        }),
+    });
+    expect(quote.statusCode).toBe(400);
+    expect(JSON.parse(quote.body).message).toContain('supply of 2, not 1');
+    const exec = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(exec.statusCode).toBe(400);
+    expect(posts()).toBe(0);
+  });
+
+  it("the NFT's supply is asked of the node once per pool, then cached", async () => {
+    const url =
+      '/trading/amm/quote-swap?' +
+      new URLSearchParams({
+        chainNetwork: 'ergo-mainnet',
+        connector: 'ergodex',
+        baseToken: 'ERG',
+        quoteToken: 'RSN',
+        amount: '1',
+        side: 'SELL',
+        poolAddress: NFT,
+      });
+    expect((await app.inject({ method: 'GET', url })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url })).statusCode).toBe(200);
+    expect(state.calls.filter((c) => c.path.startsWith('/blockchain/token/byId/')).length).toBe(1);
+  });
+
+  it('a limit JavaScript prints in exponent form is read exactly, not refused', async () => {
+    // 1e21 RSN is printed "1e+21"; as a BUY limit it binds nothing here and the swap goes through
+    state.wallet = [walletBox(5n * ERG, [{ tokenId: RSN, amount: 100000n }])];
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ side: 'BUY', amount: 1, maxAmountIn: 1e21 }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(posts()).toBe(1);
+  });
+
+  describe('no connector named', () => {
+    const quoteNoConnector = (chainNetwork: string) =>
+      app.inject({
+        method: 'GET',
+        url:
+          '/trading/amm/quote-swap?' +
+          new URLSearchParams({
+            chainNetwork,
+            baseToken: 'ERG',
+            quoteToken: 'RSN',
+            amount: '1',
+            side: 'SELL',
+            poolAddress: NFT,
+          }),
+      });
+    let configGet: jest.SpyInstance;
+    beforeEach(() => {
+      const manager = ConfigManagerV2.getInstance();
+      const realGet = manager.get.bind(manager);
+      configGet = jest
+        .spyOn(manager, 'get')
+        .mockImplementation((key: string) => (key === 'ergo-mainnet.swapProvider' ? 'ergodex/amm' : realGet(key)));
+    });
+    afterEach(() => configGet.mockRestore());
+
+    it("on an Ergo network: the network's swapProvider is used for a quote", async () => {
+      const res = await quoteNoConnector('ergo-mainnet');
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).routePath).toContain('spectrum:n2t');
+    });
+
+    it("on an Ergo network: the network's swapProvider is used for an execute", async () => {
+      const { connector: _omitted, ...body } = execBody();
+      const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: body });
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+    });
+
+    it('a connector named for another chain is still refused on an Ergo network', async () => {
+      const other = AMM_CONNECTORS.find((c) => c !== 'ergodex')!;
+      const res = await app.inject({
+        method: 'GET',
+        url:
+          '/trading/amm/quote-swap?' +
+          new URLSearchParams({
+            chainNetwork: 'ergo-mainnet',
+            connector: other,
+            baseToken: 'ERG',
+            quoteToken: 'RSN',
+            amount: '1',
+            side: 'SELL',
+            poolAddress: NFT,
+          }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toContain(`'${other}'`);
+    });
+
+    it('on Ethereum, unchanged: the schema default connector is used, as before', async () => {
+      const res = await quoteNoConnector('ethereum-mainnet');
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toContain(`'${AMM_CONNECTORS[0]}'`);
+    });
   });
 
   it('the pool box spent by our own pending swap: waits for its successor before rebuilding', async () => {
@@ -349,7 +499,7 @@ describe('ergodex through /trading/amm', () => {
     const exec = await app.inject({
       method: 'POST',
       url: '/trading/amm/execute-swap',
-      payload: execBody({ slippagePct: 1e-7 }),
+      payload: execBody({ slippagePct: 1e-9 }),
     });
     expect(exec.statusCode).toBe(400);
     expect(JSON.parse(exec.body).message).toContain('slippagePct');

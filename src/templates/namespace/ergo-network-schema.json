@@ -37,7 +37,20 @@
       "description": "Token list file, relative to conf/ and inside conf/tokens/"
     },
     "blockTimeSeconds": { "type": "number", "exclusiveMinimum": 0 },
-    "pendingTxTimeoutBlocks": { "type": "integer", "minimum": 1 },
+    "pendingTxTimeoutBlocks": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Blocks after which a pending transaction is checked against the node; it is forgotten only on evidence, never for its age while its inputs are unspent"
+    },
+    "pendingStateFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "File that keeps this network's pending transactions across restarts (signed transactions and box ids, never a key), relative to the Gateway folder. Unset: kept in memory only"
+    },
+    "transactionsExpire": {
+      "type": "boolean",
+      "description": "Whether a signed transaction can expire before it confirms. False on Ergo: a transaction stays valid until one of its inputs is spent, so a transaction the node does not know may still confirm. A statement for clients; Gateway does not read it"
+    },
     "confirmations": { "type": "integer", "minimum": 1 },
     "nodeTimeoutMs": { "type": "integer", "minimum": 1 },
     "boxPageSize": { "type": "integer", "minimum": 1, "maximum": 500 },

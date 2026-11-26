@@ -90,6 +90,8 @@ export namespace ErgodexConfig {
   export const chain = 'ergo';
   export const networks = getAvailableErgoNetworks();
   export const tradingTypes = ['amm'] as const;
+  /** Execute-swap refuses, with nothing sent, a swap outside the caller's minAmountOut or maxAmountIn. */
+  export const bindsPriceLimit = true;
 
   export const availableNetworks: Array<AvailableNetworks> = [{ chain, networks }];
 

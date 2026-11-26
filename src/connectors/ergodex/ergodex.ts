@@ -15,7 +15,7 @@ import { Ergo } from '../../chains/ergo/ergo';
 import { ErgoNodeError } from '../../chains/ergo/ergo.node-client';
 import { ErgoOutputSpec } from '../../chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../chains/ergo/ergo.types';
-import { formatUnits, isErgoId, parseUnits } from '../../chains/ergo/ergo.utils';
+import { formatUnits, isErgoId, NATIVE_COIN_ID, parseUnits } from '../../chains/ergo/ergo.utils';
 import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
@@ -23,12 +23,8 @@ import { ErgodexConfig, ErgodexNetworkConfig, ErgodexRootConfig } from './ergode
 import { SpectrumVenue } from './venues/spectrum/spectrum.venue';
 import { PoolSwap, SideName, Venue, VenuePool, VenueRuleError } from './venues/venue';
 
-/**
- * The id under which the native coin appears in responses (`tokenIn`, `baseTokenAddress`).
- * The native coin is not a token and has no id; 32 zero bytes is the convention Ergo DEX
- * APIs use for it, and no real token id can be all zeros (it is a box id, a hash).
- */
-export const NATIVE_TOKEN_ID = '0'.repeat(64);
+/** The id under which the native coin appears in responses (`tokenIn`, `baseTokenAddress`). */
+export const NATIVE_TOKEN_ID = NATIVE_COIN_ID;
 
 /** A token as the connector uses it. `tokenId` null is the native coin. */
 export interface TokenRef {
@@ -250,7 +246,27 @@ export class Ergodex {
     if (!pool) {
       throw httpErrors.badRequest(`Box ${box.boxId} holds pool NFT ${poolId} but is not a valid ${venue.name} pool`);
     }
+    await this.assertSingleNft(pool.poolId);
     return { pool, venue, source };
+  }
+
+  /**
+   * A pool is identified by its NFT, so exactly one unit of it may exist. With more, its
+   * minter could place a second box at the pool tree holding one unit, and that box would
+   * be read as the pool. The node's answer (the token's total emission) is cached by the
+   * chain layer: a token is minted once.
+   */
+  private async assertSingleNft(poolId: string): Promise<void> {
+    const emission = await this.ergo.getTokenEmission(poolId);
+    if (emission === null) {
+      throw httpErrors.serviceUnavailable(`The node does not report the supply of pool NFT ${poolId} yet; retry`);
+    }
+    if (emission !== 1n) {
+      throw httpErrors.badRequest(
+        `Refusing pool ${poolId}: its NFT was minted with a supply of ${emission}, not 1, so another box could ` +
+          'claim to be this pool',
+      );
+    }
   }
 
   /** The reason a pool may not be traded, or null when every guard passes. */

@@ -21,6 +21,13 @@ const ConnectorSchema = Type.Object({
   trading_types: Type.Array(Type.String()),
   chain: Type.String(),
   networks: Type.Array(Type.String()),
+  binds_price_limit: Type.Optional(
+    Type.Boolean({
+      description:
+        "True when the connector's AMM execute-swap refuses a swap outside the caller's minAmountOut (SELL) " +
+        'or maxAmountIn (BUY). Absent or false: the connector does not bind those limits.',
+    }),
+  ),
 });
 
 const ConnectorsResponseSchema = Type.Object({
@@ -103,6 +110,7 @@ export const connectorsConfig = [
     trading_types: [...ErgodexConfig.tradingTypes],
     chain: ErgodexConfig.chain,
     networks: [...ErgodexConfig.networks],
+    binds_price_limit: ErgodexConfig.bindsPriceLimit,
   },
 ];
 

@@ -33,6 +33,14 @@ export function assertErgoId(value: unknown, what: string): string {
   return value.toLowerCase();
 }
 
+/**
+ * The id under which the native coin is written where a token id is expected (token
+ * lists, pool lists, swap responses). The native coin is not a token and has no id; 32
+ * zero bytes is the convention Ergo DEX APIs use for it, and no real token id can be all
+ * zeros (a token id is a box id, a hash).
+ */
+export const NATIVE_COIN_ID = '0'.repeat(64);
+
 export function isHexBytes(value: unknown): value is string {
   return typeof value === 'string' && HEX.test(value);
 }
@@ -74,24 +82,38 @@ export function parseUnits(value: string | number, decimals: number): bigint {
   return BigInt(whole + fraction.padEnd(decimals, '0'));
 }
 
-function numberToPlainString(value: number): string {
+/**
+ * A number as the plain decimal it stands for. `toString` gives the shortest text that
+ * reads back as the same double, in exponent form below 1e-6 and from 1e21 up
+ * ("4e-7", "1.5e+21"); that form is expanded here by moving the decimal point in the
+ * digit string, so no float arithmetic touches the value.
+ */
+export function numberToPlainString(value: number): string {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`Invalid amount: ${value}`);
   }
-  // toString gives the shortest round-trip form; refuse exponent forms instead of guessing
   const text = value.toString();
-  if (/e/i.test(text)) {
-    throw new Error(`Amount ${value} must be given as a decimal string`);
-  }
+  const exponent = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/i.exec(text);
+  const plain = exponent ? expandExponent(exponent[1], exponent[2] ?? '', Number(exponent[3])) : text;
   // A decimal of at most 15 significant digits round-trips through a double exactly; more
-  // may already have been rounded by the time it is a number.
-  const significant = text.replace('.', '').replace(/^0+/, '');
+  // may already have been rounded by the time it is a number. Leading and trailing zeros
+  // are not significant.
+  const significant = plain.replace('.', '').replace(/^0+/, '').replace(/0+$/, '');
   if (significant.length > 15) {
     throw new Error(
       `Amount ${value} has more significant digits than a JSON number holds exactly; send it as a string`,
     );
   }
-  return text;
+  return plain;
+}
+
+/** `d.ddd` times 10^exp as a plain decimal string. */
+function expandExponent(whole: string, fraction: string, exp: number): string {
+  const digits = (whole + fraction).replace(/^0+(?=\d)/, '');
+  const point = whole.replace(/^0+(?=\d)/, '').length + exp;
+  if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`.replace(/\.?0+$/, '') || '0';
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return `${digits.slice(0, point)}.${digits.slice(point)}`.replace(/\.?0+$/, '');
 }
 
 /** For the shared response schemas, which carry amounts as JSON numbers. */

@@ -25,6 +25,11 @@ export interface ErgoNetworkConfig {
   nodeTimeoutMs: number;
   boxPageSize: number;
   swapProvider?: string;
+  /**
+   * File that keeps this network's pending transactions across restarts, relative to the
+   * Gateway folder (or absolute). Unset: they are kept in memory only.
+   */
+  pendingStateFile?: string;
 }
 
 export interface ErgoChainConfig {
@@ -86,6 +91,7 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
     nodeTimeoutMs: Number(optional<number>(namespaceId, 'nodeTimeoutMs') ?? DEFAULT_NODE_TIMEOUT_MS),
     boxPageSize: Number(optional<number>(namespaceId, 'boxPageSize') ?? DEFAULT_BOX_PAGE_SIZE),
     swapProvider: optional<string>(namespaceId, 'swapProvider'),
+    pendingStateFile: optional<string>(namespaceId, 'pendingStateFile'),
   };
 }
 

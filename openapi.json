@@ -4350,6 +4350,10 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "binds_price_limit": {
+                            "description": "True when the connector's AMM execute-swap refuses a swap outside the caller's minAmountOut (SELL) or maxAmountIn (BUY). Absent or false: the connector does not bind those limits.",
+                            "type": "boolean"
                           }
                         },
                         "required": [

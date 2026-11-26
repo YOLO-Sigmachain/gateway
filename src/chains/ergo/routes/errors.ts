@@ -1,12 +1,14 @@
 import { httpErrors } from '../../../services/error-handler';
-import { AmbiguousTokenError, ErgoInputSpentError } from '../ergo';
+import { AmbiguousTokenError, ErgoInputSpentError, ErgoTransactionRejectedError } from '../ergo';
 import { ErgoNodeError } from '../ergo.node-client';
 import { ErgoBuildError } from '../ergo.tx-builder';
 
 /**
  * Turn an Ergo error into an HTTP one. A caller's mistake (an address of another network,
  * an ambiguous symbol, a transaction that cannot be built) is a 400; an unreachable node is a 503; anything the node rejected
- * keeps the node's own text.
+ * keeps the node's own text. A transaction the node refused at submit (it answered 4xx)
+ * is a 400: it was not taken, so nothing from that submit can confirm. An unknown submit
+ * outcome is never one of these.
  */
 export function toHttpError(error: unknown, action: string): Error {
   if (error && typeof error === 'object' && 'statusCode' in error) {
@@ -19,6 +21,9 @@ export function toHttpError(error: unknown, action: string): Error {
   // a request the builder cannot satisfy (including insufficient funds) is the caller's to fix
   if (error instanceof AmbiguousTokenError || error instanceof ErgoBuildError) {
     return httpErrors.badRequest(error.message);
+  }
+  if (error instanceof ErgoTransactionRejectedError) {
+    return httpErrors.badRequest(`${action}: ${error.message}`);
   }
   if (error instanceof ErgoNodeError) {
     return error.status === 0

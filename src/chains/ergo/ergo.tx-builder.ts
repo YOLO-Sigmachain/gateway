@@ -537,6 +537,29 @@ function sameBox(eip12: Eip12BoxCandidate & { boxId: string }, box: ErgoBox): bo
  * outputs and inputs themselves, so a signer-ownership check of the change tree holds for
  * the boxes that are actually created.
  */
+/**
+ * What the selected wallet boxes lose or gain through the transaction: what comes back as
+ * change minus what those boxes held, for the native coin (key `null`, smallest unit) and
+ * for each token by id. When the change outputs are the transaction's only outputs to the
+ * wallet, as in a swap that pays the trader through change, this is the wallet's balance
+ * change, miner fee included. Zero entries are left out.
+ */
+export function changeDelta(built: BuiltErgoTransaction): Map<string | null, bigint> {
+  const delta = new Map<string | null, bigint>();
+  const add = (key: string | null, amount: bigint) => delta.set(key, (delta.get(key) ?? 0n) + amount);
+  for (const box of built.inputBoxes.slice(built.fixedInputCount)) {
+    add(null, -box.value);
+    for (const a of box.assets) add(a.tokenId.toLowerCase(), -a.amount);
+  }
+  for (const i of built.changeOutputIndexes) {
+    const out = built.unsigned.outputs[i];
+    add(null, toAmount(out.value, 'change value'));
+    for (const a of out.assets ?? []) add(a.tokenId.toLowerCase(), toAmount(a.amount, 'change token amount'));
+  }
+  for (const [key, amount] of [...delta]) if (amount === 0n) delta.delete(key);
+  return delta;
+}
+
 export function assertTransactionBalanced(built: BuiltErgoTransaction): void {
   const { unsigned, inputBoxes, dataInputBoxes, fee, feeErgoTree, minValuePerByte } = built;
   const fail = (message: string): never => {

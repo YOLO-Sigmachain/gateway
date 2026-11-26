@@ -3,11 +3,15 @@
  * mempool-aware boxes, balances and token identity, and a transfer end to end (built with
  * real fleet, signed with real wasm, submitted to the stand-in).
  */
-import { AmbiguousTokenError, Ergo } from '../../../src/chains/ergo/ergo';
+import * as path from 'path';
+
+import * as yaml from 'js-yaml';
+
+import { AmbiguousTokenError, Ergo, ErgoTransactionRejectedError } from '../../../src/chains/ergo/ergo';
 import { ErgoNodeError } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoSigner, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { buildUnsignedTransaction, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
-import { addressFromPublicKey, encodeErgoAddress } from '../../../src/chains/ergo/ergo.utils';
+import { addressFromPublicKey, encodeErgoAddress, NATIVE_COIN_ID } from '../../../src/chains/ergo/ergo.utils';
 import { balanceResponse } from '../../../src/chains/wallet-balances';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 
@@ -209,6 +213,7 @@ describe('submit and the pending-box view', () => {
       (e) => e,
     );
     expect(error).toBeInstanceOf(ErgoNodeError);
+    expect(error).toBeInstanceOf(ErgoTransactionRejectedError);
     expect(error.status).toBe(400);
     expect(error.detail).toBe(detail);
     expect(error.message).toContain(detail);
@@ -481,5 +486,193 @@ describe('balances and tokens', () => {
       balance: Number('9223372036.854775808'),
     });
     await expect(ergo.getBalances(ME)).rejects.toThrow('network prefix 0');
+  });
+});
+
+describe('a pending transaction is forgotten only on evidence, never for its age', () => {
+  const input = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
+  const TIMEOUT_MS = 15 * 120 * 1000; // pendingTxTimeoutBlocks x blockTimeSeconds in testConfig
+
+  function setup(box: () => FakeResponse, confirmed: () => FakeResponse = notFound) {
+    let now = 0;
+    const node = fakeNode((method, p) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(input)] };
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p === `/blockchain/transaction/byId/${TX}`) return confirmed();
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+      if (p === `/blockchain/box/byId/${input.boxId}`) return box();
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch, now: () => now });
+    ergo.pending.record(TX, [input.boxId], [], '{}');
+    const boxReads = () => node.calls.filter((c) => c.path === `/blockchain/box/byId/${input.boxId}`).length;
+    return { ergo, boxReads, advance: (ms: number) => (now += ms) };
+  }
+
+  it('kept past the timeout while its inputs are unspent: its inputs stay hidden', async () => {
+    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    advance(TIMEOUT_MS + 1);
+    expect(await ergo.getSpendableBoxes(ME)).toEqual([]);
+    expect(ergo.pending.get(TX)).toBeDefined();
+    expect(boxReads()).toBe(1); // the node was asked; the clock decided nothing
+  });
+
+  it('checked again at most once per block time', async () => {
+    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    await ergo.getSpendableBoxes(ME);
+    expect(boxReads()).toBe(1);
+    advance(120_000);
+    await ergo.getSpendableBoxes(ME);
+    expect(boxReads()).toBe(2);
+  });
+
+  it('not checked before the timeout', async () => {
+    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    advance(TIMEOUT_MS - 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(boxReads()).toBe(0);
+  });
+
+  it('released past the timeout once an input is spent by another transaction', async () => {
+    const { ergo, advance } = setup(() => ({ body: nodeBoxJson(input, { spentTransactionId: 'ee'.repeat(32) }) }));
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeUndefined();
+  });
+
+  it('released past the timeout once it is confirmed', async () => {
+    const { ergo, advance } = setup(
+      () => ({ body: nodeBoxJson(input, { spentTransactionId: TX }) }),
+      () => ({ body: { id: TX, inputs: [], outputs: [], inclusionHeight: TIP - 2, numConfirmations: 2 } }),
+    );
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeUndefined();
+  });
+
+  it('an input neither the index nor a tracked transaction knows: forgotten at the timeout, as before', async () => {
+    const { ergo, advance } = setup(notFound);
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeUndefined();
+  });
+
+  it('a node error during the check keeps the entry', async () => {
+    const { ergo, advance } = setup(() => ({ status: 500, body: { error: 500, reason: 'internal', detail: 'x' } }));
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeDefined();
+  });
+});
+
+describe('poll of a chained transaction whose input is our own unconfirmed change', () => {
+  const PARENT = 'c1'.repeat(32);
+  const funding = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
+  const change = makeBox({ ergoTree: ME_TREE, value: 3n * ERG, transactionId: PARENT, inclusionHeight: null });
+
+  function setup() {
+    const node = fakeNode((method, p) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+      if (p === `/blockchain/box/byId/${funding.boxId}`) return { body: nodeBoxJson(funding) };
+      if (p === `/blockchain/box/byId/${change.boxId}`) return notFound(); // unconfirmed: not indexed
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch });
+    ergo.pending.record(PARENT, [funding.boxId], [change], '{}');
+    ergo.pending.record(TX, [change.boxId], [], '{}');
+    return { ergo, calls: node.calls };
+  }
+
+  it('answers pending, naming the tracked parent, and posts nothing', async () => {
+    const { ergo, calls } = setup();
+    const r = await ergo.pollTransaction(TX);
+    expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+    expect(r.txData).toEqual({ note: expect.stringContaining(PARENT) });
+    expect(calls.some((c) => c.method === 'POST')).toBe(false);
+    expect(ergo.pending.get(TX)).toBeDefined();
+  });
+
+  it('once the parent is no longer tracked, the same transaction reads as not found', async () => {
+    const { ergo } = setup();
+    ergo.pending.release(PARENT);
+    expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.NOT_FOUND);
+  });
+});
+
+describe('the native coin in the shipped token lists', () => {
+  const realFs = jest.requireActual<typeof import('fs')>('fs');
+  const templates = path.join(__dirname, '../../../src/templates');
+
+  it.each(['mainnet', 'testnet'])(
+    '%s lists the native coin under the all-zero id, as its network config names it',
+    (net) => {
+      const list = JSON.parse(realFs.readFileSync(path.join(templates, 'tokens/ergo', `${net}.json`), 'utf8'));
+      const config = yaml.load(
+        realFs.readFileSync(path.join(templates, 'chains/ergo', `${net}.yml`), 'utf8'),
+      ) as Record<string, unknown>;
+      const native = list.filter((t: { address: string }) => t.address === NATIVE_COIN_ID);
+      expect(native).toEqual([
+        { name: 'Ergo', symbol: config.nativeCurrencySymbol, address: NATIVE_COIN_ID, decimals: config.nativeDecimals },
+      ]);
+    },
+  );
+
+  it('the chain reads the list without that entry: the native coin stays the network config native coin', async () => {
+    const text = realFs.readFileSync(path.join(templates, 'tokens/ergo/mainnet.json'), 'utf8');
+    const held = makeBox({ ergoTree: ME_TREE, value: 5n * ERG });
+    const { ergo } = chain((method, p) =>
+      method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')
+        ? { body: [nodeBoxJson(held)] }
+        : undefined,
+    );
+    // the shipped list stands in for conf/'s copy of it
+    const isList = (file: unknown) => String(file).endsWith(path.join('tokens', 'ergo', 'mainnet.json'));
+    const originalExists = realFs.existsSync.bind(realFs);
+    const originalRead = realFs.readFileSync.bind(realFs);
+    const exists = jest.spyOn(realFs, 'existsSync').mockImplementation((file) => isList(file) || originalExists(file));
+    const read = jest
+      .spyOn(realFs, 'readFileSync')
+      .mockImplementation(((file: string, ...rest: unknown[]) =>
+        isList(file) ? text : originalRead(file, ...(rest as []))) as never);
+    try {
+      const list = await ergo.getTokenList();
+      expect(list.some((t) => t.address === NATIVE_COIN_ID)).toBe(false);
+      expect(list.length).toBe(JSON.parse(text).length - 1);
+      const balances = await ergo.getBalances(ME);
+      expect(balances.filter((b) => b.symbol === 'ERG')).toEqual([
+        { key: 'ERG', symbol: 'ERG', address: null, balance: 5 },
+      ]);
+      // named by the all-zero id, the native balance is answered, not a zero for an unknown token
+      expect(await ergo.getBalances(ME, [NATIVE_COIN_ID])).toEqual([
+        { key: NATIVE_COIN_ID, symbol: 'ERG', address: null, balance: 5 },
+      ]);
+      expect((await ergo.getBalances(ME, ['erg']))[0].balance).toBe(5);
+    } finally {
+      exists.mockRestore();
+      read.mockRestore();
+    }
+  });
+});
+
+describe('token emission', () => {
+  it('is read from the node once and cached; an unknown token is not cached', async () => {
+    const nft = tokenId(0x7e);
+    let known = false;
+    const { ergo, calls } = chain((_m, p) => {
+      if (p === `/blockchain/token/byId/${nft}`)
+        return known ? { body: { id: nft, name: '', decimals: 0, emissionAmount: 1 } } : notFound();
+      return undefined;
+    });
+    expect(await ergo.getTokenEmission(nft)).toBeNull();
+    known = true;
+    expect(await ergo.getTokenEmission(nft)).toBe(1n);
+    expect(await ergo.getTokenEmission(nft)).toBe(1n);
+    expect(calls.filter((c) => c.path.startsWith('/blockchain/token/byId/')).length).toBe(2);
   });
 });

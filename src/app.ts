@@ -37,6 +37,7 @@ import {
 } from './services/gateway-security';
 import { logger } from './services/logger';
 import { OPERATION_IDS } from './services/operation-ids';
+import { isPortInUse, KILL_PORT_HOLDERS_ENV, killsPortHolders, portInUseMessage } from './services/port-holders';
 import { ajvOptions, enforceConnectorFields, schemaErrorFormatter } from './services/schema-keywords';
 import { displayChainConfigurations } from './services/startup-banner';
 import * as tokenSchemas from './tokens/schemas';
@@ -525,12 +526,18 @@ export const startGateway = async () => {
   logger.info(`🔧 Log level configured as: ${ConfigManagerV2.getInstance().get('server.logLevel') || 'info'}`);
 
   try {
-    // Kill any process using the gateway port
+    // Kill any process using the gateway port, only when asked to (see port-holders.ts)
     try {
-      logger.info(`Checking for processes using port ${port}...`);
+      logger.info(
+        killsPortHolders()
+          ? `Checking for processes using port ${port}...`
+          : `Not stopping other processes on port ${port} (${KILL_PORT_HOLDERS_ENV} is not true)`,
+      );
 
       // Use more reliable platform-specific commands
-      if (process.platform === 'win32') {
+      if (!killsPortHolders()) {
+        // leave them alone: a busy port fails the listen below with a message naming it
+      } else if (process.platform === 'win32') {
         try {
           // Windows command to find and kill process on port
           const { stdout } = await execPromise(`netstat -ano | findstr :${port}`);
@@ -613,7 +620,7 @@ export const startGateway = async () => {
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
   } catch (err) {
-    logger.error(`Failed to start the server: ${err}`);
+    logger.error(isPortInUse(err) ? portInUseMessage(port) : `Failed to start the server: ${err}`);
     process.exit(1);
   }
 };

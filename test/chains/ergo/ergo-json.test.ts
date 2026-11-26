@@ -159,6 +159,29 @@ describe('whole-unit conversion at the edge', () => {
     expect(parseUnits('12345678.123456789', 9)).toBe(12345678123456789n);
   });
 
+  it('parseUnits expands a number JavaScript prints in exponent form, exactly', () => {
+    // each literal is printed by toString in exponent form: below 1e-6 and from 1e21 up
+    expect((4e-7).toString()).toBe('4e-7');
+    expect(parseUnits(4e-7, 9)).toBe(400n);
+    expect(parseUnits(1.5e-7, 8)).toBe(15n);
+    expect(parseUnits(1.23456789012345e-7, 22)).toBe(1234567890123450n);
+    expect(parseUnits(1e-9, 9)).toBe(1n);
+    expect((1e21).toString()).toBe('1e+21');
+    expect(parseUnits(1e21, 0)).toBe(10n ** 21n);
+    expect(parseUnits(1.2345e25, 2)).toBe(12345n * 10n ** 23n);
+    // whole numbers whose only extra digits are trailing zeros are exact too
+    expect(parseUnits(1e15, 0)).toBe(10n ** 15n);
+    expect(parseUnits(1234567890123450, 0)).toBe(1234567890123450n);
+  });
+
+  it('parseUnits still refuses what a double cannot hold exactly, in either form', () => {
+    expect(() => parseUnits(1e-10, 9)).toThrow('decimal places');
+    expect(() => parseUnits(Number('1.234567890123456e-7'), 30)).toThrow('send it as a string');
+    expect(() => parseUnits(Number('1.234567890123456e+22'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(-4e-7, 9)).toThrow('Invalid amount');
+    expect(() => parseUnits(Number.POSITIVE_INFINITY, 9)).toThrow('Invalid amount');
+  });
+
   it('toDecimalNumber builds the integer part from digits', () => {
     expect(toDecimalNumber(123456789012345678n, 9)).toBe(Number('123456789.012345678'));
     expect(toDecimalNumber(0n, 9)).toBe(0);

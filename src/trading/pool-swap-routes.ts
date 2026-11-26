@@ -8,7 +8,7 @@
  * nothing else.
  */
 import { Type, Static } from '@sinclair/typebox';
-import { FastifyPluginAsync } from 'fastify';
+import { FastifyPluginAsync, FastifyRequest } from 'fastify';
 
 import { ChainExecuteSwapResponseSchema, ChainQuoteSwapResponseSchema } from '../schemas/chain-schema';
 import { DecimalNumber } from '../schemas/decimal-field';
@@ -129,6 +129,19 @@ export const EXECUTE_SWAP_REQUEST_SCHEMAS = {
   clmm: executeSwapRequestSchema('clmm'),
 } as const;
 
+/**
+ * Requests that named a connector themselves, noted before the schema fills in its
+ * default. On chain ergo a request that names none uses the network's swapProvider; on the
+ * other chains the schema default still applies, as before.
+ */
+const namedConnector = new WeakSet<object>();
+const noteNamedConnector = async (request: FastifyRequest) => {
+  const input = (request.method === 'GET' ? request.query : request.body) as Record<string, unknown> | undefined;
+  if (input && typeof input === 'object' && input.connector !== undefined) namedConnector.add(request);
+};
+const requestedConnector = (request: FastifyRequest, chain: string, connector?: string) =>
+  chain === 'ergo' && !namedConnector.has(request) ? undefined : connector;
+
 export const makeQuoteSwapRoute = (type: PoolType): FastifyPluginAsync => {
   const schema = QUOTE_SWAP_REQUEST_SCHEMAS[type];
 
@@ -142,6 +155,7 @@ export const makeQuoteSwapRoute = (type: PoolType): FastifyPluginAsync => {
           querystring: schema,
           response: { 200: ChainQuoteSwapResponseSchema },
         },
+        preValidation: noteNamedConnector,
       },
       async (request, reply) => {
         const { chainNetwork, connector, baseToken, quoteToken, amount, side, poolAddress, slippagePct } =
@@ -149,7 +163,7 @@ export const makeQuoteSwapRoute = (type: PoolType): FastifyPluginAsync => {
 
         try {
           const { chain, network } = parseChainNetwork(chainNetwork);
-          const name = resolveSwapConnector(chain, network, type, connector);
+          const name = resolveSwapConnector(chain, network, type, requestedConnector(request, chain, connector));
           assertConnectorOnChain(name, chain, type);
           const ops = getPoolOps(name, chain, type);
           const pool =
@@ -192,6 +206,7 @@ export const makeExecuteSwapRoute = (type: PoolType): FastifyPluginAsync => {
           body: schema,
           response: { 200: ChainExecuteSwapResponseSchema },
         },
+        preValidation: noteNamedConnector,
       },
       async (request, reply) => {
         const {
@@ -211,7 +226,7 @@ export const makeExecuteSwapRoute = (type: PoolType): FastifyPluginAsync => {
         try {
           const { chain, network } = parseChainNetwork(chainNetwork);
           const walletAddress = resolveWalletAddress(chain, requestedWallet);
-          const name = resolveSwapConnector(chain, network, type, connector);
+          const name = resolveSwapConnector(chain, network, type, requestedConnector(request, chain, connector));
           assertConnectorOnChain(name, chain, type);
           const ops = getPoolOps(name, chain, type);
           const pool =

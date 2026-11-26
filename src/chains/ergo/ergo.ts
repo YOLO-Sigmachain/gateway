@@ -18,7 +18,8 @@ import { WalletTokenBalance } from '../wallet-balances';
 import { configuredAddressPrefixes, ErgoNetworkConfig, getErgoNetworkConfig, networks } from './ergo.config';
 import { bigintsToStrings, parseNodeJson, toAmount } from './ergo.json';
 import { ErgoNodeClient, ErgoNodeError, FetchLike, normalizeNodeBox, NodeTransaction } from './ergo.node-client';
-import { ErgoPendingTracker } from './ergo.pending';
+import { ErgoPendingTracker, PendingTransaction } from './ergo.pending';
+import { ErgoPendingFile } from './ergo.pending-file';
 import { ErgoSigner, SignedErgoTransaction } from './ergo.signer';
 import { buildTransfer } from './ergo.transfer';
 import {
@@ -30,7 +31,14 @@ import {
   ErgoTransactionAssertionError,
 } from './ergo.tx-builder';
 import { ErgoBox, ErgoTokenAmount, ErgoTokenInfo } from './ergo.types';
-import { assertErgoId, decodeErgoAddress, decodeErgoAddressForPrefix, isErgoId, toDecimalNumber } from './ergo.utils';
+import {
+  assertErgoId,
+  decodeErgoAddress,
+  decodeErgoAddressForPrefix,
+  isErgoId,
+  NATIVE_COIN_ID,
+  toDecimalNumber,
+} from './ergo.utils';
 import { ErgoWalletAccount, loadErgoWallet } from './ergo.wallet';
 
 /** A build request as connectors send it; height, fee and the node's parameters are filled in here. */
@@ -101,6 +109,18 @@ export class ErgoInputSpentError extends Error {
   }
 }
 
+/**
+ * The node answered the submit with a 4xx: it refused the transaction, which therefore was
+ * not taken from this submit. Not a fixed input spent first (that is ErgoInputSpentError).
+ * Carries the node's own reason and detail.
+ */
+export class ErgoTransactionRejectedError extends ErgoNodeError {
+  constructor(cause: ErgoNodeError) {
+    super(cause.status, cause.message, cause.reason, cause.detail);
+    this.name = 'ErgoTransactionRejectedError';
+  }
+}
+
 /** Node rejection text that means an input is not (or no longer) in the UTXO set. */
 const INPUT_GONE_TEXT = /double.?spend|utxo|missing input|input.{0,40}(not found|spent)|already spent/i;
 
@@ -118,6 +138,8 @@ export class Ergo {
   readonly node: ErgoNodeClient;
   readonly pending: ErgoPendingTracker;
   private readonly tokenInfoCache = new Map<string, ErgoTokenInfo>();
+  /** A token's total emission never changes once it is minted. */
+  private readonly tokenEmissionCache = new Map<string, bigint>();
   /** One build-sign-submit at a time per wallet tree, so two sends never select the same boxes. */
   private readonly sendLocks = new Map<string, Promise<unknown>>();
 
@@ -130,7 +152,11 @@ export class Ergo {
       fetch: options.fetch,
     });
     const timeoutMs = this.config.pendingTxTimeoutBlocks * this.config.blockTimeSeconds * 1000;
-    this.pending = new ErgoPendingTracker(timeoutMs, options.now, this.config.blockTimeSeconds * 1000);
+    const stateFile = this.config.pendingStateFile;
+    this.pending = new ErgoPendingTracker(timeoutMs, options.now, {
+      recentMs: this.config.blockTimeSeconds * 1000,
+      file: stateFile ? new ErgoPendingFile(path.resolve(rootPath(), stateFile), network) : undefined,
+    });
   }
 
   public static async getInstance(network: string): Promise<Ergo> {
@@ -138,7 +164,11 @@ export class Ergo {
       throw new Error(`Unknown Ergo network: ${network}. Available: ${networks.join(', ')}`);
     }
     if (!Ergo._instances[network]) {
-      Ergo._instances[network] = new Ergo(network);
+      const ergo = new Ergo(network);
+      if (!ergo.config.pendingStateFile) {
+        logger.warn(`ergo-${network}.pendingStateFile is not set: pending transactions are kept in memory only`);
+      }
+      Ergo._instances[network] = ergo;
     }
     return Ergo._instances[network];
   }
@@ -206,8 +236,11 @@ export class Ergo {
     if (!Array.isArray(raw)) {
       throw new Error(`Token list ${this.config.tokenListSource} is not an array`);
     }
+    // The list may name the native coin under NATIVE_COIN_ID, for clients that read decimals
+    // from it. It is not a token: here the native coin comes from the network config only.
     return raw
       .filter((t) => isErgoId(t?.address) && Number.isInteger(t?.decimals) && typeof t?.symbol === 'string')
+      .filter((t) => String(t.address).toLowerCase() !== NATIVE_COIN_ID)
       .map((t) => ({
         address: String(t.address).toLowerCase(),
         symbol: String(t.symbol),
@@ -236,6 +269,20 @@ export class Ergo {
   }
 
   /**
+   * A token's total emission (the amount minted), from the node's index; null if the node
+   * does not know the token. A token is minted once, so a known answer is cached for good.
+   */
+  async getTokenEmission(tokenId: string): Promise<bigint | null> {
+    const id = assertErgoId(tokenId, 'token id');
+    const cached = this.tokenEmissionCache.get(id);
+    if (cached !== undefined) return cached;
+    const emission = (await this.node.getToken(id))?.emissionAmount;
+    if (emission === undefined) return null;
+    this.tokenEmissionCache.set(id, emission);
+    return emission;
+  }
+
+  /**
    * A token by id or by symbol. A symbol shared by two listed tokens throws
    * AmbiguousTokenError rather than picking one.
    */
@@ -260,6 +307,7 @@ export class Ergo {
    */
   async getSpendableBoxes(address: string): Promise<ErgoBox[]> {
     const tree = this.addressToErgoTree(address);
+    await this.checkOverduePending();
     const fromNode = await this.node.getUnspentBoxesByAddress(address, {
       includeUnconfirmed: true,
       excludeMempoolSpent: true,
@@ -298,7 +346,7 @@ export class Ergo {
     }
 
     for (const name of requested) {
-      if (name.toLowerCase() === native.toLowerCase()) {
+      if (name.toLowerCase() === native.toLowerCase() || name.toLowerCase() === NATIVE_COIN_ID) {
         result.push({ key: name, symbol: native, address: null, balance: nativeBalance });
         continue;
       }
@@ -338,6 +386,7 @@ export class Ergo {
   /** Build with a fresh node height, the node's minimum box value and spendable boxes. */
   async buildTransaction(request: ErgoTransactionRequest): Promise<BuiltErgoTransaction> {
     const changeErgoTree = this.addressToErgoTree(request.changeAddress);
+    await this.checkOverduePending();
     // A fixed input our own pending transaction already spends could only double-spend.
     for (const spec of request.inputs ?? []) {
       if (this.pending.isSpent(spec.box.boxId)) {
@@ -450,16 +499,17 @@ export class Ergo {
             error.detail ?? error.reason ?? error.message,
           );
         }
-        throw error;
+        throw new ErgoTransactionRejectedError(error);
       }
       throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
     }
     if (txId !== signed.id) {
       // The node's id is the one that will confirm. The outputs' box ids derive from our id,
       // so they are not offered as spendable; the inputs stay hidden under the node's id.
+      // Submitted already, so a file write failure here is logged, never thrown.
       logger.error(`Ergo node returned id ${txId} for transaction ${signed.id}; tracking the node's id`);
+      this.pending.record(txId, inputBoxIds, [], signed.json, fixedInputs, { mustPersist: false });
       this.pending.release(signed.id);
-      this.pending.record(txId, inputBoxIds, [], signed.json, fixedInputs);
     }
     logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
     return txId;
@@ -604,14 +654,7 @@ export class Ergo {
     const confirmed = await this.node.getTransaction(id);
     if (confirmed) {
       const inclusionHeight = typeof confirmed.inclusionHeight === 'number' ? confirmed.inclusionHeight : null;
-      // The node's numConfirmations counts the blocks after the inclusion block (0 at the
-      // tip); the config counts the inclusion block too.
-      const confirmations =
-        typeof confirmed.numConfirmations === 'number'
-          ? confirmed.numConfirmations + 1
-          : inclusionHeight !== null
-            ? fullHeight - inclusionHeight + 1
-            : 0;
+      const confirmations = confirmationsOf(confirmed, fullHeight);
       const done = confirmations >= this.config.confirmations;
       if (done) this.pending.release(id);
       return {
@@ -633,26 +676,19 @@ export class Ergo {
     // Neither indexed nor in the mempool. Failed only on evidence: one of its inputs spent
     // by a different transaction, which we can check for transactions we submitted.
     const tracked = this.pending.get(id);
-    let inputsUnspent = false;
-    const unindexed = new Set<string>();
-    if (tracked) {
-      inputsUnspent = true;
-      for (const boxId of tracked.inputBoxIds) {
-        const box = await this.node.getBox(boxId);
-        if (!box) unindexed.add(boxId);
-        if (box?.spentTransactionId && box.spentTransactionId !== id) {
-          this.pending.release(id);
-          return {
-            ...base,
-            txBlock: null,
-            txStatus: TransactionStatusCode.FAILED,
-            error: `Input ${boxId} was spent by transaction ${box.spentTransactionId}; this transaction can no longer confirm`,
-            txData: null,
-          };
-        }
-        if (!box || box.spentTransactionId) inputsUnspent = false;
-      }
+    const inputs = tracked ? await this.readTrackedInputs(tracked) : undefined;
+    if (inputs?.spentElsewhere) {
+      const { boxId, by } = inputs.spentElsewhere;
+      this.pending.release(id);
+      return {
+        ...base,
+        txBlock: null,
+        txStatus: TransactionStatusCode.FAILED,
+        error: `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`,
+        txData: null,
+      };
     }
+    const unindexed = inputs?.unindexed ?? new Set<string>();
 
     if (indexBehind) {
       return {
@@ -689,7 +725,7 @@ export class Ergo {
     // Ours, every input still unspent on an index that has caught up, and the node holds
     // it nowhere: it was dropped. Post it once more rather than forget it, since releasing
     // would let a rebuild execute twice if the dropped one resurfaces.
-    if (tracked && inputsUnspent) {
+    if (tracked && inputs!.allUnspent) {
       try {
         await this.node.submitTransaction(tracked.json);
       } catch (error) {
@@ -712,7 +748,114 @@ export class Ergo {
         txData: { note: 'rebroadcast: the node had dropped it' },
       };
     }
+
+    // Ours, and every input the index does not know is an output of another transaction we
+    // still track (a chained spend of our own unconfirmed change): it waits for that one.
+    // Not posted again here: a node that lacks the parent would reject it, and that
+    // rejection would prove nothing about this transaction. The parent's own poll posts the
+    // parent again; once the parent confirms, this one's inputs are indexed.
+    if (tracked && inputs!.waitingOn.length > 0 && inputs!.unknown.length === 0) {
+      const parents = [...new Set(inputs!.waitingOn)];
+      return {
+        ...base,
+        txBlock: null,
+        txStatus: TransactionStatusCode.PENDING,
+        txData: { note: `waits for transaction ${parents.join(', ')}, which creates its inputs and is still pending` },
+      };
+    }
     return { ...base, txBlock: null, txStatus: TransactionStatusCode.NOT_FOUND, txData: null };
+  }
+
+  /**
+   * The index's view of a tracked transaction's inputs: the first one spent by a different
+   * transaction (evidence it failed), or else which are not indexed, split into those a
+   * transaction we track creates (`waitingOn` holds that transaction's id) and the rest.
+   */
+  private async readTrackedInputs(tracked: PendingTransaction): Promise<{
+    spentElsewhere?: { boxId: string; by: string };
+    unindexed: Set<string>;
+    waitingOn: string[];
+    unknown: string[];
+    allUnspent: boolean;
+  }> {
+    const unindexed = new Set<string>();
+    const waitingOn: string[] = [];
+    const unknown: string[] = [];
+    for (const boxId of tracked.inputBoxIds) {
+      const box = await this.node.getBox(boxId);
+      if (box?.spentTransactionId && box.spentTransactionId !== tracked.txId) {
+        return {
+          spentElsewhere: { boxId, by: box.spentTransactionId },
+          unindexed,
+          waitingOn,
+          unknown,
+          allUnspent: false,
+        };
+      }
+      if (box?.spentTransactionId) {
+        unknown.push(boxId); // spent by this very transaction, which the index does not list: no conclusion
+        continue;
+      }
+      if (box) continue;
+      unindexed.add(boxId);
+      const parent = this.pending.producerOf(boxId);
+      if (parent !== undefined && parent !== tracked.txId) waitingOn.push(parent);
+      else unknown.push(boxId);
+    }
+    return { unindexed, waitingOn, unknown, allUnspent: waitingOn.length === 0 && unknown.length === 0 };
+  }
+
+  /**
+   * Check overdue pending transactions against the node, so that an entry leaves on
+   * evidence even when nobody polls it: confirmed, or an input spent by another
+   * transaction. An entry whose inputs are all unspent (or are outputs of another tracked
+   * transaction) is kept however old it is: it can still confirm. An entry with an input
+   * that neither the index nor the tracker knows (an unconfirmed box from someone else's
+   * transaction that has not confirmed by now) is forgotten, so its other inputs are not
+   * hidden for ever. Best effort: a node error leaves the entry as it is.
+   */
+  private async checkOverduePending(): Promise<void> {
+    for (const tx of this.pending.takeDueForCheck()) {
+      try {
+        await this.recheckPending(tx);
+      } catch (error) {
+        logger.warn(
+          `Ergo ${this.network}: could not check pending transaction ${tx.txId}, kept: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+
+  private async recheckPending(tx: PendingTransaction): Promise<void> {
+    const id = tx.txId;
+    if (await this.node.getUnconfirmedTransaction(id)) return;
+    const { fullHeight } = await this.node.getInfo();
+    const confirmed = await this.node.getTransaction(id);
+    if (confirmed) {
+      if (confirmationsOf(confirmed, fullHeight) >= this.config.confirmations) this.pending.release(id);
+      return;
+    }
+    const indexed = await this.node.getIndexedHeight();
+    const chainHeight = Math.max(fullHeight, typeof indexed.fullHeight === 'number' ? indexed.fullHeight : fullHeight);
+    if (indexed.indexedHeight < chainHeight) return;
+    const inputs = await this.readTrackedInputs(tx);
+    if (inputs.spentElsewhere) {
+      logger.info(
+        `Ergo ${this.network}: pending transaction ${id} failed: input ${inputs.spentElsewhere.boxId} was spent ` +
+          `by transaction ${inputs.spentElsewhere.by}`,
+      );
+      this.pending.release(id);
+      return;
+    }
+    if (inputs.unknown.length > 0) {
+      logger.warn(
+        `Ergo ${this.network}: forgetting pending transaction ${id} after ${this.config.pendingTxTimeoutBlocks} ` +
+          `blocks: input ${inputs.unknown.join(', ')} is known neither to the node's index nor as an output of a ` +
+          'transaction this Gateway tracks',
+      );
+      this.pending.release(id);
+    }
   }
 
   private feeOf(tx: NodeTransaction): number | null {
@@ -727,6 +870,17 @@ export class Ergo {
       return null;
     }
   }
+}
+
+/**
+ * Blocks holding the transaction, counting its own block: the node's numConfirmations
+ * counts the blocks after the inclusion block (0 at the tip); the config counts the
+ * inclusion block too.
+ */
+function confirmationsOf(tx: NodeTransaction, fullHeight: number): number {
+  const inclusionHeight = typeof tx.inclusionHeight === 'number' ? tx.inclusionHeight : null;
+  if (typeof tx.numConfirmations === 'number') return tx.numConfirmations + 1;
+  return inclusionHeight !== null ? fullHeight - inclusionHeight + 1 : 0;
 }
 
 function summarize(tx: NodeTransaction, confirmations: number): Record<string, unknown> {

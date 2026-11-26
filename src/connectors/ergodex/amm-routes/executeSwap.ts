@@ -19,11 +19,12 @@
  *   since a second transaction could trade twice. A TRANSACTION_TIMEOUT error carries
  *   the transaction id and says to poll it.
  *
- * The response is the submitted transaction as PENDING; a fill is reported only by poll,
- * after confirmation. No order box is ever placed, before or after.
+ * The response is the submitted transaction as PENDING, with `data` holding the amounts
+ * its transaction fixes (what it moves if it confirms). Whether it confirmed is reported
+ * only by poll. No order box is ever placed, before or after.
  */
 import { ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
-import { BuiltErgoTransaction, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
+import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
 import { ChainExecuteSwapResponseType, TransactionStatusCode } from '../../../schemas/chain-schema';
 import { httpErrors } from '../../../services/error-handler';
@@ -76,6 +77,41 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
   const outSide = swap.input === 'x' ? 'y' : 'x';
   if (reserveOf(swap.input) - pool[swap.input].reserve !== swap.amountIn) fail('the pool does not receive the input');
   if (pool[outSide].reserve - reserveOf(outSide) !== swap.amountOut) fail('the pool does not pay the output');
+  // the wallet moves by exactly the swap and the miner fee, and by nothing else
+  const expected = new Map<string | null, bigint>();
+  const add = (key: string | null, amount: bigint) => expected.set(key, (expected.get(key) ?? 0n) + amount);
+  add(plan.tokenIn.tokenId, -swap.amountIn);
+  add(plan.tokenOut.tokenId, swap.amountOut);
+  add(null, -built.fee);
+  const actual = changeDelta(built);
+  for (const key of new Set([...expected.keys(), ...actual.keys()])) {
+    if ((expected.get(key) ?? 0n) !== (actual.get(key) ?? 0n))
+      fail(`the wallet's ${key ?? 'native'} balance change differs`);
+  }
+}
+
+/**
+ * The amounts a submitted swap moves, all fixed in its transaction: if it confirms, it
+ * moves exactly these. In the shape of a confirmed swap's `data`; the answer stays PENDING.
+ */
+export function fixedSwapData(
+  plan: SwapPlan,
+  built: BuiltErgoTransaction,
+  nativeDecimals: number,
+  slippagePct: number,
+): NonNullable<ChainExecuteSwapResponseType['data']> {
+  const delta = changeDelta(built);
+  const change = (token: SwapPlan['base']) => units(delta.get(token.tokenId) ?? 0n, token.decimals);
+  return {
+    tokenIn: Ergodex.responseId(plan.tokenIn),
+    tokenOut: Ergodex.responseId(plan.tokenOut),
+    amountIn: units(plan.swap.amountIn, plan.tokenIn.decimals),
+    amountOut: units(plan.swap.amountOut, plan.tokenOut.decimals),
+    fee: units(built.fee, nativeDecimals),
+    baseTokenBalanceChange: change(plan.base),
+    quoteTokenBalanceChange: change(plan.quote),
+    slippagePct,
+  };
 }
 
 interface SwapBound {
@@ -109,7 +145,8 @@ export async function executeSwap(
     }
     const dex = await Ergodex.getInstance(network);
     const ergo = dex.ergo;
-    const slip = pctToScaled(slippagePct ?? dex.root.slippagePct);
+    const appliedSlippagePct = slippagePct ?? dex.root.slippagePct;
+    const slip = pctToScaled(appliedSlippagePct);
     const wallet = await ergo.getWallet(walletAddress);
     const base = await dex.resolveToken(baseToken);
     const raw = toRaw(amount, base);
@@ -148,13 +185,20 @@ export async function executeSwap(
       }
       try {
         const current = plan;
+        // worked out before signing, so nothing after the submit can fail
+        let data: ReturnType<typeof fixedSwapData> | undefined;
         const { txId } = await ergo.sendTransaction(
           { changeAddress: wallet.address, inputs: [{ box: current.pool.box }], outputs: [current.successor] },
           wallet.signer,
-          { verify: (built) => verifySwapTransaction(current, built) },
+          {
+            verify: (built) => {
+              verifySwapTransaction(current, built);
+              data = fixedSwapData(current, built, ergo.config.nativeDecimals, appliedSlippagePct);
+            },
+          },
         );
         logger.info(`ergodex: submitted ${side} on ${describeRoute(current)} as ${txId}`);
-        return { signature: txId, status: TransactionStatusCode.PENDING };
+        return { signature: txId, status: TransactionStatusCode.PENDING, data };
       } catch (error) {
         if (error instanceof ErgoSubmitOutcomeUnknownError) {
           // Never rebuild here: the first transaction may still execute.

@@ -254,13 +254,18 @@ describe('pending boxes and chained spends', () => {
     expect(tracker.available([], ME).map((b) => b.boxId)).toEqual([change.boxId]);
   });
 
-  it('a released or timed-out transaction frees its boxes', () => {
+  it('a released transaction frees its boxes; a timed-out one is only due for a check, its boxes still hidden', () => {
     let now = 0;
     const tracker = new ErgoPendingTracker(1000, () => now);
     const box = makeBox({ ergoTree: ME, value: ERG });
     tracker.record('cc'.repeat(32), [box.boxId], [], '{}');
     expect(tracker.available([box], ME)).toEqual([]);
+    expect(tracker.takeDueForCheck()).toEqual([]);
     now = 2000;
+    expect(tracker.available([box], ME)).toEqual([]);
+    expect(tracker.takeDueForCheck().map((t) => t.txId)).toEqual(['cc'.repeat(32)]);
+    expect(tracker.takeDueForCheck()).toEqual([]); // marked as checked
+    tracker.release('cc'.repeat(32));
     expect(tracker.available([box], ME).map((b) => b.boxId)).toEqual([box.boxId]);
     tracker.record('dd'.repeat(32), [box.boxId], [], '{}');
     tracker.release('dd'.repeat(32));

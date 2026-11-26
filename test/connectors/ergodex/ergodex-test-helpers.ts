@@ -151,6 +151,11 @@ export interface NodeState {
   submit: (body: string) => { status?: number; body: unknown } | 'throw';
   posted: string[];
   calls: Array<{ method: string; path: string }>;
+  /**
+   * Total emission by token id, for `/blockchain/token/byId`. A pool NFT not listed here
+   * answers 1 when some pool box in this state holds it; any other token is unknown.
+   */
+  emission: Map<string, bigint>;
 }
 
 export function newNodeState(): NodeState {
@@ -164,7 +169,14 @@ export function newNodeState(): NodeState {
     submit: (body) => ({ body: JSON.stringify(JSON.parse(body).id) }),
     posted: [],
     calls: [],
+    emission: new Map(),
   };
+}
+
+/** Whether a pool box anywhere in the state holds this token as its NFT (slot 0). */
+function isPoolNft(state: NodeState, id: string): boolean {
+  const boxes = [...state.pools.values(), ...state.mempool.values(), ...state.byTree.values()].flat();
+  return boxes.some((b) => b.assets[0]?.tokenId === id);
 }
 
 const notFound = { status: 404, body: { error: 404, reason: 'not-found', detail: null } };
@@ -225,7 +237,13 @@ export function stateNode(state: NodeState): FetchLike {
       if (res === 'throw') throw new Error('socket hang up');
       return send(res);
     }
-    if (method === 'GET' && p.startsWith('/blockchain/token/byId/')) return send(notFound);
+    if (method === 'GET' && (m = p.match(/^\/blockchain\/token\/byId\/([0-9a-f]{64})$/))) {
+      const emission = state.emission.get(m[1]) ?? (isPoolNft(state, m[1]) ? 1n : undefined);
+      if (emission === undefined) return send(notFound);
+      return send({
+        body: { id: m[1], boxId: m[1], emissionAmount: emission, name: '', description: '', decimals: 0 },
+      });
+    }
     throw new Error(`unrouted node request ${method} ${p}${url.search}`);
   };
 }
