@@ -70,6 +70,39 @@
           },
           "data": {
             "$ref": "#/components/schemas/AmmAddLiquidityResponseData"
+          },
+          "pendingData": {
+            "description": "Present only with status PENDING, from a connector whose transaction fixes its amounts: what the transaction moves if it confirms. Confirmation is reported only by poll.",
+            "type": "object",
+            "properties": {
+              "fee": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "poolAddress": {
+                "description": "Pool this operation acted on",
+                "type": "string"
+              },
+              "baseTokenAmountAdded": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "quoteTokenAmountAdded": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "lpTokenAmountAdded": {
+                "format": "decimal",
+                "description": "LP tokens the wallet receives, in the LP token's units",
+                "type": "string"
+              }
+            },
+            "required": [
+              "fee",
+              "baseTokenAmountAdded",
+              "quoteTokenAmountAdded",
+              "lpTokenAmountAdded"
+            ]
           }
         },
         "required": [
@@ -165,6 +198,39 @@
           },
           "data": {
             "$ref": "#/components/schemas/AmmRemoveLiquidityResponseData"
+          },
+          "pendingData": {
+            "description": "Present only with status PENDING, from a connector whose transaction fixes its amounts: what the transaction moves if it confirms. Confirmation is reported only by poll.",
+            "type": "object",
+            "properties": {
+              "fee": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "poolAddress": {
+                "description": "Pool this operation acted on",
+                "type": "string"
+              },
+              "baseTokenAmountRemoved": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "quoteTokenAmountRemoved": {
+                "format": "decimal",
+                "type": "string"
+              },
+              "lpTokenAmountRemoved": {
+                "format": "decimal",
+                "description": "LP tokens the wallet returns to the pool, in the LP token's units",
+                "type": "string"
+              }
+            },
+            "required": [
+              "fee",
+              "baseTokenAmountRemoved",
+              "quoteTokenAmountRemoved",
+              "lpTokenAmountRemoved"
+            ]
           }
         },
         "required": [
@@ -2094,10 +2160,14 @@
             "format": "decimal",
             "minimum": 0,
             "maximum": 100,
-            "description": "Percentage of liquidity to remove",
-            "default": 100,
+            "description": "Percentage of liquidity to remove. Send this or lpTokenAmount, not both.",
             "type": "number",
             "example": 100
+          },
+          "lpTokenAmount": {
+            "format": "decimal",
+            "description": "The exact LP tokens to return, in the LP token's units. Send this or percentageToRemove, not both. Only connectors that support it (ergodex) take it; any other answers 400.",
+            "type": "number"
           },
           "slippagePct": {
             "format": "decimal",
@@ -2111,8 +2181,7 @@
         "required": [
           "connector",
           "chainNetwork",
-          "poolAddress",
-          "percentageToRemove"
+          "poolAddress"
         ]
       },
       "AmmPoolInfoRequest": {

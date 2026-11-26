@@ -25,9 +25,10 @@
  * checked against its plan; the rebuild when the pool box was spent first; the pending
  * tracker; submitMode (not set: refused before the key is loaded; `check`: only checked).
  *
- * The answer to an add or remove is PENDING with the transaction id. The shared response
- * has no field for the amounts a pending transaction fixes (`data` means confirmed), so
- * they are written to the log and, in check mode, into the 409's message.
+ * The answer to an add or remove is PENDING with the transaction id and `pendingData`: the
+ * amounts the transaction fixes, that is, what it moves if it confirms. It carries no
+ * `data`, which means confirmed. The same amounts are written to the log and, in check
+ * mode, into the 409's message.
  */
 import { ErgoCheckOnlyError, ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
@@ -179,6 +180,55 @@ export function describeLiquidityMoves(plan: LiquidityPlan, built: BuiltErgoTran
   );
 }
 
+type AddPendingData = NonNullable<AddLiquidityResponseType['pendingData']>;
+type RemovePendingData = NonNullable<RemoveLiquidityResponseType['pendingData']>;
+
+/**
+ * What a built deposit or redeem gives the wallet (positive) or takes from it (negative)
+ * of base, quote and the LP token, read from the transaction itself, the miner fee left
+ * out. The check before signing has already found these equal to the plan.
+ */
+function walletMoves(plan: LiquidityPlan, built: BuiltErgoTransaction): { x: bigint; y: bigint; lp: bigint } {
+  const delta = changeDelta(built);
+  const of = (token: TokenRef) => (delta.get(token.tokenId) ?? 0n) + (token.tokenId === null ? built.fee : 0n);
+  return { x: of(plan.base), y: of(plan.quote), lp: of(plan.lpToken) };
+}
+
+/**
+ * The amounts a built deposit fixes: if it confirms, it moves exactly these. Sent as
+ * `pendingData`; the answer stays PENDING. Exact decimal digits, never a float.
+ */
+export function fixedDepositData(
+  plan: LiquidityPlan,
+  built: BuiltErgoTransaction,
+  nativeDecimals: number,
+): AddPendingData {
+  const moves = walletMoves(plan, built);
+  return {
+    fee: units(built.fee, nativeDecimals),
+    poolAddress: plan.pool.poolId,
+    baseTokenAmountAdded: units(-moves.x, plan.base.decimals),
+    quoteTokenAmountAdded: units(-moves.y, plan.quote.decimals),
+    lpTokenAmountAdded: units(moves.lp, plan.lpToken.decimals),
+  };
+}
+
+/** The same for a built redeem. */
+export function fixedRedeemData(
+  plan: LiquidityPlan,
+  built: BuiltErgoTransaction,
+  nativeDecimals: number,
+): RemovePendingData {
+  const moves = walletMoves(plan, built);
+  return {
+    fee: units(built.fee, nativeDecimals),
+    poolAddress: plan.pool.poolId,
+    baseTokenAmountRemoved: units(moves.x, plan.base.decimals),
+    quoteTokenAmountRemoved: units(moves.y, plan.quote.decimals),
+    lpTokenAmountRemoved: units(-moves.lp, plan.lpToken.decimals),
+  };
+}
+
 // ---------------------------------------------------------------------------------------
 // quote-liquidity
 
@@ -271,15 +321,17 @@ function priceBound(refs: LiquidityPlan[], slip: bigint, slippagePct: number): L
 
 /**
  * Build, check, sign and submit a deposit or redeem, rebuilding on a spent pool box while
- * the bound holds, as a swap does. Answers PENDING with the transaction id.
+ * the bound holds, as a swap does. Answers PENDING with the transaction id and, as
+ * `pendingData`, what `fixedData` reads from the transaction that was signed.
  */
-async function sendLiquidity(
+async function sendLiquidity<P>(
   dex: Ergodex,
   wallet: ErgoWalletAccount,
   first: LiquidityPlan,
   replan: () => Promise<LiquidityPlan>,
   bound: LiquidityBound,
-): Promise<{ signature: string; status: number }> {
+  fixedData: (plan: LiquidityPlan, built: BuiltErgoTransaction, nativeDecimals: number) => P,
+): Promise<{ signature: string; status: number; pendingData?: P }> {
   const ergo = dex.ergo;
   const native: TokenRef = { tokenId: null, symbol: ergo.nativeTokenSymbol, decimals: ergo.config.nativeDecimals };
   let plan = first;
@@ -295,6 +347,7 @@ async function sendLiquidity(
     const current = plan;
     // worked out before signing, so nothing after the submit can fail
     let moves: string | undefined;
+    let pendingData: P | undefined;
     try {
       const { txId } = await ergo.sendTransaction(
         { changeAddress: wallet.address, inputs: [{ box: current.pool.box }], outputs: [current.successor] },
@@ -302,12 +355,13 @@ async function sendLiquidity(
         {
           verify: (built) => {
             verifyLiquidityTransaction(current, built);
+            pendingData = fixedData(current, built, native.decimals);
             moves = describeLiquidityMoves(current, built, native);
           },
         },
       );
       logger.info(`ergodex: submitted ${current.change.action} as ${txId}, PENDING; if it confirms: ${moves}`);
-      return { signature: txId, status: TransactionStatusCode.PENDING };
+      return { signature: txId, status: TransactionStatusCode.PENDING, pendingData };
     } catch (error) {
       if (error instanceof ErgoCheckOnlyError) {
         // check mode: never PENDING, never a signature; the message says what it would move
@@ -386,7 +440,7 @@ export async function addLiquidity(
           `${formatUnits(minLp, plan.lpToken.decimals)}`
         : null);
     wallet = await dex.ergo.getWallet(walletAddress);
-    return await sendLiquidity(dex, wallet, first, () => replan(), bound);
+    return await sendLiquidity(dex, wallet, first, () => replan(), bound, fixedDepositData);
   } catch (error) {
     throw ergodexError(error, 'Failed to add ergodex liquidity');
   } finally {
@@ -484,42 +538,67 @@ function cannotPayRefusal(error: unknown, fresh: FreshLiquidityPool, lp: bigint,
   );
 }
 
+/** How much to remove: exactly one of the two. */
+export interface RemoveAmount {
+  /** A share of the wallet's spendable LP tokens of the pool. */
+  percentageToRemove?: number;
+  /** The exact LP tokens to return, in the LP token's units. */
+  lpTokenAmount?: number;
+}
+
 /**
- * Remove liquidity: return `percentageToRemove` of the wallet's spendable LP tokens of the
- * pool (rounded down to a whole LP unit) and take out the most the pool allows for them.
- * Bound at every build: the pool price within `slippagePct` of the first fresh read, and
- * each side paid at least that read's less `slippagePct`.
+ * Remove liquidity: return LP tokens of the pool and take out the most the pool allows
+ * for them. The LP tokens are either `lpTokenAmount` exactly (read in the LP token's
+ * decimals, never rounded; more than the wallet can spend is a 400), or
+ * `percentageToRemove` of the wallet's spendable LP tokens of the pool, rounded down to a
+ * whole LP unit. Exactly one of the two. Bound at every build: the pool price within
+ * `slippagePct` of the first fresh read, and each side paid at least that read's less
+ * `slippagePct`.
  */
 export async function removeLiquidity(
   network: string,
   walletAddress: string,
   poolAddress: string,
-  percentageToRemove: number,
+  amount: RemoveAmount,
   slippagePct?: number,
 ): Promise<RemoveLiquidityResponseType> {
   let wallet: ErgoWalletAccount | undefined;
   try {
+    const { percentageToRemove, lpTokenAmount } = amount;
+    if ((percentageToRemove === undefined) === (lpTokenAmount === undefined)) {
+      throw httpErrors.badRequest('Send exactly one of percentageToRemove and lpTokenAmount');
+    }
     const dex = await Ergodex.getInstance(network);
     // before any pool or box is read and before the wallet's key is loaded
     dex.ergo.assertSubmitModeSet();
     const applied = slippagePct ?? dex.root.slippagePct;
     const slip = pctToScaled(applied);
-    const pct = percentToRemove(percentageToRemove);
+    const pct = percentageToRemove === undefined ? null : percentToRemove(percentageToRemove);
     // leaving a pool: the entry guards do not apply (see freshLiquidityPool)
     const fresh = await dex.freshLiquidityPool(poolAddress, { exit: true });
     const lpId = fresh.lpToken.tokenId!;
+    const lpDecimals = fresh.lpToken.decimals;
+    // exact, in the LP token's decimals: a finer amount is a 400, never rounded
+    const exact = lpTokenAmount === undefined ? null : toRaw(lpTokenAmount, fresh.lpToken, 'lpTokenAmount');
+    if (exact === 0n) throw httpErrors.badRequest('lpTokenAmount must be above zero');
     const boxes = await dex.ergo.getSpendableBoxes(walletAddress);
     const held = boxes
       .flatMap((b) => b.assets)
       .filter((a) => a.tokenId.toLowerCase() === lpId)
       .reduce((n, a) => n + a.amount, 0n);
+    if (exact !== null && exact > held) {
+      throw httpErrors.badRequest(
+        `lpTokenAmount ${formatUnits(exact, lpDecimals)} is more than the ${formatUnits(held, lpDecimals)} LP ` +
+          `tokens of pool ${fresh.pool.poolId} (${lpId}) the wallet can spend; nothing was removed`,
+      );
+    }
     if (held === 0n) {
       throw httpErrors.badRequest(`The wallet holds no LP tokens of pool ${fresh.pool.poolId} (${lpId})`);
     }
-    const lp = (held * pct) / (100n * 10n ** 8n);
+    const lp = exact ?? (held * pct!) / HUNDRED_PCT;
     if (lp === 0n) {
       throw httpErrors.badRequest(
-        `${percentageToRemove}% of the wallet's ${formatUnits(held, fresh.lpToken.decimals)} LP tokens rounds to zero`,
+        `${percentageToRemove}% of the wallet's ${formatUnits(held, lpDecimals)} LP tokens rounds to zero`,
       );
     }
     // another box at a pool tree holding as much of this LP token: refused, not guessed
@@ -549,7 +628,7 @@ export async function removeLiquidity(
       return null;
     };
     wallet = await dex.ergo.getWallet(walletAddress);
-    return await sendLiquidity(dex, wallet, first, () => replan(), bound);
+    return await sendLiquidity(dex, wallet, first, () => replan(), bound, fixedRedeemData);
   } catch (error) {
     throw ergodexError(error, 'Failed to remove ergodex liquidity');
   } finally {

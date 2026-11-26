@@ -2,8 +2,9 @@
  * /trading/amm liquidity and position routes for connector `ergodex` through Fastify
  * inject, with the real chain layer, real fleet-sdk and real wasm signing (a throw-away
  * test key), and a node stand-in; nothing leaves the process. Covers: quote-liquidity in
- * exact units; add and remove answered PENDING with the id, the posted transaction holding
- * exactly the plan; the rebuild when the pool box was spent first; the pool price bound
+ * exact units; add and remove answered PENDING with the id and `pendingData` equal to what
+ * the posted transaction does to the wallet (both pool kinds), the posted transaction holding
+ * exactly the plan; remove by an exact `lpTokenAmount`; the rebuild when the pool box was spent first; the pool price bound
  * (on a rebuild, and against the confirmed box when someone else's unconfirmed box moved
  * it); submitMode not set (refused before the key is loaded) and `check` (checked only);
  * the guards on entry only (remove and the position reads go ahead on a pool an entry
@@ -22,8 +23,8 @@ import * as yaml from 'js-yaml';
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { normalizeNodeBox } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
-import { parseUnits } from '../../../src/chains/ergo/ergo.utils';
-import { percentToRemove } from '../../../src/connectors/ergodex/amm-routes/liquidity';
+import { formatUnits, parseUnits } from '../../../src/chains/ergo/ergo.utils';
+import { percentToRemove, removeLiquidity } from '../../../src/connectors/ergodex/amm-routes/liquidity';
 import { Ergodex, NATIVE_TOKEN_ID } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
 import { encodeLong } from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
@@ -40,6 +41,7 @@ import {
   makeBox,
   makeDex,
   ME,
+  ME_TREE,
   N2T_TREE,
   n2tPool,
   newNodeState,
@@ -48,12 +50,15 @@ import {
   ROOT,
   RSN,
   RSN_POOL,
+  T2T_POOL,
   T2T_TREE,
   testConfig,
   TIP,
   TOKENS,
   walletBox,
   withoutSubmitMode,
+  WT_ADA,
+  WT_ERG,
 } from './ergodex-test-helpers';
 import { LIT_NFT, LIT_POOL, LIT_VAULT, makeLithosDex, putPools } from './lithos-test-helpers';
 
@@ -276,8 +281,18 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(res.statusCode).toBe(200);
       expect(posts()).toBe(1);
       const tx = parseNodeJson<PostedTx>(state.posted[0]);
-      // PENDING carries no `data`: that means confirmed
-      expect(JSON.parse(res.body)).toEqual({ signature: tx.id, status: 0 });
+      // PENDING carries no `data`, which means confirmed; what it fixes is in pendingData
+      expect(JSON.parse(res.body)).toEqual({
+        signature: tx.id,
+        status: 0,
+        pendingData: {
+          fee: '0.0011',
+          poolAddress: NFT,
+          baseTokenAmountAdded: '0.999999878',
+          quoteTokenAmountAdded: '23.934',
+          lpTokenAmountAdded: '4867691',
+        },
+      });
       expect(tx.inputs[0].boxId).toBe(RSN_POOL.boxId);
       const out0 = tx.outputs[0];
       expect(out0.ergoTree).toBe(RSN_POOL.ergoTree);
@@ -326,7 +341,10 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(posts()).toBe(2);
       const second = JSON.parse(state.posted[1]);
       expect(second.inputs[0].boxId).toBe(successor.boxId);
-      expect(JSON.parse(res.body)).toEqual({ signature: second.id, status: 0 });
+      // pendingData is from the rebuilt transaction, the one that was sent
+      const body = JSON.parse(res.body);
+      expect(body).toMatchObject({ signature: second.id, status: 0 });
+      expect(body.pendingData.lpTokenAmountAdded).toBe(String(changeHolds(state.posted[1], LP)));
     });
 
     it('pool spent first and its price moved past the bound: a 409, nothing more posted', async () => {
@@ -445,7 +463,17 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(res.statusCode).toBe(200);
       expect(posts()).toBe(1);
       const tx = parseNodeJson<PostedTx>(state.posted[0]);
-      expect(JSON.parse(res.body)).toEqual({ signature: tx.id, status: 0 });
+      expect(JSON.parse(res.body)).toEqual({
+        signature: tx.id,
+        status: 0,
+        pendingData: {
+          fee: '0.0011',
+          poolAddress: NFT,
+          baseTokenAmountRemoved: '0.499999836',
+          quoteTokenAmountRemoved: '11.966',
+          lpTokenAmountRemoved: '2433845',
+        },
+      });
       // floor(4,867,691 / 2) = 2,433,845 LP; floor(LP * X0 / S) and floor(LP * Y0 / S)
       const lp = 2433845n;
       const x = (lp * X0) / SUPPLY;
@@ -569,6 +597,301 @@ describe('ergodex liquidity through /trading/amm', () => {
       expect(ok.statusCode).toBe(200);
       expect(redeemedLp() <= most).toBe(true);
       expect(redeemedLp()).toBe((all * ((most * 10n ** 10n) / all)) / 10n ** 10n);
+    });
+
+    describe('by lpTokenAmount: an exact number of LP tokens', () => {
+      const exact = (lpTokenAmount: unknown, over: Record<string, unknown> = {}) =>
+        remove({ percentageToRemove: undefined, lpTokenAmount, ...over });
+
+      it('returns exactly that many LP tokens to the pool and keeps the rest in the wallet', async () => {
+        const res = await exact(1234567);
+        expect(res.statusCode).toBe(200);
+        expect(posts()).toBe(1);
+        const tx = parseNodeJson<PostedTx>(state.posted[0]);
+        const lp = 1234567n;
+        const x = (lp * X0) / SUPPLY;
+        const y = (lp * Y0) / SUPPLY;
+        const out0 = tx.outputs[0];
+        expect(BigInt(out0.assets[1].amount)).toBe(LP0 + lp);
+        expect(BigInt(out0.value)).toBe(X0 - x);
+        expect(BigInt(out0.assets[2].amount)).toBe(Y0 - y);
+        expect(changeHolds(state.posted[0], LP)).toBe(HELD - lp);
+        expect(changeHolds(state.posted[0], RSN)).toBe(y);
+        const body = JSON.parse(res.body);
+        expect(body).not.toHaveProperty('data');
+        expect(body.pendingData).toEqual({
+          fee: '0.0011',
+          poolAddress: NFT,
+          baseTokenAmountRemoved: formatUnits(x, 9),
+          quoteTokenAmountRemoved: formatUnits(y, 3),
+          lpTokenAmountRemoved: '1234567',
+        });
+      });
+
+      it('all the wallet holds, named exactly', async () => {
+        const res = await exact(Number(HELD));
+        expect(res.statusCode).toBe(200);
+        expect(redeemedLp()).toBe(HELD);
+        expect(changeHolds(state.posted[0], LP)).toBe(0n);
+      });
+
+      it('more than the wallet can spend is a 400 naming both amounts, never cut down; nothing posted', async () => {
+        const res = await exact(Number(HELD + 1n));
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).message).toContain(
+          `lpTokenAmount 4867692 is more than the 4867691 LP tokens of pool ${NFT}`,
+        );
+        expect(posts()).toBe(0);
+      });
+
+      it('more than the wallet can spend when it holds none is a 400 naming both amounts', async () => {
+        state.wallet = [walletBox(ERG)];
+        const res = await exact(5);
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).message).toContain('lpTokenAmount 5 is more than the 0 LP tokens');
+        expect(posts()).toBe(0);
+      });
+
+      it('more decimal places than the LP token has is a 400, never rounded; nothing posted', async () => {
+        // the LP token has 0 decimals
+        const res = await exact(1234567.5);
+        expect(res.statusCode).toBe(400);
+        const message: string = JSON.parse(res.body).message;
+        expect(message).toContain('lpTokenAmount');
+        expect(message).toContain('more than 0 decimal places');
+        expect(posts()).toBe(0);
+      });
+
+      it('zero is a 400, nothing posted', async () => {
+        const res = await exact(0);
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).message).toContain('lpTokenAmount must be above zero');
+        expect(posts()).toBe(0);
+      });
+
+      it('both lpTokenAmount and percentageToRemove, or neither, is a 400; nothing read or posted', async () => {
+        const both = await exact(1234567, { percentageToRemove: 50 });
+        expect(both.statusCode).toBe(400);
+        expect(JSON.parse(both.body).message).toContain('Send exactly one of percentageToRemove and lpTokenAmount');
+        const neither = await exact(undefined);
+        expect(neither.statusCode).toBe(400);
+        expect(JSON.parse(neither.body).message).toContain('Send exactly one of percentageToRemove and lpTokenAmount');
+        expect(posts()).toBe(0);
+        expect(state.calls).toEqual([]);
+      });
+
+      it('the connector itself refuses both or neither', async () => {
+        for (const amount of [{}, { percentageToRemove: 50, lpTokenAmount: 1 }]) {
+          await expect(removeLiquidity('mainnet', ME, NFT, amount)).rejects.toMatchObject({
+            statusCode: 400,
+            message: 'Send exactly one of percentageToRemove and lpTokenAmount',
+          });
+        }
+        expect(posts()).toBe(0);
+      });
+
+      it('a sole provider naming all of it on an ERG/token pool: the 400 naming the most, which then goes through', async () => {
+        const all = SUPPLY - 1000n;
+        state.wallet = [walletBox(ERG, [{ tokenId: LP, amount: all }])];
+        const res = await exact(Number(all));
+        expect(res.statusCode).toBe(400);
+        const m = /at most (\d+) LP tokens, [\d.]+% of the wallet's (\d+), can be removed now/.exec(
+          JSON.parse(res.body).message,
+        );
+        expect(m).not.toBeNull();
+        expect(BigInt(m![2])).toBe(all);
+        expect(posts()).toBe(0);
+        const most = BigInt(m![1]);
+        const ok = await exact(Number(most));
+        expect(ok.statusCode).toBe(200);
+        expect(redeemedLp()).toBe(most);
+        expect(JSON.parse(ok.body).pendingData.lpTokenAmountRemoved).toBe(String(most));
+      });
+
+      it('pool spent first, in bound: rebuilt on the successor for the same exact amount', async () => {
+        const successor = othersSwap(dex, RSN_POOL, ERG / 10n);
+        let n = 0;
+        state.submit = (body) => {
+          n += 1;
+          if (n === 1) {
+            state.mempool.set(NFT, [successor]);
+            state.mempoolSpent.add(RSN_POOL.boxId);
+            return rejectSpent;
+          }
+          return { body: JSON.stringify(JSON.parse(body).id) };
+        };
+        const res = await exact(1234567);
+        expect(res.statusCode).toBe(200);
+        expect(posts()).toBe(2);
+        const second = parseNodeJson<PostedTx>(state.posted[1]);
+        expect(second.inputs[0].boxId).toBe(successor.boxId);
+        expect(BigInt(second.outputs[0].assets[1].amount) - successor.assets[1].amount).toBe(1234567n);
+        expect(JSON.parse(res.body).pendingData.lpTokenAmountRemoved).toBe('1234567');
+      });
+
+      it('submitMode check: the same 409 text as for a percentage, with the exact amount; nothing posted', async () => {
+        useDex(makeDex(state, dexConfig(), ROOT, TOKENS, checkTestConfig()));
+        const res = await exact(1234567);
+        expect(res.statusCode).toBe(409);
+        const body = JSON.parse(res.body);
+        expect(body.message).toContain('Check only');
+        expect(body.message).toContain('a redeem of 1234567 LP tokens');
+        expect(body).not.toHaveProperty('pendingData');
+        expect(posts()).toBe(0);
+      });
+
+      it('submitMode not set: a 503 before any read, and the key is never loaded', async () => {
+        useDex(makeDex(state, dexConfig(), ROOT, TOKENS, withoutSubmitMode(testConfig())));
+        const res = await exact(1234567);
+        expect(res.statusCode).toBe(503);
+        expect(JSON.parse(res.body).message).toContain('submitMode is not set');
+        expect(dex.ergo.getWallet).not.toHaveBeenCalled();
+        expect(state.calls).toEqual([]);
+      });
+    });
+  });
+
+  describe('pendingData is exactly what the sent transaction does to the wallet, on both pool kinds', () => {
+    const T2T_NFT = T2T_POOL.assets[0].tokenId;
+    const T2T_LP = T2T_POOL.assets[1].tokenId;
+    const T2T_SUPPLY = 9223372036854775807n - T2T_POOL.assets[1].amount;
+
+    interface Kind {
+      name: string;
+      nft: string;
+      lp: string;
+      /** Base and quote token ids (null: ERG) and decimals, as pool-info reports them. */
+      base: [string | null, number];
+      quote: [string | null, number];
+      /** What the wallet holds besides some ERG for the miner fee. */
+      tokens: Array<{ tokenId: string; amount: bigint }>;
+      /** An offer the base side limits, and one the quote side limits. */
+      baseLimited: [number, number];
+      quoteLimited: [number, number];
+      /** LP tokens to hold for a remove. */
+      held: bigint;
+    }
+
+    const KINDS: Kind[] = [
+      {
+        name: 'ERG/RSN (ERG/token pool)',
+        nft: NFT,
+        lp: LP,
+        base: [null, 9],
+        quote: [RSN, 3],
+        tokens: [{ tokenId: RSN, amount: 100000n }],
+        baseLimited: [1, 100],
+        quoteLimited: [4, 10],
+        held: 4867691n,
+      },
+      {
+        name: 'WT_ERG/WT_ADA (token/token pool)',
+        nft: T2T_NFT,
+        lp: T2T_LP,
+        base: [WT_ERG, 9],
+        quote: [WT_ADA, 8],
+        tokens: [
+          { tokenId: WT_ERG, amount: 10n ** 15n },
+          { tokenId: WT_ADA, amount: 10n ** 15n },
+        ],
+        baseLimited: [1, 1000000],
+        quoteLimited: [1000000, 1],
+        held: T2T_SUPPLY / 1000n,
+      },
+    ];
+
+    /**
+     * What a posted transaction does to the wallet, read from it alone: the wallet's own
+     * outputs less the wallet boxes it spends, by token id (null: ERG), and the miner fee.
+     */
+    function walletChange(txJson: string, walletBoxes: ErgoBox[]): { delta: Map<string | null, bigint>; fee: bigint } {
+      const tx = parseNodeJson<PostedTx>(txJson);
+      const delta = new Map<string | null, bigint>();
+      const add = (k: string | null, n: bigint) => delta.set(k, (delta.get(k) ?? 0n) + n);
+      for (const input of tx.inputs) {
+        const box = walletBoxes.find((b) => b.boxId === input.boxId);
+        if (!box) continue;
+        add(null, -box.value);
+        for (const a of box.assets) add(a.tokenId, -a.amount);
+      }
+      for (const out of tx.outputs) {
+        if (out.ergoTree !== ME_TREE) continue;
+        add(null, BigInt(out.value));
+        for (const a of out.assets) add(a.tokenId, BigInt(a.amount));
+      }
+      return { delta, fee: BigInt(tx.outputs[tx.outputs.length - 1].value) };
+    }
+
+    const setUp = (tokens: Array<{ tokenId: string; amount: bigint }>) => {
+      state.pools.set(T2T_NFT, [T2T_POOL]);
+      state.emission.set(T2T_LP, LP_EMISSION);
+      state.wallet = [walletBox(5n * ERG, tokens)];
+    };
+
+    const cases = KINDS.flatMap((kind) => [
+      { kind, limit: 'base' as const, offer: kind.baseLimited },
+      { kind, limit: 'quote' as const, offer: kind.quoteLimited },
+    ]);
+
+    it.each(cases)('add on $kind.name, the $limit side limiting', async ({ kind, offer }) => {
+      setUp(kind.tokens);
+      const walletBoxes = state.wallet;
+      const res = await add({ poolAddress: kind.nft, baseTokenAmount: offer[0], quoteTokenAmount: offer[1] });
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+      const body = JSON.parse(res.body);
+      expect(body.status).toBe(0);
+      expect(body).not.toHaveProperty('data');
+      const { delta, fee } = walletChange(state.posted[0], walletBoxes);
+      const paid = ([id]: [string | null, number]) => -((delta.get(id) ?? 0n) + (id === null ? fee : 0n));
+      expect(paid(kind.base) > 0n && paid(kind.quote) > 0n && (delta.get(kind.lp) ?? 0n) > 0n).toBe(true);
+      expect(body.pendingData).toEqual({
+        fee: formatUnits(fee, 9),
+        poolAddress: kind.nft,
+        baseTokenAmountAdded: formatUnits(paid(kind.base), kind.base[1]),
+        quoteTokenAmountAdded: formatUnits(paid(kind.quote), kind.quote[1]),
+        lpTokenAmountAdded: formatUnits(delta.get(kind.lp)!, 0),
+      });
+      // exact decimal strings on the wire, never a JSON number
+      for (const v of Object.values(body.pendingData)) expect(typeof v).toBe('string');
+      // and the wallet moves by nothing else
+      const others = [...delta.keys()].filter(
+        (k) => k !== null && k !== kind.lp && k !== kind.base[0] && k !== kind.quote[0],
+      );
+      expect(others).toEqual([]);
+    });
+
+    it.each(
+      KINDS.flatMap((kind) => [
+        { kind, how: 'by percentage', over: { percentageToRemove: 50 } },
+        {
+          kind,
+          how: 'by lpTokenAmount',
+          over: { percentageToRemove: undefined, lpTokenAmount: Number(kind.held / 3n) },
+        },
+      ]),
+    )('remove on $kind.name, $how', async ({ kind, over }) => {
+      setUp([{ tokenId: kind.lp, amount: kind.held }]);
+      const walletBoxes = state.wallet;
+      const res = await remove({ poolAddress: kind.nft, ...over });
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+      const body = JSON.parse(res.body);
+      expect(body.status).toBe(0);
+      expect(body).not.toHaveProperty('data');
+      const { delta, fee } = walletChange(state.posted[0], walletBoxes);
+      const got = ([id]: [string | null, number]) => (delta.get(id) ?? 0n) + (id === null ? fee : 0n);
+      const returned = -(delta.get(kind.lp) ?? 0n);
+      expect(returned).toBe('lpTokenAmount' in over ? kind.held / 3n : kind.held / 2n);
+      expect(got(kind.base) > 0n && got(kind.quote) > 0n).toBe(true);
+      expect(body.pendingData).toEqual({
+        fee: formatUnits(fee, 9),
+        poolAddress: kind.nft,
+        baseTokenAmountRemoved: formatUnits(got(kind.base), kind.base[1]),
+        quoteTokenAmountRemoved: formatUnits(got(kind.quote), kind.quote[1]),
+        lpTokenAmountRemoved: formatUnits(returned, 0),
+      });
+      for (const v of Object.values(body.pendingData)) expect(typeof v).toBe('string');
     });
   });
 

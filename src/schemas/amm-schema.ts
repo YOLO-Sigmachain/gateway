@@ -115,6 +115,22 @@ export const AddLiquidityResponse = Type.Object(
         { $id: 'AmmAddLiquidityResponseData' },
       ),
     ),
+    pendingData: Type.Optional(
+      Type.Object(
+        {
+          fee: DecimalNumber({}),
+          poolAddress: Type.Optional(Type.String({ description: 'Pool this operation acted on' })),
+          baseTokenAmountAdded: DecimalNumber({}),
+          quoteTokenAmountAdded: DecimalNumber({}),
+          lpTokenAmountAdded: DecimalNumber({ description: "LP tokens the wallet receives, in the LP token's units" }),
+        },
+        {
+          description:
+            'Present only with status PENDING, from a connector whose transaction fixes its amounts: ' +
+            'what the transaction moves if it confirms. Confirmation is reported only by poll.',
+        },
+      ),
+    ),
   },
   { $id: 'AmmAddLiquidityResponse' },
 );
@@ -193,6 +209,24 @@ export const RemoveLiquidityResponse = Type.Object(
           quoteTokenAmountRemoved: DecimalNumber({}),
         },
         { $id: 'AmmRemoveLiquidityResponseData' },
+      ),
+    ),
+    pendingData: Type.Optional(
+      Type.Object(
+        {
+          fee: DecimalNumber({}),
+          poolAddress: Type.Optional(Type.String({ description: 'Pool this operation acted on' })),
+          baseTokenAmountRemoved: DecimalNumber({}),
+          quoteTokenAmountRemoved: DecimalNumber({}),
+          lpTokenAmountRemoved: DecimalNumber({
+            description: "LP tokens the wallet returns to the pool, in the LP token's units",
+          }),
+        },
+        {
+          description:
+            'Present only with status PENDING, from a connector whose transaction fixes its amounts: ' +
+            'what the transaction moves if it confirms. Confirmation is reported only by poll.',
+        },
       ),
     ),
   },
