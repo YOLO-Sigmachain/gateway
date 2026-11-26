@@ -9,8 +9,9 @@
  *    check reads;
  * 4. outputs of a pending transaction the node has forgotten are not offered: for a chain
  *    of transactions, and for one with a fixed contract input;
- * 5. poll reports FAILED for a transaction whose fixed input was an unconfirmed box that
- *    will never exist.
+ * 5. poll does not report FAILED for a transaction whose fixed input is an unconfirmed box
+ *    whose creator this node no longer holds: that creator may still sit in other nodes'
+ *    mempools, so the transaction may still confirm.
  * Real fleet-sdk and real ergo-lib-wasm; the node is a stand-in.
  */
 import { SInt } from '@fleet-sdk/core';
@@ -353,7 +354,7 @@ describe('4. chained transactions the node has forgotten offer no outputs', () =
   });
 });
 
-describe('5. a fixed input built on an unconfirmed box whose creator is gone', () => {
+describe('5. a fixed input built on an unconfirmed box whose creator this node no longer holds', () => {
   // the contract box is an output of someone else's unconfirmed transaction
   const pool = makeBox({ ergoTree: OPEN_TREE, value: 10n * ERG, creationHeight: TIP, inclusionHeight: null });
   const funding = makeBox({ ergoTree: TREE_A, value: 5n * ERG, creationHeight: TIP - 30 });
@@ -388,12 +389,14 @@ describe('5. a fixed input built on an unconfirmed box whose creator is gone', (
     return { ergo, node, txId, result: await ergo.pollTransaction(txId) };
   }
 
-  it('creator neither confirmed nor in the mempool: FAILED, and the wallet box is spendable again', async () => {
-    const { ergo, txId, result } = await sentThenPolled({});
-    expect(result.txStatus).toBe(TransactionStatusCode.FAILED);
-    expect(result.error).toContain(`fixed input ${pool.boxId} no longer exists`);
-    expect(ergo.pending.get(txId)).toBeUndefined();
-    expect((await ergo.getSpendableBoxes(ADDR_A)).map((b) => b.boxId)).toEqual([funding.boxId]);
+  it('creator neither confirmed nor in this mempool: NOT_FOUND, not FAILED, and the wallet box stays hidden', async () => {
+    const { ergo, node, txId, result } = await sentThenPolled({});
+    expect(result.txStatus).toBe(TransactionStatusCode.NOT_FOUND);
+    expect(result.error).toBeNull();
+    expect(ergo.pending.get(txId)).toBeDefined();
+    expect((await ergo.getSpendableBoxes(ADDR_A)).map((b) => b.boxId)).not.toContain(funding.boxId);
+    // not posted again either: its fixed input is unknown to this node
+    expect(node.calls.filter((c) => c.method === 'POST' && c.path === '/transactions').length).toBe(1);
   });
 
   it('creator still in the mempool: not FAILED, still tracked', async () => {

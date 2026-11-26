@@ -69,9 +69,10 @@ export class AmbiguousTokenError extends Error {
 }
 
 /**
- * The node may or may not have taken the transaction: the connection failed, the node
- * answered 5xx, or it answered 200 without an id. The transaction stays tracked (its
- * inputs are not selected again); poll `txId` before doing the action again.
+ * The node may or may not have taken the transaction: the connection failed after it may
+ * have been made (a reset, a timeout), the node answered 5xx, or it answered 200 without an
+ * id. A connection never made is ErgoNotSubmittedError instead. The transaction stays
+ * tracked (its inputs are not selected again); poll `txId` before doing the action again.
  */
 export class ErgoSubmitOutcomeUnknownError extends ErgoNodeError {
   readonly txId: string;
@@ -88,6 +89,53 @@ export class ErgoSubmitOutcomeUnknownError extends ErgoNodeError {
     this.name = 'ErgoSubmitOutcomeUnknownError';
     this.txId = txId;
   }
+}
+
+/**
+ * The submit never reached the node: the connection to it was refused, or its name did
+ * not resolve. No byte of the transaction was sent, so it cannot confirm from this submit;
+ * it is no longer tracked. Retry once the node is reachable.
+ */
+export class ErgoNotSubmittedError extends ErgoNodeError {
+  readonly txId: string;
+
+  constructor(txId: string, cause: ErgoNodeError) {
+    super(
+      0,
+      `Transaction ${txId} was not submitted: the node could not be reached (${cause.message}); ` +
+        'nothing was sent, so it cannot confirm. Retry once the node is reachable',
+      cause.reason,
+      cause.detail,
+      { cause },
+    );
+    this.name = 'ErgoNotSubmittedError';
+    this.txId = txId;
+  }
+}
+
+/** Transport error codes raised before a connection exists: nothing can have been sent. */
+const CONNECT_PHASE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+/**
+ * Whether a failed request provably failed before any connection was made: the error, or
+ * the error its cause chain ends in, carries one of CONNECT_PHASE_CODES; for an error that
+ * groups several (an AggregateError, one per address tried), every one of them does. An
+ * error with any other code (a reset, a timeout) is not: part of the request may have
+ * been sent.
+ */
+export function failedBeforeConnecting(error: unknown, depth = 0): boolean {
+  if (depth > 10 || error === null || typeof error !== 'object') return false;
+  const e = error as { code?: unknown; cause?: unknown; errors?: unknown };
+  if (Array.isArray(e.errors) && e.errors.length > 0) {
+    return e.errors.every((inner) => failedBeforeConnecting(inner, depth + 1));
+  }
+  if (e.code !== undefined) return typeof e.code === 'string' && CONNECT_PHASE_CODES.has(e.code);
+  return e.cause !== undefined && failedBeforeConnecting(e.cause, depth + 1);
+}
+
+/** The node's own words for a rejection. */
+function nodeText(error: ErgoNodeError): string {
+  return error.detail ?? error.reason ?? error.message;
 }
 
 /**
@@ -453,8 +501,9 @@ export class Ergo {
   /**
    * Submit through the node. The transaction is recorded before the POST, so its boxes are
    * not selected again even when the node's answer is lost. A definite rejection (4xx)
-   * releases it and rethrows; any other failure keeps it tracked and throws
-   * ErgoSubmitOutcomeUnknownError carrying the transaction id.
+   * releases it and rethrows; a connection that was never made (refused, or the node's
+   * name did not resolve) releases it and throws ErgoNotSubmittedError; any other failure
+   * keeps it tracked and throws ErgoSubmitOutcomeUnknownError carrying the transaction id.
    *
    * A transaction with fixed inputs (a contract box such as a pool) must go through
    * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
@@ -500,6 +549,11 @@ export class Ergo {
           );
         }
         throw new ErgoTransactionRejectedError(error);
+      }
+      if (error instanceof ErgoNodeError && error.status === 0 && failedBeforeConnecting(error)) {
+        // no byte reached the node: nothing from this submit can confirm
+        this.pending.release(signed.id);
+        throw new ErgoNotSubmittedError(signed.id, error);
       }
       throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
     }
@@ -642,6 +696,7 @@ export class Ergo {
     // two reads has moved into a block, which the index lookup or its lag check covers.
     const unconfirmed = await this.node.getUnconfirmedTransaction(id);
     if (unconfirmed) {
+      this.pending.markRefused(id, false);
       return {
         ...base,
         txBlock: null,
@@ -657,6 +712,7 @@ export class Ergo {
       const confirmations = confirmationsOf(confirmed, fullHeight);
       const done = confirmations >= this.config.confirmations;
       if (done) this.pending.release(id);
+      else this.pending.markRefused(id, false);
       return {
         ...base,
         txBlock: inclusionHeight,
@@ -666,6 +722,14 @@ export class Ergo {
       };
     }
 
+    // Released earlier because it can never confirm. Asked only after the mempool and the
+    // index: a transaction the chain shows confirmed is confirmed, whatever this says.
+    const tracked = this.pending.get(id);
+    const failed = tracked ? undefined : this.pending.failedReason(id);
+    if (failed) {
+      return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: failed.reason, txData: null };
+    }
+
     // The indexer can lag the chain; a transaction in a block it has not indexed yet looks
     // unknown. Read the index height before any input box, so box reads are at least as
     // fresh as the height the decision below is made on.
@@ -673,22 +737,29 @@ export class Ergo {
     const chainHeight = Math.max(fullHeight, typeof indexed.fullHeight === 'number' ? indexed.fullHeight : fullHeight);
     const indexBehind = indexed.indexedHeight < chainHeight;
 
-    // Neither indexed nor in the mempool. Failed only on evidence: one of its inputs spent
-    // by a different transaction, which we can check for transactions we submitted.
-    const tracked = this.pending.get(id);
+    // Neither indexed nor in the mempool. Failed only on proof: one of its inputs spent by a
+    // different transaction that has the network's confirmations, which we can check for
+    // transactions we submitted.
     const inputs = tracked ? await this.readTrackedInputs(tracked) : undefined;
     if (inputs?.spentElsewhere) {
       const { boxId, by } = inputs.spentElsewhere;
-      this.pending.release(id);
+      const depth = await this.confirmationsOfTransaction(by, fullHeight);
+      if (depth >= this.config.confirmations) {
+        const reason = `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`;
+        this.pending.releaseFailed(id, reason);
+        return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: reason, txData: null };
+      }
       return {
         ...base,
         txBlock: null,
-        txStatus: TransactionStatusCode.FAILED,
-        error: `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`,
-        txData: null,
+        txStatus: TransactionStatusCode.PENDING,
+        txData: {
+          note:
+            `input ${boxId} is spent by transaction ${by}, which has ${depth} of the ${this.config.confirmations} ` +
+            'confirmations that make it final; this transaction can no longer confirm once that one is final',
+        },
       };
     }
-    const unindexed = inputs?.unindexed ?? new Set<string>();
 
     if (indexBehind) {
       return {
@@ -699,63 +770,41 @@ export class Ergo {
       };
     }
 
-    // Ours, with a fixed input (a contract box) that was an unconfirmed output: not indexed
-    // on an index that has caught up, not spent in the mempool, and the transaction that
-    // created it is not in the mempool either. That box will never exist, so this
-    // transaction can never confirm. Not when that creator is one of our own pending
-    // transactions: its own poll may still post it again.
-    if (tracked) {
-      for (const fixed of tracked.fixedInputs) {
-        if (!unindexed.has(fixed.boxId) || this.pending.get(fixed.transactionId)) continue;
-        if (await this.node.isSpentInMempool(fixed.boxId)) continue;
-        if (await this.node.getUnconfirmedTransaction(fixed.transactionId)) continue;
-        this.pending.release(id);
-        return {
-          ...base,
-          txBlock: null,
-          txStatus: TransactionStatusCode.FAILED,
-          error:
-            `Its fixed input ${fixed.boxId} no longer exists: transaction ${fixed.transactionId}, which created it, ` +
-            'is neither confirmed nor in the mempool; this transaction can no longer confirm',
-          txData: null,
-        };
-      }
-    }
-
     // Ours, every input still unspent on an index that has caught up, and the node holds
     // it nowhere: it was dropped. Post it once more rather than forget it, since releasing
     // would let a rebuild execute twice if the dropped one resurfaces.
     if (tracked && inputs!.allUnspent) {
-      try {
-        await this.node.submitTransaction(tracked.json);
-      } catch (error) {
-        if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
-          this.pending.release(id);
-          return {
-            ...base,
-            txBlock: null,
-            txStatus: TransactionStatusCode.FAILED,
-            error: error.detail ?? error.message,
-            txData: null,
-          };
-        }
-        throw error;
+      const refusal = await this.postAgain(tracked);
+      if (!refusal) {
+        return {
+          ...base,
+          txBlock: null,
+          txStatus: TransactionStatusCode.PENDING,
+          txData: { note: 'rebroadcast: the node had dropped it' },
+        };
       }
-      return {
-        ...base,
-        txBlock: null,
-        txStatus: TransactionStatusCode.PENDING,
-        txData: { note: 'rebroadcast: the node had dropped it' },
-      };
+      return { ...base, txBlock: null, ...(await this.refusedAnswer(tracked, refusal)) };
     }
 
     // Ours, and every input the index does not know is an output of another transaction we
     // still track (a chained spend of our own unconfirmed change): it waits for that one.
-    // Not posted again here: a node that lacks the parent would reject it, and that
-    // rejection would prove nothing about this transaction. The parent's own poll posts the
-    // parent again; once the parent confirms, this one's inputs are indexed.
+    // Not posted again itself: a node that lacks the parent would reject it, and that
+    // rejection would prove nothing about this transaction. A parent the node has dropped
+    // is posted again here, so polling only this one still moves its parent.
     if (tracked && inputs!.waitingOn.length > 0 && inputs!.unknown.length === 0) {
       const parents = [...new Set(inputs!.waitingOn)];
+      for (const parent of parents) {
+        const parentTx = this.pending.get(parent);
+        if (!parentTx) continue;
+        try {
+          await this.postAgainIfDropped(parentTx);
+        } catch (error) {
+          logger.warn(
+            `Ergo ${this.network}: could not check transaction ${parent}, which ${id} waits for: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
       return {
         ...base,
         txBlock: null,
@@ -764,6 +813,88 @@ export class Ergo {
       };
     }
     return { ...base, txBlock: null, txStatus: TransactionStatusCode.NOT_FOUND, txData: null };
+  }
+
+  /**
+   * Post a tracked transaction the node no longer holds, as it was signed. Returns the
+   * node's refusal (a 4xx), or undefined when the node took it. A refusal is not proof that
+   * the transaction cannot confirm (the node also refuses a valid transaction: a competing
+   * spend in its mempool, a full mempool, one it already holds, a fee below its own
+   * minimum), so the entry is kept and marked refused, and its outputs are not offered
+   * until a later post is taken. Any other failure throws, and the entry is kept as it is.
+   */
+  private async postAgain(tx: PendingTransaction): Promise<ErgoNodeError | undefined> {
+    try {
+      await this.node.submitTransaction(tx.json);
+    } catch (error) {
+      if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
+        this.pending.markRefused(tx.txId, true);
+        logger.warn(
+          `Ergo ${this.network}: transaction ${tx.txId} was refused when posted again, and is kept: ${nodeText(error)}`,
+        );
+        return error;
+      }
+      throw error;
+    }
+    this.pending.markRefused(tx.txId, false);
+    logger.info(`Ergo ${this.network}: transaction ${tx.txId}, which the node had dropped, was posted again and taken`);
+    return undefined;
+  }
+
+  /**
+   * Poll's answer for a tracked transaction the node refused when it was posted again. It
+   * is kept either way. PENDING when it is in the mempool after all, or when one of its
+   * inputs is spent there by another transaction (whichever confirms first wins); otherwise
+   * NOT_FOUND, with the node's words in the note.
+   */
+  private async refusedAnswer(
+    tx: PendingTransaction,
+    refusal: ErgoNodeError,
+  ): Promise<Pick<ErgoPollResult, 'txStatus' | 'txData'>> {
+    const said = nodeText(refusal);
+    if (await this.node.getUnconfirmedTransaction(tx.txId)) {
+      this.pending.markRefused(tx.txId, false);
+      return {
+        txStatus: TransactionStatusCode.PENDING,
+        txData: { note: `the node refused it when posted again (${said}), but holds it in its mempool` },
+      };
+    }
+    for (const boxId of tx.inputBoxIds) {
+      if (await this.node.isSpentInMempool(boxId)) {
+        return {
+          txStatus: TransactionStatusCode.PENDING,
+          txData: {
+            note:
+              `the node refused it when posted again (${said}): its input ${boxId} is spent by another ` +
+              'transaction in the mempool; it may still confirm',
+          },
+        };
+      }
+    }
+    return {
+      txStatus: TransactionStatusCode.NOT_FOUND,
+      txData: { note: `the node refused it when posted again: ${said}; it is kept and posted again later` },
+    };
+  }
+
+  /**
+   * Post a tracked transaction again if the node has dropped it: in no mempool, and every
+   * input indexed and unspent. For a caller that has seen the index caught up. A refusal
+   * keeps it, as in poll.
+   */
+  private async postAgainIfDropped(tx: PendingTransaction): Promise<void> {
+    if (await this.node.getUnconfirmedTransaction(tx.txId)) {
+      this.pending.markRefused(tx.txId, false);
+      return;
+    }
+    const inputs = await this.readTrackedInputs(tx);
+    if (inputs.allUnspent) await this.postAgain(tx);
+  }
+
+  /** Blocks holding a transaction, by the index; 0 when the index does not have it. */
+  private async confirmationsOfTransaction(txId: string, fullHeight: number): Promise<number> {
+    const tx = await this.node.getTransaction(txId);
+    return tx ? confirmationsOf(tx, fullHeight) : 0;
   }
 
   /**
@@ -806,16 +937,23 @@ export class Ergo {
   }
 
   /**
-   * Check overdue pending transactions against the node, so that an entry leaves on
-   * evidence even when nobody polls it: confirmed, or an input spent by another
-   * transaction. An entry whose inputs are all unspent (or are outputs of another tracked
-   * transaction) is kept however old it is: it can still confirm. An entry with an input
-   * that neither the index nor the tracker knows (an unconfirmed box from someone else's
-   * transaction that has not confirmed by now) is forgotten, so its other inputs are not
-   * hidden for ever. Best effort: a node error leaves the entry as it is.
+   * Check overdue pending transactions against the node, so that an entry is settled even
+   * when nobody polls it:
+   * - confirmed: released;
+   * - an input spent by a different transaction that has the network's confirmations:
+   *   released as failed, with every tracked transaction that spends its outputs;
+   *   below that depth it is kept;
+   * - every input indexed and unspent, and the node holds it in no mempool: it was dropped,
+   *   so it is posted again; a refusal keeps it, marked refused, for the next check;
+   * - an input that neither the index nor the tracker knows (an unconfirmed box from
+   *   someone else's transaction that has not confirmed by now): forgotten, so its other
+   *   inputs are not hidden for ever.
+   * An entry whose inputs are outputs of another tracked transaction is kept however old it
+   * is. Best effort: a node error leaves the entry as it is.
    */
   private async checkOverduePending(): Promise<void> {
     for (const tx of this.pending.takeDueForCheck()) {
+      if (!this.pending.get(tx.txId)) continue; // released with a failed parent earlier in this round
       try {
         await this.recheckPending(tx);
       } catch (error) {
@@ -829,11 +967,15 @@ export class Ergo {
 
   private async recheckPending(tx: PendingTransaction): Promise<void> {
     const id = tx.txId;
-    if (await this.node.getUnconfirmedTransaction(id)) return;
+    if (await this.node.getUnconfirmedTransaction(id)) {
+      this.pending.markRefused(id, false);
+      return;
+    }
     const { fullHeight } = await this.node.getInfo();
     const confirmed = await this.node.getTransaction(id);
     if (confirmed) {
       if (confirmationsOf(confirmed, fullHeight) >= this.config.confirmations) this.pending.release(id);
+      else this.pending.markRefused(id, false);
       return;
     }
     const indexed = await this.node.getIndexedHeight();
@@ -841,11 +983,16 @@ export class Ergo {
     if (indexed.indexedHeight < chainHeight) return;
     const inputs = await this.readTrackedInputs(tx);
     if (inputs.spentElsewhere) {
+      const { boxId, by } = inputs.spentElsewhere;
+      // not final yet: the spender may still be undone, and this one confirm
+      if ((await this.confirmationsOfTransaction(by, fullHeight)) < this.config.confirmations) return;
+      const reason = `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`;
+      const released = this.pending.releaseFailed(id, reason);
+      const others = released.filter((r) => r !== id);
       logger.info(
-        `Ergo ${this.network}: pending transaction ${id} failed: input ${inputs.spentElsewhere.boxId} was spent ` +
-          `by transaction ${inputs.spentElsewhere.by}`,
+        `Ergo ${this.network}: pending transaction ${id} failed: input ${boxId} was spent by transaction ${by}` +
+          (others.length > 0 ? `; released with it, as they spend its outputs: ${others.join(', ')}` : ''),
       );
-      this.pending.release(id);
       return;
     }
     if (inputs.unknown.length > 0) {
@@ -855,7 +1002,10 @@ export class Ergo {
           'transaction this Gateway tracks',
       );
       this.pending.release(id);
+      return;
     }
+    // dropped by the node while it can still confirm: post it again (a refusal keeps it)
+    if (inputs.allUnspent) await this.postAgain(tx);
   }
 
   private feeOf(tx: NodeTransaction): number | null {

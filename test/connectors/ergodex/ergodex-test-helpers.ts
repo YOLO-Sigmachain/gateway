@@ -148,7 +148,8 @@ export interface NodeState {
   wallet: ErgoBox[];
   /** Index view of a box (for `getBox`). */
   boxes: Map<string, Record<string, unknown>>;
-  submit: (body: string) => { status?: number; body: unknown } | 'throw';
+  /** 'throw': the connection breaks mid-request; 'refused': the connection is never made. */
+  submit: (body: string) => { status?: number; body: unknown } | 'throw' | 'refused';
   posted: string[];
   calls: Array<{ method: string; path: string }>;
   /**
@@ -235,6 +236,10 @@ export function stateNode(state: NodeState): FetchLike {
       state.posted.push(body!);
       const res = state.submit(body!);
       if (res === 'throw') throw new Error('socket hang up');
+      if (res === 'refused') {
+        const refused = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9053'), { code: 'ECONNREFUSED' });
+        throw new TypeError('fetch failed', { cause: refused });
+      }
       return send(res);
     }
     if (method === 'GET' && (m = p.match(/^\/blockchain\/token\/byId\/([0-9a-f]{64})$/))) {

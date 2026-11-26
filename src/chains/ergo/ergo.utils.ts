@@ -84,26 +84,30 @@ export function parseUnits(value: string | number, decimals: number): bigint {
 
 /**
  * A number as the plain decimal it stands for. `toString` gives the shortest text that
- * reads back as the same double, in exponent form below 1e-6 and from 1e21 up
- * ("4e-7", "1.5e+21"); that form is expanded here by moving the decimal point in the
- * digit string, so no float arithmetic touches the value.
+ * reads back as the same double, in exponent form below 1e-6 ("4e-7"); that form is
+ * expanded here by moving the decimal point in the digit string, so no float arithmetic
+ * touches the value.
+ *
+ * A whole number is accepted only up to Number.MAX_SAFE_INTEGER: beyond it neighbouring
+ * integers share one double, so the caller's digits cannot be known. A number with a
+ * fraction is accepted with at most 15 significant digits (leading zeros not counted),
+ * which round-trip through a double exactly; more may already have been rounded.
  */
 export function numberToPlainString(value: number): string {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`Invalid amount: ${value}`);
   }
+  const tooPrecise = () =>
+    new Error(`Amount ${value} has more significant digits than a JSON number holds exactly; send it as a string`);
+  if (Number.isInteger(value)) {
+    if (!Number.isSafeInteger(value)) throw tooPrecise();
+    return value.toString(); // below 1e21, so never in exponent form
+  }
   const text = value.toString();
   const exponent = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/i.exec(text);
   const plain = exponent ? expandExponent(exponent[1], exponent[2] ?? '', Number(exponent[3])) : text;
-  // A decimal of at most 15 significant digits round-trips through a double exactly; more
-  // may already have been rounded by the time it is a number. Leading and trailing zeros
-  // are not significant.
-  const significant = plain.replace('.', '').replace(/^0+/, '').replace(/0+$/, '');
-  if (significant.length > 15) {
-    throw new Error(
-      `Amount ${value} has more significant digits than a JSON number holds exactly; send it as a string`,
-    );
-  }
+  const significant = plain.replace('.', '').replace(/^0+/, '');
+  if (significant.length > 15) throw tooPrecise();
   return plain;
 }
 

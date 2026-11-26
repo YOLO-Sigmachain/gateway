@@ -14,6 +14,7 @@ import { buildUnsignedTransaction, ErgoTransactionAssertionError } from '../../.
 import { addressFromPublicKey, encodeErgoAddress, NATIVE_COIN_ID } from '../../../src/chains/ergo/ergo.utils';
 import { balanceResponse } from '../../../src/chains/wallet-balances';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
+import { logger } from '../../../src/services/logger';
 
 import {
   ABOVE_2_53,
@@ -151,22 +152,78 @@ describe('poll', () => {
     expect(r.txData).toEqual({ note: expect.stringContaining('index') });
   });
 
-  it('failed only on evidence: an input of our transaction was spent by another', async () => {
+  describe('failed only on proof: an input spent by another transaction that is final', () => {
     const input = makeBox({ ergoTree: ME_TREE, value: ERG });
     const other = 'ee'.repeat(32);
-    const { ergo } = chain((_m, p) => {
-      if (p.startsWith('/blockchain/transaction/byId/') || p.startsWith('/transactions/unconfirmed/'))
-        return notFound();
-      if (p === `/blockchain/box/byId/${input.boxId}`)
-        return { body: nodeBoxJson(input, { spentTransactionId: other }) };
-      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
-      return undefined;
+    const CHILD = 'c4'.repeat(32);
+    const change = makeBox({ ergoTree: ME_TREE, value: ERG / 2n, transactionId: TX, inclusionHeight: null });
+
+    /** Our TX's input is spent by `other`, which the index holds at the tip (1 block). */
+    function spentByOther(overrides = {}, opts: { otherConfirmed?: boolean; txConfirmed?: boolean } = {}) {
+      return chain((_m, p) => {
+        if (p.startsWith('/transactions/unconfirmed/')) return notFound();
+        if (p === `/blockchain/transaction/byId/${other}` && opts.otherConfirmed !== false)
+          return { body: { id: other, inputs: [], outputs: [], inclusionHeight: TIP, numConfirmations: 0 } };
+        if (p === `/blockchain/transaction/byId/${TX}` && opts.txConfirmed)
+          return { body: { ...tx, inclusionHeight: TIP - 2, numConfirmations: 2 } };
+        if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+        if (p === `/blockchain/box/byId/${input.boxId}`)
+          return { body: nodeBoxJson(input, { spentTransactionId: other }) };
+        if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+        return undefined;
+      }, overrides);
+    }
+
+    it('the spender has the confirmations: FAILED, and the input is spendable again', async () => {
+      const { ergo } = spentByOther();
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      const r = await ergo.pollTransaction(TX);
+      expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
+      expect(r.error).toContain(other);
+      expect(ergo.pending.isSpent(input.boxId)).toBe(false);
     });
-    ergo.pending.record(TX, [input.boxId], [], '{}');
-    const r = await ergo.pollTransaction(TX);
-    expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
-    expect(r.error).toContain(other);
-    expect(ergo.pending.isSpent(input.boxId)).toBe(false);
+
+    it('the spender has fewer confirmations than the network asks for: PENDING, naming it, and kept', async () => {
+      const { ergo } = spentByOther({ confirmations: 2 });
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      const r = await ergo.pollTransaction(TX);
+      expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+      expect(r.error).toBeNull();
+      expect(r.txData).toEqual({ note: expect.stringContaining(other) });
+      expect(ergo.pending.isSpent(input.boxId)).toBe(true);
+    });
+
+    it('the index shows the input spent but does not have the spender yet: PENDING, and kept', async () => {
+      const { ergo } = spentByOther({}, { otherConfirmed: false });
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.PENDING);
+      expect(ergo.pending.get(TX)).toBeDefined();
+    });
+
+    it('a transaction spending its output is released with it, and both keep answering FAILED', async () => {
+      const { ergo } = spentByOther();
+      ergo.pending.record(TX, [input.boxId], [change], '{}');
+      ergo.pending.record(CHILD, [change.boxId], [], '{}');
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.FAILED);
+      expect(ergo.pending.get(CHILD)).toBeUndefined();
+      expect(ergo.pending.isSpent(change.boxId)).toBe(false);
+      const child = await ergo.pollTransaction(CHILD);
+      expect(child.txStatus).toBe(TransactionStatusCode.FAILED);
+      expect(child.error).toContain(`output of transaction ${TX}`);
+      // asked again, untracked now: still FAILED, from the remembered reason
+      const again = await ergo.pollTransaction(TX);
+      expect(again.txStatus).toBe(TransactionStatusCode.FAILED);
+      expect(again.error).toContain(other);
+    });
+
+    it('a remembered failure gives way to what the chain shows: confirmed reads as confirmed', async () => {
+      const opts = { txConfirmed: false };
+      const { ergo } = spentByOther({}, opts);
+      ergo.pending.record(TX, [input.boxId], [], '{}');
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.FAILED);
+      opts.txConfirmed = true; // the chain now holds TX itself
+      expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.CONFIRMED);
+    });
   });
 
   it('surfaces a node error rather than turning it into a status', async () => {
@@ -492,26 +549,44 @@ describe('balances and tokens', () => {
 describe('a pending transaction is forgotten only on evidence, never for its age', () => {
   const input = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
   const TIMEOUT_MS = 15 * 120 * 1000; // pendingTxTimeoutBlocks x blockTimeSeconds in testConfig
+  const SPENDER = 'ee'.repeat(32);
+  const signedJson = JSON.stringify({ id: TX, inputs: [{ boxId: input.boxId }], dataInputs: [], outputs: [] });
+  const accept = (): FakeResponse => ({ body: JSON.stringify(TX) });
 
-  function setup(box: () => FakeResponse, confirmed: () => FakeResponse = notFound) {
+  function setup(
+    box: () => FakeResponse,
+    confirmed: () => FakeResponse = notFound,
+    opts: { submit?: () => FakeResponse; spender?: () => FakeResponse; overrides?: object } = {},
+  ) {
     let now = 0;
-    const node = fakeNode((method, p) => {
+    const posted: string[] = [];
+    const node = fakeNode((method, p, body) => {
       if (method === 'GET' && p === '/info') return { body: infoBody() };
       if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(input)] };
+      if (method === 'POST' && p === '/transactions') {
+        posted.push(body!);
+        return (opts.submit ?? accept)();
+      }
       if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
       if (p === `/blockchain/transaction/byId/${TX}`) return confirmed();
+      if (p === `/blockchain/transaction/byId/${SPENDER}`) return (opts.spender ?? notFound)();
       if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
       if (p === `/blockchain/box/byId/${input.boxId}`) return box();
       return undefined;
     });
-    const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch, now: () => now });
-    ergo.pending.record(TX, [input.boxId], [], '{}');
+    const ergo = new Ergo('mainnet', { config: testConfig(opts.overrides), fetch: node.fetch, now: () => now });
+    ergo.pending.record(TX, [input.boxId], [], signedJson);
     const boxReads = () => node.calls.filter((c) => c.path === `/blockchain/box/byId/${input.boxId}`).length;
-    return { ergo, boxReads, advance: (ms: number) => (now += ms) };
+    return { ergo, boxReads, posted, advance: (ms: number) => (now += ms) };
   }
+  const spenderAt = (numConfirmations: number) => (): FakeResponse => ({
+    body: { id: SPENDER, inputs: [], outputs: [], inclusionHeight: TIP - numConfirmations, numConfirmations },
+  });
+  const spentBySpender = () => ({ body: nodeBoxJson(input, { spentTransactionId: SPENDER }) });
+  const unspent = () => ({ body: nodeBoxJson(input) });
 
   it('kept past the timeout while its inputs are unspent: its inputs stay hidden', async () => {
-    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    const { ergo, boxReads, advance } = setup(unspent);
     advance(TIMEOUT_MS + 1);
     expect(await ergo.getSpendableBoxes(ME)).toEqual([]);
     expect(ergo.pending.get(TX)).toBeDefined();
@@ -519,7 +594,7 @@ describe('a pending transaction is forgotten only on evidence, never for its age
   });
 
   it('checked again at most once per block time', async () => {
-    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    const { ergo, boxReads, advance } = setup(unspent);
     advance(TIMEOUT_MS + 1);
     await ergo.getSpendableBoxes(ME);
     await ergo.getSpendableBoxes(ME);
@@ -530,17 +605,72 @@ describe('a pending transaction is forgotten only on evidence, never for its age
   });
 
   it('not checked before the timeout', async () => {
-    const { ergo, boxReads, advance } = setup(() => ({ body: nodeBoxJson(input) }));
+    const { ergo, boxReads, advance } = setup(unspent);
     advance(TIMEOUT_MS - 1);
     await ergo.getSpendableBoxes(ME);
     expect(boxReads()).toBe(0);
   });
 
-  it('released past the timeout once an input is spent by another transaction', async () => {
-    const { ergo, advance } = setup(() => ({ body: nodeBoxJson(input, { spentTransactionId: 'ee'.repeat(32) }) }));
+  it('dropped by the node while its inputs are unspent: posted again, byte for byte, once per block time', async () => {
+    const { ergo, posted, advance } = setup(unspent);
+    const info = jest.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      advance(TIMEOUT_MS + 1);
+      await ergo.getSpendableBoxes(ME);
+      await ergo.buildTransaction({ changeAddress: ME, walletBoxes: [], outputs: [] }).catch(() => undefined);
+      expect(posted).toEqual([signedJson]);
+      advance(120_000);
+      await ergo.getSpendableBoxes(ME);
+      expect(posted).toEqual([signedJson, signedJson]);
+      expect(ergo.pending.get(TX)).toBeDefined();
+      expect(info.mock.calls.some(([m]) => String(m).includes(TX) && String(m).includes('posted again'))).toBe(true);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('a 4xx when posted again keeps it, marked refused, logged with the node text, and posted again later', async () => {
+    let status = 400;
+    const detail = 'Transaction pays less than any other in the pool being full';
+    const { ergo, posted, advance } = setup(unspent, notFound, {
+      submit: () => (status === 200 ? accept() : { status, body: { error: status, reason: 'bad.request', detail } }),
+    });
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      advance(TIMEOUT_MS + 1);
+      expect(await ergo.getSpendableBoxes(ME)).toEqual([]);
+      expect(posted.length).toBe(1);
+      expect(ergo.pending.get(TX)!.refused).toBe(true);
+      expect(ergo.pending.isSpent(input.boxId)).toBe(true);
+      expect(warn.mock.calls.some(([m]) => String(m).includes(TX) && String(m).includes(detail))).toBe(true);
+      status = 200;
+      advance(120_000);
+      await ergo.getSpendableBoxes(ME);
+      expect(posted.length).toBe(2);
+      expect(ergo.pending.get(TX)!.refused).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('released past the timeout once an input is spent by another transaction that has the confirmations', async () => {
+    const { ergo, posted, advance } = setup(spentBySpender, notFound, { spender: spenderAt(0) });
     advance(TIMEOUT_MS + 1);
     await ergo.getSpendableBoxes(ME);
     expect(ergo.pending.get(TX)).toBeUndefined();
+    expect(ergo.pending.failedReason(TX)!.reason).toContain(SPENDER);
+    expect(posted.length).toBe(0);
+  });
+
+  it('kept past the timeout while that spender has fewer confirmations than the network asks for', async () => {
+    const { ergo, posted, advance } = setup(spentBySpender, notFound, {
+      spender: spenderAt(0),
+      overrides: { confirmations: 2 },
+    });
+    advance(TIMEOUT_MS + 1);
+    await ergo.getSpendableBoxes(ME);
+    expect(ergo.pending.get(TX)).toBeDefined();
+    expect(posted.length).toBe(0);
   });
 
   it('released past the timeout once it is confirmed', async () => {
@@ -572,10 +702,16 @@ describe('poll of a chained transaction whose input is our own unconfirmed chang
   const PARENT = 'c1'.repeat(32);
   const funding = makeBox({ ergoTree: ME_TREE, value: 5n * ERG, creationHeight: TIP - 30 });
   const change = makeBox({ ergoTree: ME_TREE, value: 3n * ERG, transactionId: PARENT, inclusionHeight: null });
+  const PARENT_JSON = JSON.stringify({ id: PARENT, inputs: [{ boxId: funding.boxId }], dataInputs: [], outputs: [] });
 
   function setup() {
-    const node = fakeNode((method, p) => {
+    const posted: string[] = [];
+    const node = fakeNode((method, p, body) => {
       if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (method === 'POST' && p === '/transactions') {
+        posted.push(body!);
+        return { body: JSON.stringify(PARENT) };
+      }
       if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
       if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
       if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
@@ -584,18 +720,19 @@ describe('poll of a chained transaction whose input is our own unconfirmed chang
       return undefined;
     });
     const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch });
-    ergo.pending.record(PARENT, [funding.boxId], [change], '{}');
+    ergo.pending.record(PARENT, [funding.boxId], [change], PARENT_JSON);
     ergo.pending.record(TX, [change.boxId], [], '{}');
-    return { ergo, calls: node.calls };
+    return { ergo, calls: node.calls, posted };
   }
 
-  it('answers pending, naming the tracked parent, and posts nothing', async () => {
-    const { ergo, calls } = setup();
+  it('answers pending, naming the tracked parent, and posts the dropped parent again, never itself', async () => {
+    const { ergo, posted } = setup();
     const r = await ergo.pollTransaction(TX);
     expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
     expect(r.txData).toEqual({ note: expect.stringContaining(PARENT) });
-    expect(calls.some((c) => c.method === 'POST')).toBe(false);
+    expect(posted).toEqual([PARENT_JSON]);
     expect(ergo.pending.get(TX)).toBeDefined();
+    expect(ergo.pending.get(PARENT)).toBeDefined();
   });
 
   it('once the parent is no longer tracked, the same transaction reads as not found', async () => {

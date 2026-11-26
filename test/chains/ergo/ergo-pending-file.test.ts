@@ -1,16 +1,18 @@
 /**
  * Pending transactions on disk: written atomically on every change, read back at start,
- * and a missing, truncated or foreign file starts an empty list with the bad file kept
- * aside. Every file here is in a fresh temporary directory, never in the repository.
+ * and a missing, truncated or foreign-format file starts an empty list with the bad file
+ * kept aside; another network's file stops start-up. Every file here is in a fresh
+ * temporary directory, never in the repository.
  */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
 import { Ergo } from '../../../src/chains/ergo/ergo';
-import { ErgoPendingTracker } from '../../../src/chains/ergo/ergo.pending';
+import { ErgoPendingTracker, FAILED_KEPT } from '../../../src/chains/ergo/ergo.pending';
 import { ErgoPendingFile } from '../../../src/chains/ergo/ergo.pending-file';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
+import { logger } from '../../../src/services/logger';
 
 import {
   ABOVE_2_53,
@@ -126,7 +128,6 @@ describe('pending transactions survive a restart', () => {
     ['truncated', (text: string) => text.slice(0, text.length - 7)],
     ['not JSON', () => 'not json at all'],
     ['another format', () => JSON.stringify({ format: 'something-else', version: 1, transactions: [] })],
-    ['another network', (text: string) => text.replace('"network":"mainnet"', '"network":"testnet"')],
   ])('%s: starts empty and keeps the bad file aside', (_name, damage) => {
     recordOne(tracker());
     const bad = damage(fs.readFileSync(file, 'utf8'));
@@ -162,6 +163,137 @@ describe('pending transactions survive a restart', () => {
     expect(t.isSpent(input.boxId)).toBe(false);
   });
 
+  it("another network's file stops start-up, and is neither moved aside nor overwritten", () => {
+    recordOne(tracker('testnet'));
+    const before = fs.readFileSync(file, 'utf8');
+    expect(() => tracker('mainnet')).toThrow('belongs to network testnet, not mainnet');
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+    // its own network still reads it
+    expect(tracker('testnet').get(TX1)).toBeDefined();
+  });
+
+  it('the folder is synced after the rename, so the rename itself survives a power loss', () => {
+    if (process.platform === 'win32') return;
+    const nodeFs = jest.requireActual<typeof import('fs')>('fs');
+    const order: string[] = [];
+    const folders = new Set<number>();
+    const realOpen = nodeFs.openSync;
+    const realRename = nodeFs.renameSync;
+    const realSync = nodeFs.fsyncSync;
+    const open = jest.spyOn(nodeFs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const fd = (realOpen as (...a: unknown[]) => number)(p, ...rest);
+      if (String(p) === path.dirname(file)) folders.add(fd);
+      return fd;
+    }) as never);
+    const rename = jest.spyOn(nodeFs, 'renameSync').mockImplementation((from, to) => {
+      order.push('rename');
+      return realRename(from, to);
+    });
+    const sync = jest.spyOn(nodeFs, 'fsyncSync').mockImplementation((fd) => {
+      order.push(folders.has(fd) ? 'sync folder' : 'sync file');
+      return realSync(fd);
+    });
+    try {
+      recordOne(tracker());
+    } finally {
+      open.mockRestore();
+      rename.mockRestore();
+      sync.mockRestore();
+    }
+    expect(order).toEqual(['sync file', 'rename', 'sync folder']);
+  });
+
+  it('a folder that cannot be synced is logged, not thrown: the write itself succeeded', () => {
+    const nodeFs = jest.requireActual<typeof import('fs')>('fs');
+    const realOpen = nodeFs.openSync;
+    const open = jest.spyOn(nodeFs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === path.dirname(file)) throw Object.assign(new Error('EISDIR: not allowed'), { code: 'EISDIR' });
+      return (realOpen as (...a: unknown[]) => number)(p, ...rest);
+    }) as never);
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      expect(() => recordOne(tracker())).not.toThrow();
+      if (process.platform !== 'win32') {
+        expect(warn.mock.calls.some(([m]) => String(m).includes('could not sync the folder'))).toBe(true);
+      }
+    } finally {
+      open.mockRestore();
+      warn.mockRestore();
+    }
+    expect(tracker().get(TX1)).toBeDefined();
+  });
+
+  it('a recorded time later than the time of loading is read as the time of loading', () => {
+    recordOne(tracker('mainnet', () => 9e15));
+    let now = 1_000_000;
+    const again = tracker('mainnet', () => now);
+    expect(again.get(TX1)!.submittedAt).toBe(now);
+    // so it is not offered as recent for ever: one block time later, with the node listing
+    // its input as unspent, its outputs are not offered
+    now += 120_000;
+    expect(again.available([input], ME)).toEqual([]);
+  });
+
+  it('a refused mark is kept across a restart, and cleared again', () => {
+    const t = tracker();
+    recordOne(t);
+    t.markRefused(TX1, true);
+    const again = tracker();
+    expect(again.get(TX1)!.refused).toBe(true);
+    // while refused, its outputs are not offered; its inputs stay hidden
+    expect(again.available([], ME)).toEqual([]);
+    expect(again.isSpent(input.boxId)).toBe(true);
+    again.markRefused(TX1, false);
+    expect(tracker().get(TX1)!.refused).toBeUndefined();
+    expect(
+      tracker()
+        .available([], ME)
+        .map((b) => b.boxId),
+    ).toEqual([change.boxId]);
+  });
+
+  it('failed ids are kept across a restart with their reason, and only the newest are kept', () => {
+    const t = tracker();
+    recordOne(t);
+    t.releaseFailed(TX1, 'Input x was spent by transaction y');
+    const again = tracker();
+    expect(again.get(TX1)).toBeUndefined();
+    expect(again.failedReason(TX1)!.reason).toBe('Input x was spent by transaction y');
+
+    // a list longer than the bound: the oldest are dropped, and the next write keeps the bound
+    const id = (i: number) => i.toString(16).padStart(64, '0');
+    const body = JSON.parse(fs.readFileSync(file, 'utf8'));
+    body.failed = Array.from({ length: FAILED_KEPT + 1 }, (_, i) => ({ txId: id(i), reason: 'gone', at: i }));
+    fs.writeFileSync(file, JSON.stringify(body));
+    const long = tracker();
+    expect(long.failedReason(id(0))).toBeUndefined();
+    expect(long.failedReason(id(1))).toBeDefined();
+    expect(long.failedReason(id(FAILED_KEPT))).toBeDefined();
+    long.record(TX2, [input.boxId], [], '{}');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).failed).toHaveLength(FAILED_KEPT);
+  });
+
+  it('a file written before failed ids were kept loads as before', () => {
+    const at = Date.now();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        format: 'ergo-pending-transactions',
+        version: 1,
+        network: 'mainnet',
+        transactions: [
+          { txId: TX1, inputBoxIds: [input.boxId], fixedInputs: [], outputs: [], json: signedJson, submittedAt: at },
+        ],
+      }),
+    );
+    const t = tracker();
+    expect(t.get(TX1)).toBeDefined();
+    expect(t.failedReason(TX1)).toBeUndefined();
+    expect(fs.readdirSync(path.dirname(file))).toEqual([path.basename(file)]);
+  });
+
   it('a file that is there but cannot be opened stops start-up rather than starting without it', () => {
     fs.mkdirSync(file, { recursive: true }); // a folder where the file should be
     expect(() => tracker()).toThrow('Cannot open the pending-transaction file');
@@ -182,7 +314,19 @@ describe('pending transactions survive a restart', () => {
     for (const net of ['mainnet', 'testnet']) {
       const text = fs.readFileSync(path.join(__dirname, '../../../src/templates/chains/ergo', `${net}.yml`), 'utf8');
       expect(text).toMatch(new RegExp(`^pendingStateFile: db/ergo/${net}-pending\\.json$`, 'm'));
+      // and say that the file is one network's, in one process
+      expect(text).toContain('Each network\n# needs its own file');
+      expect(text).toContain('two Gateway\n# processes must not share one');
+      // and when an entry leaves, including the one refused when posted again
+      expect(text).toContain('one the node refuses\n# when posted again is kept and tried again later');
     }
+  });
+
+  it('the shipped compose file keeps the db folder, where the file is, across container upgrades', () => {
+    const compose = fs.readFileSync(path.join(__dirname, '../../../docker-compose.yml'), 'utf8');
+    const dockerfile = fs.readFileSync(path.join(__dirname, '../../../Dockerfile'), 'utf8');
+    expect(dockerfile).toMatch(/^WORKDIR \/home\/gateway$/m); // the folder pendingStateFile is relative to
+    expect(compose).toMatch(/^\s+- \.\/db:\/home\/gateway\/db$/m);
   });
 });
 

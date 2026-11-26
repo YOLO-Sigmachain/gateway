@@ -160,18 +160,28 @@ describe('whole-unit conversion at the edge', () => {
   });
 
   it('parseUnits expands a number JavaScript prints in exponent form, exactly', () => {
-    // each literal is printed by toString in exponent form: below 1e-6 and from 1e21 up
+    // each literal is printed by toString in exponent form: below 1e-6
     expect((4e-7).toString()).toBe('4e-7');
     expect(parseUnits(4e-7, 9)).toBe(400n);
     expect(parseUnits(1.5e-7, 8)).toBe(15n);
     expect(parseUnits(1.23456789012345e-7, 22)).toBe(1234567890123450n);
     expect(parseUnits(1e-9, 9)).toBe(1n);
-    expect((1e21).toString()).toBe('1e+21');
-    expect(parseUnits(1e21, 0)).toBe(10n ** 21n);
-    expect(parseUnits(1.2345e25, 2)).toBe(12345n * 10n ** 23n);
-    // whole numbers whose only extra digits are trailing zeros are exact too
+    // whole numbers up to the largest exact integer are read exactly, written either way
     expect(parseUnits(1e15, 0)).toBe(10n ** 15n);
+    expect(parseUnits(JSON.parse('1e15'), 0)).toBe(10n ** 15n);
     expect(parseUnits(1234567890123450, 0)).toBe(1234567890123450n);
+    expect(parseUnits(Number.MAX_SAFE_INTEGER, 0)).toBe(9007199254740991n);
+  });
+
+  it('parseUnits refuses a whole number above the largest exact integer: its last digits are not known', () => {
+    // each of these reads back as a double whose text differs from what the caller wrote
+    expect(() => parseUnits(JSON.parse('1e21'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(JSON.parse('100000000000000001'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(JSON.parse('10000000000000001'), 0)).toThrow('send it as a string');
+    expect(() => parseUnits(JSON.parse('1.2345e25'), 2)).toThrow('send it as a string');
+    expect(() => parseUnits(Number.MAX_SAFE_INTEGER + 1, 0)).toThrow('send it as a string');
+    // as strings they are exact
+    expect(parseUnits('100000000000000001', 0)).toBe(100000000000000001n);
   });
 
   it('parseUnits still refuses what a double cannot hold exactly, in either form', () => {

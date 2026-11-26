@@ -3,7 +3,7 @@
  * change address that is not the signer's, a node that answers with another id. Built with
  * real fleet, signed with real wasm, submitted to a node stand-in.
  */
-import { Ergo, ErgoSubmitOutcomeUnknownError } from '../../../src/chains/ergo/ergo';
+import { Ergo, ErgoNotSubmittedError, ErgoSubmitOutcomeUnknownError } from '../../../src/chains/ergo/ergo';
 import { FetchLike } from '../../../src/chains/ergo/ergo.node-client';
 import { ErgoSigner, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBuildError, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
@@ -142,6 +142,59 @@ describe('a submit whose answer is lost', () => {
     expect(ergo.pending.isSpent(big.boxId)).toBe(true);
   });
 
+  /** A send whose POST fails in transport with `thrown`; everything else answered. */
+  function failingTransport(thrown: () => unknown) {
+    const node = fakeNode((method, path) => {
+      if (method === 'GET' && path === '/info') return { body: infoBody() };
+      if (method === 'POST' && path.startsWith('/blockchain/box/unspent/byAddress'))
+        return { body: [nodeBoxJson(big), nodeBoxJson(small)] };
+      if (method === 'GET' && path === '/blocks/lastHeaders/10') return { body: HEADERS };
+      return undefined;
+    });
+    const fetch: FetchLike = async (input, init) => {
+      if (init?.method === 'POST' && input.endsWith('/transactions')) throw thrown();
+      return node.fetch(input, init);
+    };
+    const ergo = new Ergo('mainnet', { config: testConfig(), fetch });
+    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    return ergo;
+  }
+  const coded = (code: string) => Object.assign(new Error(`connect ${code} 127.0.0.1:9053`), { code });
+  const fetchFailed = (cause: unknown) => new TypeError('fetch failed', { cause });
+
+  it.each([
+    ['the connection is refused', () => fetchFailed(coded('ECONNREFUSED'))],
+    [
+      'every address tried refuses it',
+      () => fetchFailed(new AggregateError([coded('ECONNREFUSED'), coded('ECONNREFUSED')])),
+    ],
+    ["the node's name does not resolve", () => fetchFailed(coded('ENOTFOUND'))],
+    ['name resolution fails for now', () => fetchFailed(coded('EAI_AGAIN'))],
+  ])('%s at the first submit: not submitted, released, and not an unknown outcome', async (_name, thrown) => {
+    const ergo = failingTransport(thrown);
+    const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoNotSubmittedError);
+    expect(error).not.toBeInstanceOf(ErgoSubmitOutcomeUnknownError);
+    expect(error.message).toContain('was not submitted');
+    expect(ergo.pending.isSpent(big.boxId)).toBe(false);
+    expect(ergo.pending.get(error.txId)).toBeUndefined();
+  });
+
+  it.each([
+    ['a reset after connecting', () => fetchFailed(coded('ECONNRESET'))],
+    [
+      'one address refuses and another times out',
+      () => fetchFailed(new AggregateError([coded('ECONNREFUSED'), coded('ETIMEDOUT')])),
+    ],
+    ['a timeout', () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })],
+    ['an error with no code', () => fetchFailed(new Error('other side closed'))],
+  ])('%s at the first submit: still an unknown outcome, kept', async (_name, thrown) => {
+    const ergo = failingTransport(thrown);
+    const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoSubmitOutcomeUnknownError);
+    expect(ergo.pending.isSpent(big.boxId)).toBe(true);
+  });
+
   it('a 5xx is an unknown outcome too; a 4xx is a definite rejection and releases', async () => {
     let status = 503;
     const { ergo } = setup({
@@ -163,12 +216,18 @@ describe('a submit whose answer is lost', () => {
 });
 
 describe('a transaction the node dropped', () => {
-  const dropped = (submit: (body: string) => FakeResponse, now?: () => number) =>
+  const dropped = (
+    submit: (body: string) => FakeResponse,
+    now?: () => number,
+    mempool: (p: string) => FakeResponse | undefined = () => undefined,
+  ) =>
     setup({
       listing: () => [nodeBoxJson(big)], // the node lists the input as unspent again
       submit,
       now,
       other: (p) => {
+        const held = mempool(p);
+        if (held) return held;
         if (p.startsWith('/blockchain/transaction/byId/') || p.startsWith('/transactions/unconfirmed/'))
           return notFound();
         if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
@@ -188,19 +247,69 @@ describe('a transaction the node dropped', () => {
     expect(ergo.pending.isSpent(big.boxId)).toBe(true);
   });
 
-  it('a rejected rebroadcast is FAILED with the node text, and the input is spendable again', async () => {
+  /** Accepted at the first submit, refused with `detail` on every post after it. */
+  const refusedAfterFirst = (detail: string) => {
     let n = 0;
-    const { ergo } = dropped((body) =>
-      n++ === 0
-        ? acceptWithId(body)
-        : { status: 400, body: { error: 400, reason: 'bad.request', detail: 'input box not found' } },
-    );
+    return (body: string): FakeResponse =>
+      n++ === 0 ? acceptWithId(body) : { status: 400, body: { error: 400, reason: 'bad.request', detail } };
+  };
+
+  it('refused when posted again: NOT_FOUND with the node text in the note, kept, and its outputs not offered', async () => {
+    const { ergo } = dropped(refusedAfterFirst('input box not found'));
     const txId = await ergo.transfer(ME, OTHER, ERG);
     const r = await ergo.pollTransaction(txId);
-    expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
-    expect(r.error).toBe('input box not found');
-    expect(ergo.pending.get(txId)).toBeUndefined();
-    expect((await ergo.getSpendableBoxes(ME)).map((b) => b.boxId)).toEqual([big.boxId]);
+    expect(r.txStatus).toBe(TransactionStatusCode.NOT_FOUND);
+    expect(r.error).toBeNull();
+    expect(r.txData).toEqual({ note: expect.stringContaining('input box not found') });
+    expect(ergo.pending.get(txId)!.refused).toBe(true);
+    // its input stays hidden, and its change is not offered while it is refused
+    expect(await ergo.getSpendableBoxes(ME)).toEqual([]);
+  });
+
+  // The node answers 4xx for transactions that are still valid and may confirm from
+  // another node's mempool; none of these is proof that it can no longer confirm.
+  it.each([
+    ['a competing spend in the mempool', 'Double spending attempt', 'spent', TransactionStatusCode.PENDING],
+    [
+      'one it already holds',
+      'Pool can not accept transaction, it is already in the mempool',
+      'held',
+      TransactionStatusCode.PENDING,
+    ],
+    [
+      'a full mempool',
+      'Transaction pays less than any other in the pool being full',
+      'none',
+      TransactionStatusCode.NOT_FOUND,
+    ],
+    ['a fee below its own minimum', 'Min fee not met', 'none', TransactionStatusCode.NOT_FOUND],
+  ])('refused when posted again for %s: never FAILED, and kept', async (_name, detail, mempool, status) => {
+    let txId = '';
+    let posts = 0;
+    const submit = refusedAfterFirst(detail);
+    const { ergo } = dropped(
+      (body) => {
+        posts += 1;
+        return submit(body);
+      },
+      undefined,
+      (p) => {
+        if (mempool === 'spent' && p === `/transactions/unconfirmed/inputs/byBoxId/${big.boxId}`)
+          return { body: { boxId: big.boxId } };
+        // held: the node shows it in the mempool once it has been posted again
+        if (mempool === 'held' && posts > 1 && p === `/transactions/unconfirmed/byTransactionId/${txId}`)
+          return { body: { id: txId, inputs: [{ boxId: big.boxId }], outputs: [] } };
+        return undefined;
+      },
+    );
+    txId = await ergo.transfer(ME, OTHER, ERG);
+    const r = await ergo.pollTransaction(txId);
+    expect(r.txStatus).not.toBe(TransactionStatusCode.FAILED);
+    expect(r.txStatus).toBe(status);
+    expect(r.error).toBeNull();
+    expect(r.txData).toEqual({ note: expect.stringContaining(detail) });
+    expect(ergo.pending.get(txId)).toBeDefined();
+    expect(ergo.pending.isSpent(big.boxId)).toBe(true);
   });
 
   it('after a block time, no phantom change is offered and balances do not count it', async () => {

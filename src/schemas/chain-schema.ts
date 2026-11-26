@@ -249,7 +249,7 @@ export const ChainQuoteSwapResponseSchema = Type.Object(
 export type ChainQuoteSwapResponseType = Static<typeof ChainQuoteSwapResponseSchema>;
 
 // Chain-level execute-swap response
-export const ChainExecuteSwapResponseSchema = Type.Object(
+const ExecuteSwapResponseFields = Type.Object(
   {
     signature: Type.String({
       description: 'Transaction signature/hash',
@@ -299,6 +299,20 @@ export const ChainExecuteSwapResponseSchema = Type.Object(
         },
         { $id: 'ChainExecuteSwapResponseData' },
       ),
+    ),
+  },
+  { $comment: 'The fields of ChainExecuteSwapResponse; pendingData is added to them below' },
+);
+export const ChainExecuteSwapResponseSchema = Type.Object(
+  {
+    ...ExecuteSwapResponseFields.properties,
+    pendingData: Type.Optional(
+      Type.Object(ExecuteSwapResponseFields.properties.data.properties, {
+        description:
+          'Present only with status PENDING, from a connector whose transaction fixes its amounts. ' +
+          'The same fields as data: what the transaction moves if it confirms. ' +
+          'Confirmation is reported only by poll.',
+      }),
     ),
   },
   { $id: 'ChainExecuteSwapResponse' },

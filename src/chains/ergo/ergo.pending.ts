@@ -10,15 +10,27 @@
  * It also keeps the outputs of our pending transactions, so the next transaction can spend
  * the unconfirmed change of the previous one (chained transactions).
  *
- * Entries leave only on evidence: when poll sees the transaction confirmed, or shown to
- * have failed (an input spent by another transaction, or rejected by the node). An Ergo
- * transaction does not expire; one the node dropped can still confirm while its inputs are
- * unspent, so it is never forgotten for its age alone. Once an entry is older than the
- * per-network timeout (pendingTxTimeoutBlocks x blockTimeSeconds) it is due for a check
- * against the node (see `Ergo`), at most once per `recheckMs`.
+ * An Ergo transaction does not expire; one the node dropped can still confirm while its
+ * inputs are unspent, so it is never forgotten for its age alone. An entry leaves only:
+ * - when it is confirmed;
+ * - when it is shown failed: one of its inputs is spent by a different transaction that
+ *   has at least the network's `confirmations`, or it spends an output of a transaction
+ *   that failed that way. Such ids are remembered (newest 1,000), so poll keeps answering
+ *   FAILED for them;
+ * - once it is older than the per-network timeout (pendingTxTimeoutBlocks x
+ *   blockTimeSeconds), when one of its inputs is known neither to the node's index nor as
+ *   an output of a transaction tracked here;
+ * - when the node refuses it at its first submit (nothing was taken).
+ * A transaction the node refuses when it is posted again is kept, marked refused, and
+ * posted again later: the node refuses a valid transaction too (a competing spend in its
+ * mempool, a full mempool, one it already holds, a fee below its own minimum). While it is
+ * marked refused its outputs are not offered; its inputs stay hidden.
+ *
+ * Once an entry is older than the timeout it is due for a check against the node (see
+ * `Ergo`), at most once per `recheckMs`.
  *
  * A transaction is recorded before it is posted, so a submit whose answer is lost still
- * hides its inputs. Its signed JSON is kept so poll can post it again if the node drops it.
+ * hides its inputs. Its signed JSON is kept so it can be posted again if the node drops it.
  * With a file (`ErgoPendingFile`), every change is written to disk and the list is read
  * back at start, so a restart forgets nothing either.
  */
@@ -45,7 +57,23 @@ export interface PendingTransaction {
   /** The signed transaction as submitted, for a rebroadcast. */
   json: string;
   submittedAt: number;
+  /**
+   * The node refused it the last time it was posted again. Its outputs are not offered
+   * until a later post is accepted, or it is seen in a mempool or confirmed.
+   */
+  refused?: boolean;
 }
+
+/** A transaction released because it can never confirm, and why. */
+export interface FailedTransaction {
+  txId: string;
+  reason: string;
+  /** When it was released (ms). */
+  at: number;
+}
+
+/** How many failed transaction ids are remembered (the newest). */
+export const FAILED_KEPT = 1000;
 
 export interface PendingTrackerOptions {
   /** For this long after recording, outputs are offered even while the node lists every input as unspent. */
@@ -60,6 +88,8 @@ export class ErgoPendingTracker {
   private readonly txs = new Map<string, PendingTransaction>();
   private readonly spentBy = new Map<string, string>();
   private readonly lastChecked = new Map<string, number>();
+  /** Failed ids, oldest first. */
+  private readonly failed = new Map<string, FailedTransaction>();
   private readonly timeoutMs: number;
   private readonly now: () => number;
   private readonly recentMs: number;
@@ -80,7 +110,9 @@ export class ErgoPendingTracker {
     this.recentMs = options.recentMs ?? 0;
     this.recheckMs = options.recheckMs ?? (this.recentMs > 0 ? this.recentMs : timeoutMs);
     this.file = options.file;
-    for (const tx of this.file?.load() ?? []) this.insert(tx);
+    const stored = this.file?.load(this.now());
+    for (const tx of stored?.transactions ?? []) this.insert(tx);
+    for (const f of stored?.failed ?? []) this.rememberFailed(f);
   }
 
   /**
@@ -110,7 +142,7 @@ export class ErgoPendingTracker {
       return;
     }
     try {
-      this.file?.save([...this.txs.values()]);
+      this.write();
     } catch (error) {
       this.remove(txId);
       throw new Error(
@@ -120,9 +152,57 @@ export class ErgoPendingTracker {
     }
   }
 
-  /** Forget a transaction: confirmed (the node's view now has it) or failed. */
+  /** Forget a transaction: confirmed (the node's view now has it), or no longer checkable. */
   release(txId: string): void {
     if (this.remove(txId)) this.persist();
+  }
+
+  /**
+   * Release a transaction shown to be unable to confirm, and with it every tracked
+   * transaction that spends one of its outputs, and theirs in turn: those inputs will never
+   * exist. Each id released is remembered with its reason. Returns the ids released.
+   */
+  releaseFailed(txId: string, reason: string): string[] {
+    const released: string[] = [];
+    const queue: Array<{ txId: string; reason: string }> = [{ txId, reason }];
+    while (queue.length > 0) {
+      const next = queue.shift()!;
+      const tx = this.txs.get(next.txId);
+      if (!tx) continue;
+      this.remove(next.txId);
+      this.rememberFailed({ txId: next.txId, reason: next.reason, at: this.now() });
+      released.push(next.txId);
+      const outputs = new Set(tx.outputs.map((o) => o.boxId));
+      for (const child of this.txs.values()) {
+        const boxId = child.inputBoxIds.find((id) => outputs.has(id));
+        if (boxId === undefined || queue.some((q) => q.txId === child.txId)) continue;
+        queue.push({
+          txId: child.txId,
+          reason:
+            `Input ${boxId} is an output of transaction ${next.txId}, which can no longer confirm; ` +
+            'this transaction can no longer confirm either',
+        });
+      }
+    }
+    if (released.length > 0) this.persist();
+    return released;
+  }
+
+  /** A transaction released by `releaseFailed`, if it is among the ones remembered. */
+  failedReason(txId: string): FailedTransaction | undefined {
+    return this.failed.get(txId);
+  }
+
+  /**
+   * Mark or clear "the node refused it when it was posted again". A refused transaction's
+   * outputs are not offered; its inputs stay hidden.
+   */
+  markRefused(txId: string, refused: boolean): void {
+    const tx = this.txs.get(txId);
+    if (!tx || Boolean(tx.refused) === refused) return;
+    if (refused) tx.refused = true;
+    else delete tx.refused;
+    this.persist();
   }
 
   get(txId: string): PendingTransaction | undefined {
@@ -206,6 +286,7 @@ export class ErgoPendingTracker {
       const tx = this.txs.get(txId);
       if (!tx || depth > this.txs.size) return false;
       memo.set(txId, false); // a cycle cannot happen (ids are hashes); guard anyway
+      if (tx.refused) return false; // the node refused it when posted again: no outputs to offer
       let ok = true;
       let nodeSeesASpend = false;
       const fixed = new Set(tx.fixedInputs.map((f) => f.boxId));
@@ -248,11 +329,23 @@ export class ErgoPendingTracker {
     return true;
   }
 
+  /** Remember a failed id as the newest, dropping the oldest beyond FAILED_KEPT. */
+  private rememberFailed(entry: FailedTransaction): void {
+    this.failed.delete(entry.txId);
+    this.failed.set(entry.txId, { ...entry });
+    while (this.failed.size > FAILED_KEPT) this.failed.delete(this.failed.keys().next().value!);
+  }
+
+  /** Write the list and the failed ids; throws if it cannot. */
+  private write(): void {
+    this.file?.save([...this.txs.values()], [...this.failed.values()]);
+  }
+
   /** Write the list; a failure is logged (memory stays right, the file catches up on the next write). */
   private persist(): void {
     if (!this.file) return;
     try {
-      this.file.save([...this.txs.values()]);
+      this.write();
     } catch (error) {
       logger.error(
         `Could not write the pending-transaction file ${this.file.file}: ` +

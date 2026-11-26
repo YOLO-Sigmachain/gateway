@@ -19,9 +19,10 @@
  *   since a second transaction could trade twice. A TRANSACTION_TIMEOUT error carries
  *   the transaction id and says to poll it.
  *
- * The response is the submitted transaction as PENDING, with `data` holding the amounts
- * its transaction fixes (what it moves if it confirms). Whether it confirmed is reported
- * only by poll. No order box is ever placed, before or after.
+ * The response is the submitted transaction as PENDING, with `pendingData` holding the
+ * amounts its transaction fixes (what it moves if it confirms), in the fields of a
+ * confirmed swap's `data`. It carries no `data`: that means confirmed. Whether it
+ * confirmed is reported only by poll. No order box is ever placed, before or after.
  */
 import { ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
@@ -92,7 +93,8 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
 
 /**
  * The amounts a submitted swap moves, all fixed in its transaction: if it confirms, it
- * moves exactly these. In the shape of a confirmed swap's `data`; the answer stays PENDING.
+ * moves exactly these. In the shape of a confirmed swap's `data`, sent as `pendingData`;
+ * the answer stays PENDING.
  */
 export function fixedSwapData(
   plan: SwapPlan,
@@ -186,19 +188,19 @@ export async function executeSwap(
       try {
         const current = plan;
         // worked out before signing, so nothing after the submit can fail
-        let data: ReturnType<typeof fixedSwapData> | undefined;
+        let pendingData: ReturnType<typeof fixedSwapData> | undefined;
         const { txId } = await ergo.sendTransaction(
           { changeAddress: wallet.address, inputs: [{ box: current.pool.box }], outputs: [current.successor] },
           wallet.signer,
           {
             verify: (built) => {
               verifySwapTransaction(current, built);
-              data = fixedSwapData(current, built, ergo.config.nativeDecimals, appliedSlippagePct);
+              pendingData = fixedSwapData(current, built, ergo.config.nativeDecimals, appliedSlippagePct);
             },
           },
         );
         logger.info(`ergodex: submitted ${side} on ${describeRoute(current)} as ${txId}`);
-        return { signature: txId, status: TransactionStatusCode.PENDING, data };
+        return { signature: txId, status: TransactionStatusCode.PENDING, pendingData };
       } catch (error) {
         if (error instanceof ErgoSubmitOutcomeUnknownError) {
           // Never rebuild here: the first transaction may still execute.

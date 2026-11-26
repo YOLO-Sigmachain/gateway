@@ -116,11 +116,12 @@ describe('ergodex through /trading/amm', () => {
     const body = JSON.parse(res.body);
     expect(posts()).toBe(1);
     const tx = JSON.parse(state.posted[0]);
-    // still PENDING: the amounts are what it moves if it confirms, not a report that it did
+    // still PENDING: the amounts are what it moves if it confirms, under pendingData. No
+    // `data`, which the shared schema and its clients read as confirmed.
     expect(body).toEqual({
       signature: tx.id,
       status: 0,
-      data: {
+      pendingData: {
         tokenIn: NATIVE_TOKEN_ID,
         tokenOut: RSN,
         amountIn: '1',
@@ -129,9 +130,9 @@ describe('ergodex through /trading/amm', () => {
         baseTokenBalanceChange: '-1.0011',
         quoteTokenBalanceChange: '23.693',
         slippagePct: '1',
-        poolAddress: NFT,
       },
     });
+    expect(body).not.toHaveProperty('data');
     // the same amounts, read from the posted transaction itself
     const changeAssets: Array<{ tokenId: string; amount: number }> = tx.outputs
       .slice(1, -1)
@@ -177,7 +178,7 @@ describe('ergodex through /trading/amm', () => {
     expect(posts()).toBe(2);
     const second = JSON.parse(state.posted[1]);
     expect(second.inputs[0].boxId).toBe(successor.boxId);
-    expect(JSON.parse(res.body)).toMatchObject({ signature: second.id, status: 0, data: { amountIn: '1' } });
+    expect(JSON.parse(res.body)).toMatchObject({ signature: second.id, status: 0, pendingData: { amountIn: '1' } });
   });
 
   it('pool spent first and moved past the bound: a retryable 409, nothing more posted', async () => {
@@ -220,6 +221,17 @@ describe('ergodex through /trading/amm', () => {
     expect(body.message).toContain('do not resubmit');
     // still tracked: its inputs are not offered to the next build
     expect(dex.ergo.pending.isSpent(RSN_POOL.boxId)).toBe(true);
+  });
+
+  it('the connection to the node is refused: a 503 that says nothing was submitted, and nothing tracked', async () => {
+    state.submit = () => 'refused';
+    const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(posts()).toBe(1);
+    expect(res.statusCode).toBe(503);
+    const body = JSON.parse(res.body);
+    expect(body.code).not.toBe('TRANSACTION_TIMEOUT');
+    expect(body.message).toContain('was not submitted');
+    expect(dex.ergo.pending.isSpent(RSN_POOL.boxId)).toBe(false);
   });
 
   it('a 5xx from the node is an unknown outcome too', async () => {
@@ -377,15 +389,33 @@ describe('ergodex through /trading/amm', () => {
   });
 
   it('a limit JavaScript prints in exponent form is read exactly, not refused', async () => {
-    // 1e21 RSN is printed "1e+21"; as a BUY limit it binds nothing here and the swap goes through
+    // 4e-7 ERG is printed "4e-7"; as a BUY limit on ERG in it is read as 400 nanoERG exactly,
+    // so it binds, and the answer names that bound, not an unreadable amount
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ baseToken: 'RSN', quoteToken: 'ERG', side: 'BUY', amount: 1, maxAmountIn: 4e-7 }),
+    });
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).message).toContain('at most 0.0000004 ERG in');
+    expect(posts()).toBe(0);
+  });
+
+  it('a whole-number limit above the largest exact integer is refused, with a pointer to send a string', async () => {
     state.wallet = [walletBox(5n * ERG, [{ tokenId: RSN, amount: 100000n }])];
     const res = await app.inject({
       method: 'POST',
       url: '/trading/amm/execute-swap',
-      payload: execBody({ side: 'BUY', amount: 1, maxAmountIn: 1e21 }),
+      headers: { 'content-type': 'application/json' },
+      // written as the caller sent it: JSON reads it as the double 1e21
+      payload: JSON.stringify(execBody({ side: 'BUY', amount: 1, maxAmountIn: 0 })).replace(
+        '"maxAmountIn":0',
+        '"maxAmountIn":1e21',
+      ),
     });
-    expect(res.statusCode).toBe(200);
-    expect(posts()).toBe(1);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).message).toContain('send it as a string');
+    expect(posts()).toBe(0);
   });
 
   describe('no connector named', () => {

@@ -18,8 +18,9 @@ export class ErgoNodeError extends Error {
   /** The node's `detail` field: for a rejected transaction, why it was rejected. */
   readonly detail?: string;
 
-  constructor(status: number, message: string, reason?: string, detail?: string) {
-    super(message);
+  /** `options.cause`: for status 0, the transport error as the fetch threw it. */
+  constructor(status: number, message: string, reason?: string, detail?: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'ErgoNodeError';
     this.status = status;
     this.reason = reason;
@@ -154,7 +155,9 @@ export class ErgoNodeClient {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new ErgoNodeError(0, `Ergo node unreachable (${method} ${path}): ${message}`);
+      throw new ErgoNodeError(0, `Ergo node unreachable (${method} ${path}): ${message}`, undefined, undefined, {
+        cause: error,
+      });
     }
 
     const text = await response.text();

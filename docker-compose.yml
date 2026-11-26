@@ -16,6 +16,7 @@ services:
       - ./conf:/home/gateway/conf
       - ./logs:/home/gateway/logs
       - ./certs:/home/gateway/certs
+      - ./db:/home/gateway/db
     environment:
       # The container binds all interfaces internally; the host only publishes on loopback above.
       - GATEWAY_BIND_ADDRESS=0.0.0.0

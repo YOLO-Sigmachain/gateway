@@ -24,13 +24,20 @@ tokenListSource: tokens/ergo/testnet.json
 
 # Average block interval in seconds. A pending transaction older than
 # pendingTxTimeoutBlocks blocks of this length is checked against the node when boxes are
-# next selected; it is forgotten only on evidence (confirmed, or an input spent by another
-# transaction), never for its age while its inputs are unspent.
+# next selected, at most once per block. It is never forgotten for its age while its inputs
+# are unspent. It leaves only when it is confirmed; when it is shown failed (an input spent
+# by another transaction that has `confirmations` confirmations, or it spends an output of
+# a transaction that failed so); once past that age, when an input is known neither to the
+# node's index nor as an output of a transaction Gateway tracks; or when the node refuses
+# it at its first submit. One the node has dropped is posted again; one the node refuses
+# when posted again is kept and tried again later.
 blockTimeSeconds: 120
 pendingTxTimeoutBlocks: 15
 
 # File that keeps this network's pending transactions across restarts, relative to the
-# Gateway folder. It holds signed transactions and box ids only, never a key.
+# Gateway folder. It holds signed transactions and box ids only, never a key. Each network
+# needs its own file (Gateway does not start on another network's file), and two Gateway
+# processes must not share one: each would overwrite the other's entries.
 pendingStateFile: db/ergo/testnet-pending.json
 
 # Ergo transactions carry no expiry: a signed transaction stays valid until one of its

@@ -765,6 +765,63 @@
           },
           "data": {
             "$ref": "#/components/schemas/ChainExecuteSwapResponseData"
+          },
+          "pendingData": {
+            "description": "Present only with status PENDING, from a connector whose transaction fixes its amounts. The same fields as data: what the transaction moves if it confirms. Confirmation is reported only by poll.",
+            "type": "object",
+            "properties": {
+              "tokenIn": {
+                "description": "Address of the token swapped from",
+                "type": "string"
+              },
+              "tokenOut": {
+                "description": "Address of the token swapped to",
+                "type": "string"
+              },
+              "amountIn": {
+                "format": "decimal",
+                "description": "Actual amount of tokenIn swapped",
+                "type": "string"
+              },
+              "amountOut": {
+                "format": "decimal",
+                "description": "Actual amount of tokenOut received",
+                "type": "string"
+              },
+              "fee": {
+                "format": "decimal",
+                "description": "Transaction fee paid",
+                "type": "string"
+              },
+              "baseTokenBalanceChange": {
+                "format": "decimal",
+                "description": "Change in base token balance (negative for decrease)",
+                "type": "string"
+              },
+              "quoteTokenBalanceChange": {
+                "format": "decimal",
+                "description": "Change in quote token balance (negative for decrease)",
+                "type": "string"
+              },
+              "slippagePct": {
+                "format": "decimal",
+                "description": "Slippage tolerance percentage actually applied to the swap",
+                "type": "string"
+              },
+              "poolAddress": {
+                "description": "Pool the swap executed against. Set by the pool-scoped routes (/trading/clmm, /trading/amm), which resolve exactly one pool; a router picks its own path across pools and leaves this unset. Without it a settled fill cannot be reconciled to a venue without refetching the transaction.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tokenIn",
+              "tokenOut",
+              "amountIn",
+              "amountOut",
+              "fee",
+              "baseTokenBalanceChange",
+              "quoteTokenBalanceChange"
+            ]
           }
         },
         "required": [
