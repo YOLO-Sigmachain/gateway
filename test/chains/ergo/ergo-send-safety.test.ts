@@ -65,7 +65,12 @@ function setup(opts: {
     return opts.other ? opts.other(path) : undefined;
   });
   const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch, now: opts.now });
-  jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+  // a fresh signer per load, as the chain layer gives one per request and wipes it after
+  jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+    address: ME,
+    ergoTree: ME_TREE,
+    signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+  }));
   return { ergo, posted, node };
 }
 
@@ -97,6 +102,33 @@ describe('two sends at once from one wallet', () => {
     const [first, second] = await Promise.allSettled([ergo.transfer(ME, OTHER, ERG), ergo.transfer(ME, OTHER, ERG)]);
     expect(first.status).toBe('rejected');
     expect(second.status).toBe('fulfilled');
+  });
+});
+
+describe('the key loaded for a transfer', () => {
+  it('is wiped once the send has settled, whether the node takes it or refuses it', async () => {
+    let refuse = false;
+    const { ergo } = setup({
+      listing: () => [nodeBoxJson(big), nodeBoxJson(small)],
+      submit: (body) =>
+        refuse ? { status: 400, body: { error: 400, reason: 'bad.request', detail: 'nope' } } : acceptWithId(body),
+    });
+    const loaded: WasmErgoSigner[] = [];
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => {
+      const fresh = WasmErgoSigner.fromMnemonic(MNEMONIC_A);
+      jest.spyOn(fresh, 'dispose');
+      loaded.push(fresh);
+      return { address: ME, ergoTree: ME_TREE, signer: fresh };
+    });
+    await ergo.transfer(ME, OTHER, ERG);
+    refuse = true;
+    await expect(ergo.transfer(ME, OTHER, ERG)).rejects.toBeInstanceOf(ErgoTransactionRejectedError);
+    // refused before signing: nothing to send that much
+    await expect(ergo.transfer(ME, OTHER, 1000n * ERG)).rejects.toThrow();
+    expect(loaded.map((l) => (l.dispose as jest.Mock).mock.calls.length)).toEqual([1, 1, 1]);
+    await expect(loaded[0].signTransaction({} as never, [], [], { headers: HEADERS as never })).rejects.toThrow(
+      /disposed/,
+    );
   });
 });
 
@@ -144,7 +176,12 @@ describe('a submit whose answer is lost', () => {
       return node.fetch(input, init);
     };
     const ergo = new Ergo('mainnet', { config: testConfig(), fetch });
-    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    // a fresh signer per load, as the chain layer gives one per request and wipes it after
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
     const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
     expect(error).toBeInstanceOf(ErgoSubmitOutcomeUnknownError);
     expect(error.status).toBe(0);
@@ -166,7 +203,12 @@ describe('a submit whose answer is lost', () => {
       return node.fetch(input, init);
     };
     const ergo = new Ergo('mainnet', { config: testConfig(), fetch });
-    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    // a fresh signer per load, as the chain layer gives one per request and wipes it after
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
     return ergo;
   }
   const coded = (code: string) => Object.assign(new Error(`connect ${code} 127.0.0.1:9053`), { code });
@@ -263,7 +305,12 @@ describe('a definite answer at the first submit is given only once its release i
       return node.fetch(input, init);
     };
     const ergo = new Ergo('mainnet', { config: testConfig({ pendingStateFile: file }), fetch });
-    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    // a fresh signer per load, as the chain layer gives one per request and wipes it after
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
     return { ergo, posted };
   }
 

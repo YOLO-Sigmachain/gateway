@@ -9,8 +9,15 @@ import { Eip12BoxCandidate, ErgoBox } from '../../../src/chains/ergo/ergo.types'
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
 import { blake2b256Hex, LithosDeployments } from '../../../src/connectors/ergodex/venues/lithos/lithos.deployment';
-import { decodeLong, encodeLong } from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
+import {
+  decodeLong,
+  encodeBigInt,
+  encodeCollLong,
+  encodeLong,
+  MAX_LONG,
+} from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
 import { LithosPool, LithosVenue } from '../../../src/connectors/ergodex/venues/lithos/lithos.venue';
+import { VenueRuleError } from '../../../src/connectors/ergodex/venues/venue';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
 
 import { ERG, makeBox, ME_TREE, n2tPool, newNodeState, NodeState, RSN_POOL, walletBox } from './ergodex-test-helpers';
@@ -25,14 +32,18 @@ import {
   LIT_RSN_VAULT,
   LIT_VAULT,
   lithosConfig,
+  L_TIP,
   lithosDexConfig,
   makeLithosDex,
   putPools,
+  setIndexedHeight,
   shippedMainnet,
   shippedTemplate,
 } from './lithos-test-helpers';
 
 const venue = new LithosVenue(lithosConfig([LIT_NFT, LIT_RSN_NFT]));
+/** What selling 1 RSN (1000 units) into the captured LIT:RSN pool gives, in LIT units. */
+const TRADE_FEE_NORMAL_OUT = 9877515028n;
 
 function candidate(
   spec: ReturnType<LithosVenue['successor']>,
@@ -84,6 +95,40 @@ describe('reading LithosDex pool boxes', () => {
     const { R8: _r8, ...withoutR8 } = LIT_POOL.additionalRegisters;
     const noR8 = makeBox({ ...LIT_POOL, registers: withoutR8 });
     expect(venue.parsePool(noR8)).toBeNull();
+  });
+
+  it('a box whose registers the contract arithmetic cannot hold is not a pool: pending fees below zero, a supply beyond a Long', () => {
+    const withRegs = (over: Record<string, string>) =>
+      makeBox({ ...LIT_POOL, registers: { ...LIT_POOL.additionalRegisters, ...over } });
+    // a negative pending fee would show the pool deeper than it is
+    expect(venue.parsePool(withRegs({ R6: encodeCollLong([-(10n ** 15n), 0n]) }))).toBeNull();
+    expect(venue.parsePool(withRegs({ R6: encodeCollLong([0n, -1n]) }))).toBeNull();
+    expect(venue.parsePool(withRegs({ R6: encodeCollLong([0n, 0n]) }))).not.toBeNull();
+    // liquidity 0 gives a supply of exactly the largest Long; below 0 the supply leaves the Long range
+    expect((venue.parsePool(withRegs({ R4: encodeLong(0n) })) as LithosPool).lithos.supply).toBe(MAX_LONG);
+    expect(venue.parsePool(withRegs({ R4: encodeLong(-1n) }))).toBeNull();
+    expect(venue.parsePool(withRegs({ R4: encodeLong(-5n) }))).toBeNull();
+  });
+
+  it('a swap whose fee accumulator would pass 256 bits is refused as a pool rule (a 400), not a crash', () => {
+    const edge = makeBox({
+      ...LIT_POOL,
+      registers: { ...LIT_POOL.additionalRegisters, R7: encodeBigInt(2n ** 255n - 1n) },
+    });
+    const pool = venue.parsePool(edge) as LithosPool;
+    const swap = { input: 'x' as const, amountIn: ERG, amountOut: venue.amountOut(pool, 'x', ERG) };
+    expect(() => venue.successor(pool, swap)).toThrow(VenueRuleError);
+    expect(() => venue.successor(pool, swap)).toThrow(/registers cannot hold the state after this swap/);
+    const dex = makeLithosDex(newNodeState());
+    const erg = { tokenId: null, symbol: 'ERG', decimals: 9 };
+    const lit = { tokenId: LIT_POOL.assets[1].tokenId, symbol: 'LIT', decimals: 9 };
+    let status: number | undefined;
+    try {
+      dex.plan({ pool, venue, source: 'confirmed' }, erg, lit, 'SELL', ERG);
+    } catch (error) {
+      status = (error as { statusCode?: number }).statusCode;
+    }
+    expect(status).toBe(400);
   });
 
   it('the swap input carries context variable 0 = the swap operation byte', () => {
@@ -156,8 +201,11 @@ describe('the deployment check', () => {
       provisionToken: p.lithos.provisionToken.tokenId,
     };
   };
-  const node = (boxes: Record<string, ErgoBox[]>) => ({
+  // the index is caught up unless a lower indexed height is given
+  const node = (boxes: Record<string, ErgoBox[]>, indexedHeight = 1000) => ({
     getUnspentBoxesByTokenId: jest.fn(async (id: string) => boxes[id] ?? []),
+    getInfo: jest.fn(async () => ({ fullHeight: 1000 })),
+    getIndexedHeight: jest.fn(async () => ({ indexedHeight, fullHeight: 1000 })),
   });
 
   it.each([
@@ -212,6 +260,27 @@ describe('the deployment check', () => {
       /2 confirmed unspent boxes carry its vault NFT/,
     );
     expect(await deployments.check(LIT_POOL.ergoTree, i, node({}))).toMatch(/0 confirmed unspent boxes/);
+  });
+
+  it('an index behind the chain is a 503 to retry, not a failed check, when it lists no vault or two', async () => {
+    const i = ids(LIT_POOL);
+    const second = makeBox({ ...LIT_VAULT, registers: LIT_VAULT.additionalRegisters, transactionId: 'ee'.repeat(32) });
+    for (const listed of [[], [LIT_VAULT, second]]) {
+      const lagging = node({ [i.vaultNft]: listed }, 999);
+      const error = await deployments.check(LIT_POOL.ergoTree, i, lagging).then(
+        () => null,
+        (e) => e,
+      );
+      expect(error?.statusCode).toBe(503);
+      expect(error.message).toMatch(/index has not caught up with the chain \(indexed to 999, chain at 1000\).*retry/);
+      expect(error.message).not.toMatch(/fails the deployment check/);
+    }
+    // with the index caught up, the same answers are a failed check
+    expect(await deployments.check(LIT_POOL.ergoTree, i, node({ [i.vaultNft]: [] }))).toMatch(/0 confirmed unspent/);
+    // one vault box: the index height is not read
+    const one = node({ [i.vaultNft]: [LIT_VAULT] }, 999);
+    expect(await deployments.check(LIT_POOL.ergoTree, i, one)).toBeNull();
+    expect(one.getIndexedHeight).not.toHaveBeenCalled();
   });
 
   it('refuses a vault NFT held at a wrong tree', async () => {
@@ -287,6 +356,19 @@ describe('the allowlist, the guards and pool choice', () => {
     await expect(dex.getFreshPool(LIT_NFT)).rejects.toThrow(/fails the deployment check/);
   });
 
+  it('a listed pool whose vault the lagging index lists twice is a 503 (retry), not a 400', async () => {
+    const second = makeBox({ ...LIT_VAULT, registers: LIT_VAULT.additionalRegisters, transactionId: 'ee'.repeat(32) });
+    state.pools.set(LIT_VAULT.assets[0].tokenId, [LIT_VAULT, second]);
+    setIndexedHeight(state, L_TIP - 1);
+    const dex = makeLithosDex(state, lithosDexConfig([LIT_NFT]));
+    const error = await dex.getFreshPool(LIT_NFT).then(
+      () => null,
+      (e) => e,
+    );
+    expect(error?.statusCode).toBe(503);
+    expect(error.message).toMatch(/index has not caught up/);
+  });
+
   it('the guardFailure of the connector names the lithos allowlist too', () => {
     const dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
     const pool = venue.parsePool(LIT_POOL)!;
@@ -311,6 +393,37 @@ describe('the allowlist, the guards and pool choice', () => {
     expect(dex.guardFailure(venue.parsePool(LIT_RSN_POOL)!)).toMatch(/1\.297%.*maxPoolFeePct 1\.29/);
     const looser = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT], { maxPoolFeePct: '1.3' }));
     expect(looser.guardFailure(venue.parsePool(LIT_RSN_POOL)!)).toBeNull();
+  });
+
+  it('a trade whose own fee is above the ceiling is refused: on LIT:RSN 2 and 20 RSN units pay 50.15% and 5.285%', () => {
+    const dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
+    const pool = venue.parsePool(LIT_RSN_POOL)!;
+    const rsn = { tokenId: LIT_RSN_POOL.assets[2].tokenId, symbol: 'RSN', decimals: 3 };
+    const lit = { tokenId: LIT_RSN_POOL.assets[1].tokenId, symbol: 'LIT', decimals: 9 };
+    const plan = (d: Ergodex, amount: bigint) => d.plan({ pool, venue, source: 'confirmed' }, rsn, lit, 'SELL', amount);
+    // the pool's own figure is under the ceiling
+    expect(dex.guardFailure(pool)).toBeNull();
+    // 2 units: a side fee of 1 (rounded up) and 1 traded: (2 * 10000 - 1 * 9970) / (2 * 10000)
+    expect(() => plan(dex, 2n)).toThrow(
+      /swap of 0\.002 RSN into pool .* pays 50\.15% of its input in fees, above maxPoolFeePct 3%/,
+    );
+    // 20 units: a side fee of 1 and 19 traded: (20 * 10000 - 19 * 9970) / (20 * 10000)
+    expect(() => plan(dex, 20n)).toThrow(/pays 5\.285% of its input in fees, above maxPoolFeePct 3%/);
+    // a fee exactly at the ceiling passes; one step under it is refused
+    const atCeiling = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT], { maxPoolFeePct: '5.285' }));
+    expect(plan(atCeiling, 20n).swap.amountIn).toBe(20n);
+    const under = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT], { maxPoolFeePct: '5.28499999' }));
+    expect(() => plan(under, 20n)).toThrow(/5\.285%/);
+    // a normal-sized sale passes with the venue's exact-input quote
+    const normal = plan(dex, 1000n);
+    expect(normal.swap.amountOut).toBe(venue.amountOut(pool, 'y', 1000n));
+    expect(normal.swap.amountOut).toBe(TRADE_FEE_NORMAL_OUT);
+  });
+
+  it('pool choice by pair skips a pool whose fee on this size is above the ceiling', async () => {
+    const dex = makeLithosDex(state, lithosDexConfig([LIT_RSN_NFT]));
+    await expect(dex.bestPool('RSN', 'LIT', 'SELL', 0.002)).rejects.toThrow(/No allowed ergodex pool/);
+    expect(await dex.bestPool('RSN', 'LIT', 'SELL', 1)).toBe(LIT_RSN_NFT);
   });
 
   it('pool choice by pair weighs the Spectrum pools and the listed LithosDex pools, and skips a dust pool', async () => {

@@ -20,6 +20,7 @@ import * as yaml from 'js-yaml';
 
 import { Ergo } from '../../../src/chains/ergo/ergo';
 import { FetchLike } from '../../../src/chains/ergo/ergo.node-client';
+import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBox, ErgoTokenInfo, NodeHeaderJson } from '../../../src/chains/ergo/ergo.types';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig, ErgodexNetworkConfig, LithosVenueConfig } from '../../../src/connectors/ergodex/ergodex.config';
@@ -32,10 +33,10 @@ import {
   fixtureText,
   ME,
   ME_TREE,
+  MNEMONIC_A,
   NodeState,
   ROOT,
   RSN,
-  signer,
   stateNode,
   TOKENS,
 } from './ergodex-test-helpers';
@@ -92,7 +93,14 @@ export function lithosDexConfig(allow: string[], over: Partial<ErgodexNetworkCon
   return { ...dexConfig(over), lithos: lithosConfig(allow) };
 }
 
-/** The stand-in node, answering height and headers from the LithosDex capture. */
+const indexedHeights = new WeakMap<NodeState, number>();
+
+/** Make the stand-in node's index report this height (default: caught up with the chain). */
+export function setIndexedHeight(state: NodeState, height: number): void {
+  indexedHeights.set(state, height);
+}
+
+/** The stand-in node, answering height, index height and headers from the LithosDex capture. */
 export function lithosNode(state: NodeState): FetchLike {
   const inner = stateNode(state);
   return async (input, init) => {
@@ -112,6 +120,9 @@ export function lithosNode(state: NodeState): FetchLike {
       });
     }
     if (method === 'GET' && url.pathname === '/blocks/lastHeaders/10') return reply(L_HEADERS);
+    if (method === 'GET' && url.pathname === '/blockchain/indexedHeight') {
+      return reply({ indexedHeight: indexedHeights.get(state) ?? L_TIP, fullHeight: L_TIP });
+    }
     return inner(input, init);
   };
 }
@@ -132,7 +143,12 @@ export function makeLithosDex(
 ): Ergodex {
   const ergo = new Ergo('mainnet', { config: testConfig(), fetch: lithosNode(state) });
   jest.spyOn(ergo, 'getTokenList').mockResolvedValue(L_TOKENS);
-  jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+  // a fresh signer per load, as the chain layer gives one per request and wipes it after
+  jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+    address: ME,
+    ergoTree: ME_TREE,
+    signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+  }));
   return new Ergodex('mainnet', ergo, config, ROOT);
 }
 

@@ -45,6 +45,7 @@ import {
   LithosDirectionFees,
   LithosKind,
   MAX_LONG,
+  MIN_LONG,
   quoteExactIn,
   quoteExactOut,
   sideFee,
@@ -130,16 +131,21 @@ export class LithosVenue implements Venue {
     const accY = decodeBigInt(r.R8);
     if (liquidity === null || !feeParams || !pending || accX === null || accY === null) return null;
     if (feeParams.length < 3 || pending.length !== 2) return null;
+    // Pending fees are owed to providers; one below zero would show the pool deeper than it is.
+    if (pending[0] < 0n || pending[1] < 0n) return null;
+    // The contract computes the supply in Long (lockedLiquidity - R4): out of that range it
+    // fails on every spend.
     const supply = this.config.lockedLiquidity - liquidity;
-    if (supply <= 0n) return null;
+    if (supply <= 0n || supply > MAX_LONG) return null;
     const denom = this.config.feeDenominator;
     const [dexFee, feeX, feeY] = feeParams;
     if (!(dexFee > 0n && dexFee <= denom && feeX >= 0n && feeX < denom && feeY >= 0n && feeY < denom)) return null;
     const heldX = kind === 'n2t' ? box.value : tokens[1].amount;
     const heldY = kind === 'n2t' ? tokens[1].amount : tokens[2].amount;
+    // the reserves, also computed in Long by the contract
     const reserveX = heldX - pending[0];
     const reserveY = heldY - pending[1];
-    if (reserveX <= 0n || reserveY <= 0n) return null;
+    if (reserveX <= 0n || reserveY <= 0n || reserveX > MAX_LONG || reserveY > MAX_LONG) return null;
     const tokenX = kind === 'n2t' ? null : tokens[1].tokenId.toLowerCase();
     const tokenY = (kind === 'n2t' ? tokens[1] : tokens[2]).tokenId.toLowerCase();
     // the costlier direction, as the fraction of the input that reaches the curve
@@ -181,6 +187,20 @@ export class LithosVenue implements Venue {
     const s = lithosOf(pool);
     const q = quoteExactOut(s.kind, pool[input].reserve, pool[other(input)].reserve, amountOut, fees(s, input));
     return q ? q.gross : null;
+  }
+
+  /**
+   * What this swap pays in fees, over its gross input A: the side fee f taken from A,
+   * plus the dex fee's share of the traded amount T = A - f, that is f + T * (D - dex) / D,
+   * so the share is (A * D - T * dex) / (A * D). Exact, in bigint. On a small trade the
+   * side fee is rounded (up, on a token/token pool), so this can be well above the pool's
+   * figure.
+   */
+  tradeFee(pool: VenuePool, swap: PoolSwap): { num: bigint; den: bigint } {
+    const s = lithosOf(pool);
+    const gross = swap.amountIn;
+    const traded = gross - sideFee(s.kind, gross, fees(s, swap.input));
+    return { num: gross * s.denom - traded * s.dexFee, den: gross * s.denom };
   }
 
   swapInputExtension(): ErgoContextExtension {
@@ -253,10 +273,17 @@ export class LithosVenue implements Venue {
       assets = [nft, { tokenId: pool.x.tokenId!, amount: held.x }, { tokenId: pool.y.tokenId!, amount: held.y }, prov];
     }
     const registers: ErgoRegisters = { ...pool.box.additionalRegisters };
-    registers.R6 = encodeCollLong([pending.x, pending.y]);
-    registers[ACC_REGISTER[input]] = encodeBigInt(
-      s.acc[input] + accumulatorAdvance(f, this.config.accumulatorScale, s.supply),
-    );
+    try {
+      registers.R6 = encodeCollLong([pending.x, pending.y]);
+      registers[ACC_REGISTER[input]] = encodeBigInt(
+        s.acc[input] + accumulatorAdvance(f, this.config.accumulatorScale, s.supply),
+      );
+    } catch (error) {
+      // a pending fee beyond a Long, or an accumulator beyond 256 bits: the contract cannot hold it
+      throw new VenueRuleError(
+        `the pool's registers cannot hold the state after this swap (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
     const spec: ErgoOutputSpec = {
       ergoTree: pool.box.ergoTree,
       value,
@@ -276,13 +303,17 @@ export class LithosVenue implements Venue {
 
   /**
    * The pool contract on the swap path (operation 0), line by line, in bigint: the rules
-   * every spend keeps (`poolPreserved`), then the swap rules. Long arithmetic that the
-   * script does in Long, and that would overflow there, fails here too.
+   * every spend keeps (`poolPreserved`), then the swap rules. Every value the script
+   * computes in Long on this path is checked against the Long range, so a successor whose
+   * arithmetic would overflow there (the script then fails) fails here too: the two
+   * supplies and their difference, the four reserves, the two box changes, the two
+   * pending changes, the two reserve changes, the negated output change and the traded
+   * amount times the dex fee. What the script computes in BigInt stays unbounded here.
    */
   contractAccepts(pool: VenuePool, candidate: Eip12BoxCandidate, inputs?: ErgoBox[]): boolean {
     const s = lithosOf(pool);
     const self = pool.box;
-    const longOk = (v: bigint) => v <= MAX_LONG && v >= -MAX_LONG - 1n;
+    const longOk = (...vs: bigint[]) => vs.every((v) => v <= MAX_LONG && v >= MIN_LONG);
     if (inputs) {
       if (inputs[0]?.boxId !== self.boxId) return false; // onlyOne: the pool is INPUTS(0)
       const provIn = inputs
@@ -316,21 +347,28 @@ export class LithosVenue implements Venue {
     };
     const r0 = { x: pool.x.reserve, y: pool.y.reserve };
     const r1 = { x: held1.x - pending1[0], y: held1.y - pending1[1] };
+    const supply1 = this.config.lockedLiquidity - liquidity1;
+    // supplyLP0, supplyLP1, deltaSupplyLP and the four reserves, all Long in the script
+    if (!longOk(s.supply, supply1, supply1 - s.supply, r0.x, r0.y, r1.x, r1.y)) return false;
     if (!(r1.x > 0n && r1.y > 0n)) return false; // reservesHeld
     // swap
     if (liquidity1 !== s.liquidity) return false; // deltaSupplyLP == 0
     if (t1[count - 1].amount !== s.provisionToken.amount) return false;
     const dPending = { x: pending1[0] - s.pending.x, y: pending1[1] - s.pending.y };
+    if (!longOk(dPending.x, dPending.y)) return false; // deltaPendingX, deltaPendingY
     const scale = this.config.accumulatorScale;
     if (accX1 !== s.acc.x + (dPending.x * scale) / s.supply) return false;
     if (accY1 !== s.acc.y + (dPending.y * scale) / s.supply) return false;
     const total = { x: held1.x - s.held.x, y: held1.y - s.held.y };
+    if (!longOk(total.x, total.y)) return false; // totalDeltaX, totalDeltaY
     if (total.x === 0n && total.y === 0n) return false;
     const dR = { x: r1.x - r0.x, y: r1.y - r0.y };
+    if (!longOk(dR.x, dR.y)) return false; // deltaReservesX, deltaReservesY
     const input: SideName = dR.x > 0n ? 'x' : 'y';
     const out = other(input);
     const f = fees(s, input);
-    if (!longOk(dR[input] * f.dex)) return false;
+    // in the curve: the negated output change, and the traded amount times the dex fee
+    if (!longOk(-dR[out], dR[input] * f.dex)) return false;
     if (!curveAllows(r0[input], r0[out], dR[input], -dR[out], f)) return false;
     // With the reserve rising, a fall in the box amount would need a negative pending change,
     // which never equals the contract's fee on that amount.

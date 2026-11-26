@@ -23,6 +23,7 @@
  */
 import { ErgoMessage } from '@fleet-sdk/core';
 
+import { httpErrors } from '../../../../services/error-handler';
 import { LithosKindTemplates, LithosVenueConfig } from '../../ergodex.config';
 import { VenueNodeReader } from '../venue';
 
@@ -168,7 +169,9 @@ export class LithosDeployments {
 
   /**
    * The deployment check on a pool box's tree and ids, reading the vault from the node:
-   * null when the pool belongs to the deployment its ids name, else the reason.
+   * null when the pool belongs to the deployment its ids name, else the reason. A vault
+   * count other than one is concluded only from an index that has caught up with the
+   * chain; while it lags, this throws a 503.
    */
   async check(ergoTree: string, ids: LithosDeploymentIds, node: VenueNodeReader): Promise<string | null> {
     const trees = this.rebuild(ids);
@@ -181,11 +184,27 @@ export class LithosDeployments {
       excludeMempoolSpent: false,
     });
     if (vaults.length !== 1) {
+      // In the block where a flush or resize moves the vault, an index that has not caught
+      // up can list none or two. That is the node's state, not the pool's: a 503 to retry.
+      await this.assertIndexCaughtUp(node);
       return `${vaults.length} confirmed unspent boxes carry its vault NFT ${ids.vaultNft}, not exactly one`;
     }
     if (vaults[0].ergoTree.toLowerCase() !== trees.feeVaultTree) {
       return `the box carrying its vault NFT ${ids.vaultNft} is not at the vault contract rebuilt from its ids`;
     }
     return null;
+  }
+
+  /** A 503 when the node's index is behind the chain (as the chain layer reads it for poll). */
+  private async assertIndexCaughtUp(node: VenueNodeReader): Promise<void> {
+    const { fullHeight } = await node.getInfo();
+    const indexed = await node.getIndexedHeight();
+    const chainHeight = Math.max(fullHeight, typeof indexed.fullHeight === 'number' ? indexed.fullHeight : fullHeight);
+    if (indexed.indexedHeight < chainHeight) {
+      throw httpErrors.serviceUnavailable(
+        `The node's index has not caught up with the chain (indexed to ${indexed.indexedHeight}, chain at ` +
+          `${chainHeight}), so the LithosDex vault cannot be counted yet; retry`,
+      );
+    }
   }
 }

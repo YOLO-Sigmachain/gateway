@@ -3,7 +3,9 @@
  * pools and LithosDex pools; Dexy is to follow as a further module.
  *
  * What this file holds, and nothing more: finding a pool box by its pool NFT on the node,
- * picking the venue by the box's exact ErgoTree, the guards from config (fee ceiling,
+ * picking the venue that recognises the box's ErgoTree (Spectrum by exact tree, LithosDex
+ * by its template's shape, bound to a real deployment only by the venue's admission
+ * check, which runs before any pool is used), the guards from config (fee ceiling,
  * minimum size, allowlist), token resolution by id, and turning a quote into a
  * transaction request for the chain layer. Box selection, change, conservation, signing,
  * submit, locks and pending tracking are `src/chains/ergo`'s.
@@ -145,7 +147,12 @@ export class Ergodex {
     }
   }
 
-  /** The venue whose configured trees include this exact tree. Never matched on token layout. */
+  /**
+   * The venue that recognises this tree (see `Venue.ownsTree`). Never matched on token
+   * layout. For LithosDex a match is only the template's shape: the pool is bound to a
+   * real deployment by `admit`, which every caller must run before using it (as
+   * `getFreshPool` does).
+   */
   venueForTree(ergoTree: string): Venue | undefined {
     return this.venues.find((v) => v.ownsTree(ergoTree));
   }
@@ -194,7 +201,10 @@ export class Ergodex {
    * The pool box for a pool NFT: the node's confirmed unspent box, or (when
    * `useMempoolSuccessor`) the newest unconfirmed successor in the node's mempool, i.e.
    * the mempool output holding the NFT that no mempool transaction spends. Only boxes at a
-   * configured pool tree count; the NFT held anywhere else is not this connector's pool.
+   * tree some venue recognises count (see `venueForTree`); the NFT held anywhere else is
+   * not this connector's pool. For LithosDex that is the template's shape only, so the box
+   * returned here is not yet bound to a real deployment: `getFreshPool` runs the venue's
+   * `admit` for that, and every caller must go through it.
    * With `confirmedOnly` the mempool is not read, whatever `useMempoolSuccessor` says.
    */
   async fetchPoolBox(
@@ -390,6 +400,19 @@ export class Ergodex {
       }
       swap = { input: quoteSide, amountIn: needed, amountOut: amount };
     }
+    const [tokenIn, tokenOut] = side === 'SELL' ? [base, quote] : [quote, base];
+    const tradeFee = venue.tradeFee?.(pool, swap);
+    if (tradeFee) {
+      const maxScaled = pctToScaled(this.config.maxPoolFeePct);
+      // fee% = num * 100 / den; compare without division, so a fee at the ceiling passes
+      if (tradeFee.num * HUNDRED_PCT > maxScaled * tradeFee.den) {
+        throw httpErrors.badRequest(
+          `This swap of ${formatUnits(swap.amountIn, tokenIn.decimals)} ${tokenIn.symbol} into pool ${pool.poolId} ` +
+            `pays ${ratio(tradeFee.num * 100n, tradeFee.den)}% of its input in fees, above maxPoolFeePct ` +
+            `${this.config.maxPoolFeePct}%; trade a larger amount`,
+        );
+      }
+    }
     const outSide: SideName = swap.input === 'x' ? 'y' : 'x';
     const minerFee = this.ergo.config.minerFee;
     if (pool[outSide].tokenId === null && swap.amountOut <= minerFee) {
@@ -407,7 +430,6 @@ export class Ergodex {
       if (error instanceof VenueRuleError) throw httpErrors.badRequest(`Pool ${pool.poolId}: ${error.message}`);
       throw error;
     }
-    const [tokenIn, tokenOut] = side === 'SELL' ? [base, quote] : [quote, base];
     return { ...fresh, side, base, quote, swap, tokenIn, tokenOut, successor };
   }
 
@@ -435,7 +457,8 @@ export class Ergodex {
   /**
    * The allowed pool for a pair that gives the best result for this size: the most out
    * for a SELL, the least in for a BUY. Pools the guards refuse, and pools too small for
-   * the size (dust, rounding to zero, storage floor), are skipped, never thrown on.
+   * the size (dust, rounding to zero, storage floor, a fee above the ceiling at this
+   * size), are skipped, never thrown on.
    * Every candidate is scored on the box a swap would trade: each is read live, as quote
    * and execute read it (the mempool successor when `useMempoolSuccessor`), never on the
    * confirmed box discovery listed.

@@ -721,9 +721,14 @@ export class Ergo {
   ): Promise<string> {
     return this.withLock(`tree:${this.addressToErgoTree(fromAddress)}`, async () => {
       const wallet = await this.getWallet(fromAddress);
-      const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
-      const signed = await this.signTransaction(built, wallet.signer);
-      return this.submitSigned(signed, built);
+      try {
+        const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
+        const signed = await this.signTransaction(built, wallet.signer);
+        return await this.submitSigned(signed, built);
+      } finally {
+        // the key is loaded for this one send; wipe it once the send has settled
+        wallet.signer.dispose?.();
+      }
     });
   }
 

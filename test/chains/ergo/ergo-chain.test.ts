@@ -564,7 +564,12 @@ describe('transfer', () => {
       }
       return undefined;
     });
-    jest.spyOn(ergo, 'getWallet').mockResolvedValue({ address: ME, ergoTree: ME_TREE, signer });
+    // a fresh signer per load, as the chain layer gives one per request and wipes it after
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
     const txId = await ergo.transfer(ME, OTHER, 2n * ERG);
     const tx = JSON.parse(posted!);
     expect(tx.id).toBe(txId);

@@ -34,12 +34,13 @@ import {
   accumulatorAdvance,
   encodeBigInt,
   encodeCollLong,
+  encodeLong,
   quoteExactIn,
   sideFee,
 } from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
 import { LithosPool } from '../../../src/connectors/ergodex/venues/lithos/lithos.venue';
 import { Venue } from '../../../src/connectors/ergodex/venues/venue';
-import { FEE_TREE } from '../../chains/ergo/ergo-test-helpers';
+import { FEE_TREE, makeBox } from '../../chains/ergo/ergo-test-helpers';
 
 import { ME_TREE, newNodeState, RSN, signer, walletBox } from './ergodex-test-helpers';
 import { L_HEADERS, L_TIP, LIT, LIT_POOL, LIT_RSN_POOL, lithosConfig, makeLithosDex } from './lithos-test-helpers';
@@ -296,5 +297,88 @@ describe('LithosDex pool contract proof with the real version-3 signing library,
       // eslint-disable-next-line no-console
       console.log(`${c.name}: in ${amountIn} out ${amountOut} ${JSON.stringify(results)}`);
     }
+  });
+});
+
+/**
+ * The script fails to evaluate (an arithmetic overflow, not a false verdict): reducing it
+ * throws and signing it is refused.
+ */
+async function evaluationFails(built: BuiltErgoTransaction): Promise<boolean> {
+  let reduceThrew = false;
+  try {
+    reducedPoolProposition(built);
+  } catch {
+    reduceThrew = true;
+  }
+  const v3 = await signer.forTreeVersion3!();
+  let signRefused = false;
+  try {
+    await v3.signTransaction(built.unsigned, built.unsigned.inputs, built.unsigned.dataInputs, { headers: L_HEADERS });
+  } catch {
+    signRefused = true;
+  }
+  expect(signRefused).toBe(reduceThrew);
+  return reduceThrew;
+}
+
+describe('the Long range of the pool arithmetic: our guard and the real script agree on both sides of each boundary', () => {
+  const MAX = 2n ** 63n - 1n;
+
+  it('the traded amount times the dex fee, selling LIT into ERG:LIT right at the largest Long', async () => {
+    const venue = dex.venueForTree(LIT_POOL.ergoTree)!;
+    const pool = venue.parsePool(LIT_POOL) as LithosPool;
+    const s = pool.lithos;
+    const fees = { denom: s.denom, dex: s.dexFee, side: s.sideFee.y };
+    // the largest gross input whose traded amount times the dex fee is still a Long
+    const tMax = MAX / s.dexFee;
+    let a = (tMax * s.denom) / (s.denom - s.sideFee.y);
+    while (a - sideFee('n2t', a, fees) > tMax) a--;
+    while (a + 1n - sideFee('n2t', a + 1n, fees) <= tMax) a++;
+    for (const [gross, inRange] of [
+      [a, true],
+      [a + 1n, false],
+      [a + 2n, false],
+    ] as const) {
+      const q = quoteExactIn('n2t', pool.y.reserve, pool.x.reserve, gross, fees);
+      expect(q.traded * s.dexFee <= MAX).toBe(inRange);
+      const succ = rawSuccessor(pool, 'y', gross, q.out);
+      const built = build(venue, pool, succ, walletBox(10n ** 8n, [{ tokenId: LIT, amount: gross }]));
+      expect(venue.contractAccepts(pool, built.unsigned.outputs[0], built.inputBoxes)).toBe(inRange);
+      if (inRange) {
+        expect(await verdict(built)).toBe(true);
+        expect(dex.plan({ pool, venue, source: 'confirmed' }, LIT_REF, ERG, 'SELL', gross).swap.amountOut).toBe(q.out);
+      } else {
+        expect(await evaluationFails(built)).toBe(true);
+        expect(() => dex.plan({ pool, venue, source: 'confirmed' }, LIT_REF, ERG, 'SELL', gross)).toThrow(
+          /the pool contract would refuse this swap/,
+        );
+      }
+    }
+  });
+
+  it('the supply (largest Long less the liquidity register): 0 is the largest supply, below 0 is not a pool', async () => {
+    const at = (liquidity: bigint) =>
+      makeBox({
+        ergoTree: LIT_POOL.ergoTree,
+        value: LIT_POOL.value,
+        assets: LIT_POOL.assets,
+        registers: { ...LIT_POOL.additionalRegisters, R4: encodeLong(liquidity) },
+        creationHeight: LIT_POOL.creationHeight,
+      });
+    const venue = dex.venueForTree(LIT_POOL.ergoTree)!;
+    const edge = venue.parsePool(at(0n)) as LithosPool;
+    expect(edge.lithos.supply).toBe(MAX);
+    const plan = dex.plan({ pool: edge, venue, source: 'confirmed' }, ERG, LIT_REF, 'SELL', 10n ** 9n);
+    const wallet = walletBox(2n * 10n ** 9n);
+    const ours = build(venue, edge, plan.successor, wallet);
+    expect(venue.contractAccepts(edge, ours.unsigned.outputs[0], ours.inputBoxes)).toBe(true);
+    expect(await verdict(ours)).toBe(true);
+    // one below: we do not read it as a pool, and the script cannot evaluate a swap on it
+    const beyond = at(-1n);
+    expect(venue.parsePool(beyond)).toBeNull();
+    const onBeyond = { ...edge, box: beyond } as LithosPool;
+    const theirs = build(venue, onBeyond, rawSuccessor(onBeyond, 'x', plan.swap.amountIn, plan.swap.amountOut), wallet);
+    expect(await evaluationFails(theirs)).toBe(true);
   });
 });

@@ -8,13 +8,14 @@
  * info; and a pool off the allowlist refused with nothing posted.
  */
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
+import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBox } from '../../../src/chains/ergo/ergo.types';
 import { Ergodex, NATIVE_TOKEN_ID } from '../../../src/connectors/ergodex/ergodex';
 import { decodeBigInt, decodeCollLong } from '../../../src/connectors/ergodex/venues/lithos/lithos.math';
 import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
 
-import { ERG, makeBox, ME, newNodeState, NodeState, RSN, walletBox } from './ergodex-test-helpers';
+import { ERG, makeBox, ME, ME_TREE, MNEMONIC_A, newNodeState, NodeState, RSN, walletBox } from './ergodex-test-helpers';
 import {
   L_TIP,
   LIT,
@@ -277,6 +278,69 @@ describe('ergodex on LithosDex pools through /trading/amm', () => {
     const e = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
     expect(e.statusCode).toBe(400);
     expect(posts()).toBe(0);
+  });
+
+  it('a sale too small for its own fee to stay under the ceiling is refused on quote and execute; a normal one agrees', async () => {
+    const rsnSale = { baseToken: 'RSN', quoteToken: 'LIT', poolAddress: LIT_RSN_NFT };
+    for (const [amount, pct] of [
+      ['0.002', '50.15'],
+      ['0.02', '5.285'],
+    ]) {
+      const q = await app.inject({ method: 'GET', url: quoteUrl({ ...rsnSale, amount }) });
+      expect(q.statusCode).toBe(400);
+      const ceiling = new RegExp(`pays ${pct.replace('.', '\\.')}% of its input in fees, above maxPoolFeePct 3%`);
+      expect(JSON.parse(q.body).message).toMatch(ceiling);
+      const e = await app.inject({
+        method: 'POST',
+        url: '/trading/amm/execute-swap',
+        payload: execBody({ ...rsnSale, amount: Number(amount) }),
+      });
+      expect(e.statusCode).toBe(400);
+      expect(JSON.parse(e.body).message).toMatch(ceiling);
+    }
+    expect(posts()).toBe(0);
+    // 1 RSN: the same quote as without the per-trade check, and execute moves exactly it
+    const q = await app.inject({ method: 'GET', url: quoteUrl({ ...rsnSale, amount: '1' }) });
+    expect(q.statusCode).toBe(200);
+    expect(JSON.parse(q.body).amountOut).toBe('9.877515028');
+    const e = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody(rsnSale) });
+    expect(e.statusCode).toBe(200);
+    expect(JSON.parse(e.body).pendingData).toMatchObject({ amountIn: '1', amountOut: '9.877515028' });
+  });
+
+  it('the key loaded for an execute is wiped once the send has settled, on success and on failure', async () => {
+    const loaded: WasmErgoSigner[] = [];
+    const disposed = () => loaded.map((l) => (l.dispose as jest.Mock).mock.calls.length);
+    jest.spyOn(dex.ergo, 'getWallet').mockImplementation(async () => {
+      const signer = WasmErgoSigner.fromMnemonic(MNEMONIC_A);
+      jest.spyOn(signer, 'dispose');
+      loaded.push(signer);
+      return { address: ME, ergoTree: ME_TREE, signer };
+    });
+    // refused before the send (the caller's bound)
+    const bound = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ minAmountOut: 241.5 }),
+    });
+    expect(bound.statusCode).toBe(409);
+    expect(disposed()).toEqual([1]);
+    // signed, and refused by the node at submit
+    const submit = state.submit;
+    state.submit = () => ({ status: 400, body: { error: 400, reason: 'bad.request', detail: 'nope' } });
+    const rejected = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(rejected.statusCode).toBe(400);
+    expect(posts()).toBe(1);
+    expect(disposed()).toEqual([1, 1]);
+    // taken by the node
+    state.submit = submit;
+    const ok = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(ok.statusCode).toBe(200);
+    expect(posts()).toBe(2);
+    expect(disposed()).toEqual([1, 1, 1]);
+    // a disposed signer cannot sign again
+    const headers = { headers: (await dex.ergo.node.getLastHeaders(10)) as never };
+    await expect(loaded[2].signTransaction({} as never, [], [], headers)).rejects.toThrow(/disposed/);
   });
 
   it('a quote with only a pair picks the LithosDex pool for it', async () => {

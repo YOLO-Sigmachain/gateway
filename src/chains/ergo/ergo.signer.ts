@@ -59,6 +59,12 @@ export interface ErgoSigner {
    * ErgoTree of version 3. Absent: this signer cannot.
    */
   forTreeVersion3?(): Promise<ErgoSigner>;
+  /**
+   * Wipe and free the key material this signer holds. After it, signing throws. Called
+   * once the transaction it was loaded for has been sent or has failed. Absent: nothing
+   * to release.
+   */
+  dispose?(): void;
 }
 
 export class ErgoSigningError extends Error {
@@ -119,13 +125,20 @@ export function headersNewestFirst(headers: NodeHeaderJson[]): NodeHeaderJson[] 
   return top;
 }
 
+/** The error a signer gives once its key has been wiped. */
+export const DISPOSED_SIGNER_MESSAGE = 'This signer has been disposed; load the wallet again to sign';
+
 /** ergo-lib-wasm 0.28.0 signer holding one key. */
 export class WasmErgoSigner implements ErgoSigner {
   readonly publicKeys: readonly string[];
   #wallet: Wallet;
-  /** A copy of the key, kept only so the version-3 signer can be made from it on first need. */
+  /**
+   * A copy of the key, kept only so the version-3 signer can be made from it on first
+   * need. Zeroed once that signer is built, and on dispose.
+   */
   #secret: Uint8Array;
   #v3?: Promise<ErgoSigner>;
+  #disposed = false;
 
   private constructor(wallet: Wallet, publicKeys: string[], secret: Uint8Array) {
     this.#wallet = wallet;
@@ -133,18 +146,47 @@ export class WasmErgoSigner implements ErgoSigner {
     this.#secret = Uint8Array.from(secret);
   }
 
-  /** The same key on the signing library that reads ErgoTree version 3; that library is loaded on the first call. */
+  /**
+   * The same key on the signing library that reads ErgoTree version 3; that library is
+   * loaded on the first call. Once built, the copy of the key it was built from is zeroed
+   * and later calls return the same signer. A failed build keeps the copy, so a later
+   * call can try again.
+   */
   forTreeVersion3(): Promise<ErgoSigner> {
+    if (this.#disposed) return Promise.reject(new ErgoSigningError(DISPOSED_SIGNER_MESSAGE));
     if (!this.#v3) {
-      const secret = this.#secret;
       const publicKey = this.publicKeys[0];
-      this.#v3 = import('./ergo.signer-alpha').then(({ AlphaErgoSigner }) =>
-        AlphaErgoSigner.fromSecretKeyBytes(secret, publicKey),
-      );
+      const v3 = import('./ergo.signer-alpha').then(({ AlphaErgoSigner }) => {
+        if (this.#disposed) throw new ErgoSigningError(DISPOSED_SIGNER_MESSAGE);
+        const built = AlphaErgoSigner.fromSecretKeyBytes(this.#secret, publicKey);
+        // the built signer holds the key from here on; the copy is no longer needed
+        this.#secret.fill(0);
+        return built;
+      });
+      this.#v3 = v3;
       // a failed load is not kept, so a later call tries again
-      this.#v3.catch(() => (this.#v3 = undefined));
+      v3.catch(() => {
+        if (this.#v3 === v3) this.#v3 = undefined;
+      });
     }
     return this.#v3;
+  }
+
+  /**
+   * Zero the copy of the key and free the wallets this signer owns (the version-3 one
+   * too, if it was built). Signing afterwards throws. Safe to call more than once.
+   */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#secret.fill(0);
+    this.#wallet.free();
+    const v3 = this.#v3;
+    this.#v3 = undefined;
+    v3?.then(
+      (built) => built.dispose?.(),
+      () => undefined,
+    );
   }
 
   /** A signer for m/44'/429'/0'/0/index of a mnemonic. The caller validates the mnemonic. */
@@ -181,6 +223,7 @@ export class WasmErgoSigner implements ErgoSigner {
     dataInputBoxes: Eip12DataInput[],
     context: ErgoSigningContext,
   ): Promise<SignedErgoTransaction> {
+    if (this.#disposed) throw new ErgoSigningError(DISPOSED_SIGNER_MESSAGE);
     const headers = headersNewestFirst(context.headers);
     // Only objects wasm did not take ownership of are freed here: from_block_header takes
     // its header, and the state context takes the pre-header, headers and parameters.

@@ -27,6 +27,7 @@
 import { ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
+import { ErgoWalletAccount } from '../../../chains/ergo/ergo.wallet';
 import { ChainExecuteSwapResponseType, TransactionStatusCode } from '../../../schemas/chain-schema';
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
@@ -156,6 +157,7 @@ export async function executeSwap(
   minAmountOut?: number,
   maxAmountIn?: number,
 ): Promise<ChainExecuteSwapResponseType> {
+  let wallet: ErgoWalletAccount | undefined;
   try {
     if (side === 'BUY' && minAmountOut !== undefined) {
       throw httpErrors.badRequest('minAmountOut applies to a SELL (exact input); a BUY is limited by maxAmountIn');
@@ -167,7 +169,9 @@ export async function executeSwap(
     const ergo = dex.ergo;
     const appliedSlippagePct = slippagePct ?? dex.root.slippagePct;
     const slip = pctToScaled(appliedSlippagePct);
-    const wallet = await ergo.getWallet(walletAddress);
+    wallet = await ergo.getWallet(walletAddress);
+    const signer = wallet.signer;
+    const changeAddress = wallet.address;
     const base = await dex.resolveToken(baseToken);
     const raw = toRaw(amount, base);
 
@@ -209,11 +213,11 @@ export async function executeSwap(
         let pendingData: ReturnType<typeof fixedSwapData> | undefined;
         const { txId } = await ergo.sendTransaction(
           {
-            changeAddress: wallet.address,
+            changeAddress,
             inputs: [{ box: current.pool.box, extension: current.venue.swapInputExtension?.(current.pool) }],
             outputs: [current.successor],
           },
-          wallet.signer,
+          signer,
           {
             verify: (built) => {
               verifySwapTransaction(current, built);
@@ -255,5 +259,8 @@ export async function executeSwap(
     }
   } catch (error) {
     throw ergodexError(error, 'Failed to execute ergodex swap');
+  } finally {
+    // the key is loaded for this one request; wipe it once the send has settled
+    wallet?.signer.dispose?.();
   }
 }

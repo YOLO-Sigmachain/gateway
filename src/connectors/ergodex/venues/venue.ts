@@ -22,7 +22,7 @@ export interface PoolSide {
 }
 
 /** The node reads a venue may make to admit a pool. */
-export type VenueNodeReader = Pick<ErgoNodeClient, 'getUnspentBoxesByTokenId'>;
+export type VenueNodeReader = Pick<ErgoNodeClient, 'getUnspentBoxesByTokenId' | 'getIndexedHeight' | 'getInfo'>;
 
 export type SideName = 'x' | 'y';
 
@@ -61,7 +61,12 @@ export class VenueRuleError extends Error {
 
 export interface Venue {
   readonly name: string;
-  /** True when the tree is, byte for byte, one of this venue's configured pool trees. */
+  /**
+   * True when this venue recognises the tree as one of its pool trees: Spectrum by an exact
+   * configured tree, LithosDex by the shape of its pinned pool template (any deployment's
+   * ids in its terms). For LithosDex this does not bind the pool to a real deployment;
+   * only `admit` does, and every caller must run it before the pool is used.
+   */
   ownsTree(ergoTree: string): boolean;
   /** The pool in a box at one of this venue's trees, or null if the box is not a pool (wrong layout). */
   parsePool(box: ErgoBox): VenuePool | null;
@@ -69,6 +74,13 @@ export interface Venue {
   amountOut(pool: VenuePool, input: SideName, amountIn: bigint): bigint;
   /** Smallest input the contract accepts for an exact output, or null if the pool cannot pay it. */
   amountInFor(pool: VenuePool, input: SideName, amountOut: bigint): bigint | null;
+  /**
+   * The share of this swap's gross input that goes to fees, as num / den, for a venue
+   * whose fee on one trade can be above the pool's own figure (`feeNum` / `feeDenom`), for
+   * example when a fee is rounded up on a small amount. The fee ceiling is applied to it
+   * as well. Absent: the pool's figure is every trade's.
+   */
+  tradeFee?(pool: VenuePool, swap: PoolSwap): { num: bigint; den: bigint };
   /** The pool's successor box for a swap. Throws VenueRuleError when the contract would refuse it. */
   successor(pool: VenuePool, swap: PoolSwap): ErgoOutputSpec;
   /**

@@ -27,6 +27,7 @@ import {
 
 import { parseNodeJson } from './ergo.json';
 import {
+  DISPOSED_SIGNER_MESSAGE,
   ErgoSigner,
   ErgoSigningContext,
   ErgoSigningError,
@@ -38,31 +39,47 @@ import { Eip12DataInput, Eip12UnsignedInput, Eip12UnsignedTransaction } from './
 export class AlphaErgoSigner implements ErgoSigner {
   readonly publicKeys: readonly string[];
   #wallet: Wallet;
+  #disposed = false;
 
   private constructor(wallet: Wallet, publicKeys: string[]) {
     this.#wallet = wallet;
     this.publicKeys = Object.freeze([...publicKeys]);
   }
 
-  /** A signer for a raw 32-byte secret key. */
+  /**
+   * A signer for a raw 32-byte secret key. The public key it reports is always the one
+   * this library derives from the secret. When `publicKey` is given (the key the caller
+   * expects), a different derived key is refused.
+   */
   static fromSecretKeyBytes(secret: Uint8Array, publicKey?: string): AlphaErgoSigner {
     const key = SecretKey.dlog_from_bytes(secret);
     const keys = new SecretKeys();
-    let pk = publicKey;
-    if (!pk) {
-      const address = key.get_address();
-      pk = Buffer.from(address.to_bytes(0)).toString('hex').slice(2, 68);
-      address.free();
+    // P2PK tree is 0008cd + compressed key
+    const address = key.get_address();
+    const derived = Buffer.from(address.to_bytes(0)).toString('hex').slice(2, 68);
+    address.free();
+    if (publicKey !== undefined && derived !== publicKey.toLowerCase()) {
+      keys.free();
+      key.free();
+      throw new ErgoSigningError('the version-3 signing library derives another public key from this key');
     }
     keys.add(key);
     const wallet = Wallet.from_secrets(keys);
     keys.free();
     key.free();
-    return new AlphaErgoSigner(wallet, [pk]);
+    return new AlphaErgoSigner(wallet, [derived]);
   }
 
   async forTreeVersion3(): Promise<ErgoSigner> {
+    if (this.#disposed) throw new ErgoSigningError(DISPOSED_SIGNER_MESSAGE);
     return this;
+  }
+
+  /** Free the wallet holding the key. Signing afterwards throws. Safe to call more than once. */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#wallet.free();
   }
 
   async signTransaction(
@@ -71,6 +88,7 @@ export class AlphaErgoSigner implements ErgoSigner {
     dataInputBoxes: Eip12DataInput[],
     context: ErgoSigningContext,
   ): Promise<SignedErgoTransaction> {
+    if (this.#disposed) throw new ErgoSigningError(DISPOSED_SIGNER_MESSAGE);
     const headers = headersNewestFirst(context.headers);
     const toFree: Array<{ free(): void }> = [];
     try {
