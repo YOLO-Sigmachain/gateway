@@ -131,6 +131,34 @@ export function symbolForMessage(symbol: string, tokenId: string | null): string
   return tokenId === null ? 'native' : `${tokenId.slice(0, 8)}…`;
 }
 
+/**
+ * A token as it is named in a message that says what a transaction would move: its symbol
+ * (as symbolForMessage writes it) and the first 8 characters of its id, so two tokens that
+ * share a symbol or an on-chain name can be told apart. The native coin (`tokenId` null) is
+ * named by its symbol alone.
+ */
+export function tokenForMessage(symbol: string, tokenId: string | null): string {
+  if (tokenId === null) return symbolForMessage(symbol, null);
+  return `${symbolForMessage(symbol, tokenId)} (${tokenId.slice(0, 8)}…)`;
+}
+
+/**
+ * Whether a URL names this machine: the host `localhost`, an address in 127.0.0.0/8, or
+ * ::1. The URL parser writes every IPv4 form (`127.1`, a decimal number) as four decimal
+ * parts first. A URL that cannot be read is not one.
+ */
+export function isLoopbackUrl(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'localhost' || host === '[::1]') return true;
+  const parts = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  return parts !== null && parts.slice(1).every((part) => Number(part) <= 255);
+}
+
 // ---------------------------------------------------------------------------------------
 // Amounts. Whole-unit decimal strings are made from bigints digit by digit: no float ever
 // touches the integer part.

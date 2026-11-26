@@ -20,8 +20,10 @@ import { WalletTokenBalance } from '../wallet-balances';
 
 import {
   configuredAddressPrefixes,
+  errorKind,
   ErgoNetworkConfig,
   ErgoSubmitMode,
+  findSubmitModeLookalike,
   getErgoNetworkConfig,
   networks,
   parseSubmitMode,
@@ -54,10 +56,12 @@ import {
   decodeErgoAddressForPrefix,
   formatUnits,
   isErgoId,
+  isLoopbackUrl,
   NATIVE_COIN_ID,
   sanitizeNodeText,
   symbolForMessage,
   toDecimalNumber,
+  tokenForMessage,
 } from './ergo.utils';
 import { ErgoWalletAccount, loadErgoWallet } from './ergo.wallet';
 
@@ -270,24 +274,48 @@ export class ErgoCheckIncompleteError extends Error {
 }
 
 /**
+ * The network's submitMode is not set: nothing is signed, sent or checked until it is set to
+ * `send` or `check` in the network's config file and Gateway is restarted. Raised before
+ * any box is selected and before the wallet's key is loaded. Answered as a 503.
+ */
+export class ErgoSubmitModeNotSetError extends Error {
+  constructor(network: string) {
+    super(
+      `ergo-${network}.submitMode is not set. Add "submitMode: send" to send transactions, or "submitMode: check" ` +
+        "to have the node only check them, to the network's config file, then restart Gateway. Nothing was signed " +
+        'or sent.',
+    );
+    this.name = 'ErgoSubmitModeNotSetError';
+  }
+}
+
+/**
  * The submit mode differs between the running instance, the config held in memory and the
- * config file (or one of them cannot be read, or is neither `send` nor `check`). Nothing was
- * recorded or sent. Answered as a 503: Gateway must be restarted to use the mode in its config.
+ * config file (or one of them cannot be read, or is neither `send` nor `check`, or a key
+ * that looks like submitMode is in the config). Nothing was recorded or sent, and once seen
+ * the network refuses every later submit and re-post until Gateway restarts. Answered as a
+ * 503.
  */
 export class ErgoSubmitModeMismatchError extends Error {
-  constructor(network: string, values: { running: string; inMemory: string; inFile: string }) {
-    super(
-      `The submit mode differs between the running Gateway and its config for ergo-${network}: ` +
-        `running ${values.running}, config in memory ${values.inMemory}, config file ${values.inFile}. ` +
-        'Nothing was sent. Restart Gateway to use the mode in its config',
-    );
+  constructor(network: string, cause: { running: string; inMemory: string; inFile: string } | { keyProblem: string }) {
+    const what =
+      'keyProblem' in cause
+        ? `The submit mode for ergo-${network} is in doubt: ${cause.keyProblem}. The mode changed while Gateway ` +
+          'was running; correct the config, then restart Gateway'
+        : `The submit mode differs between the running Gateway and its config for ergo-${network}: ` +
+          `running ${cause.running}, config in memory ${cause.inMemory}, config file ${cause.inFile}. ` +
+          'The mode changed while Gateway was running; restart Gateway to use the mode in its config';
+    super(`${what}. Nothing was sent, and nothing is sent from this network until Gateway is restarted`);
     this.name = 'ErgoSubmitModeMismatchError';
   }
 }
 
-/** A submitMode value as read: the mode it names, or why it names none. Absent is `send`. */
-function readSubmitModeValue(value: unknown): { mode?: ErgoSubmitMode; text: string } {
-  if (value === undefined) return { mode: 'send', text: 'send (not set)' };
+/** The submit mode as one of its three states: `send`, `check`, or not set. */
+type SubmitModeState = ErgoSubmitMode | 'not set';
+
+/** A submitMode value as read: the state it names, or why it names none. Absent is not set. */
+function readSubmitModeValue(value: unknown): { mode?: SubmitModeState; text: string } {
+  if (value === undefined) return { mode: 'not set', text: 'not set' };
   if (value === 'send' || value === 'check') return { mode: value, text: value };
   const shown = JSON.stringify(value) ?? String(value);
   return { text: `${shown.length > 40 ? `${shown.slice(0, 40)}…` : shown} (neither send nor check)` };
@@ -309,14 +337,19 @@ export class Ergo {
   readonly config: ErgoNetworkConfig;
   readonly node: ErgoNodeClient;
   readonly pending: ErgoPendingTracker;
-  /** `send`: signed transactions are submitted. `check`: only checked by the node; nothing is sent. */
-  readonly submitMode: ErgoSubmitMode;
+  /**
+   * `send`: signed transactions are submitted. `check`: only checked by the node; nothing is
+   * sent. Undefined (not set): nothing is signed, sent or checked.
+   */
+  readonly submitMode: ErgoSubmitMode | undefined;
   /**
    * Whether this instance's config was read from the config manager (no `options.config`
    * given), as every instance getInstance makes is. Only then is there a config in memory
    * and a config file to compare the mode with at each submit decision.
    */
   private readonly configFromManager: boolean;
+  /** The first doubt about the submit mode this instance saw; once set, nothing is submitted until a restart. */
+  private latchedMismatch?: ErgoSubmitModeMismatchError;
   private readonly tokenInfoCache = new Map<string, ErgoTokenInfo>();
   /** A token's total emission never changes once it is minted. */
   private readonly tokenEmissionCache = new Map<string, bigint>();
@@ -328,13 +361,37 @@ export class Ergo {
     this.configFromManager = options.config === undefined;
     this.config = options.config ?? getErgoNetworkConfig(network);
     this.submitMode = parseSubmitMode(this.config.submitMode, `ergo-${network}.submitMode`);
+    if (
+      this.submitMode === 'check' &&
+      this.config.checkAllowsRemoteNode !== true &&
+      !isLoopbackUrl(this.config.nodeURL)
+    ) {
+      let host = 'that cannot be read';
+      try {
+        host = new URL(this.config.nodeURL).hostname;
+      } catch {
+        // the host stays unnamed
+      }
+      throw new Error(
+        `ergo-${network}.submitMode is check and nodeURL names the host ${host}, which is not this machine. In ` +
+          'check mode the node receives every signed transaction in full, and whoever runs or can watch that node ' +
+          'could broadcast it. Point nodeURL at a node on this machine (localhost, 127.0.0.0/8 or ::1), or set ' +
+          `ergo-${network}.checkAllowsRemoteNode: true to accept that; this network does not start until then`,
+      );
+    }
     if (this.submitMode === 'check') {
       logger.warn(
         `ergo-${network}.submitMode is check: signed transactions are only checked by the node, never sent; ` +
           'no swap or transfer from this network is carried out',
       );
-    } else {
+    } else if (this.submitMode === 'send') {
       logger.info(`ergo-${network}.submitMode is send: signed transactions are sent to the node`);
+    } else {
+      logger.warn(
+        `ergo-${network}.submitMode is not set: no swap or transfer is carried out until it is set; nothing is ` +
+          'signed, sent or checked. Add "submitMode: send" or "submitMode: check" to the network\'s config file, ' +
+          'then restart Gateway',
+      );
     }
     this.node = new ErgoNodeClient(this.config.nodeURL, {
       timeoutMs: this.config.nodeTimeoutMs,
@@ -369,51 +426,95 @@ export class Ergo {
     Ergo._instances = {};
   }
 
+  /** This instance's submit mode as one of the three states. */
+  private get submitModeState(): SubmitModeState {
+    return this.submitMode ?? 'not set';
+  }
+
   /**
    * The submit mode in force, read at each submit decision. Three values are compared: the
    * mode this instance was built with, the mode in the config manager's namespace held in
    * memory (a /config/update changes it), and the mode in that namespace's config file on
-   * disk, read now (a hand edit changes it). An absent key is `send` in each. All three
-   * agreeing gives that mode; any disagreement, a value that cannot be read, or one that is
-   * neither `send` nor `check` gives `mismatch`, and then nothing may be recorded or posted.
+   * disk, read now (a hand edit changes it). Each is `send`, `check` or not set (no key);
+   * not set is a state of its own. All three agreeing gives that state; any disagreement, a
+   * value that cannot be read, one that is neither `send` nor `check`, or a key that looks
+   * like submitMode in the network's file or memory or in the chain's memory (see
+   * findSubmitModeLookalike) gives `mismatch`, and then nothing may be recorded or posted.
+   * A mismatch is kept: from then on every answer is that mismatch until Gateway restarts,
+   * even if the three values agree again (an update through the API rewrites the whole
+   * file from memory, which can erase a hand edit and make them agree on the old mode).
    * An instance built from an explicit config (`options.config`) has no namespace or file
    * behind it: only its own mode exists, and that is the answer.
    */
-  private submitModeCheck(): { mode?: ErgoSubmitMode; mismatch?: ErgoSubmitModeMismatchError } {
-    if (!this.configFromManager) return { mode: this.submitMode };
-    const namespaceId = `ergo-${this.network}`;
-    let inMemory: { mode?: ErgoSubmitMode; text: string };
-    let inFile: { mode?: ErgoSubmitMode; text: string };
-    try {
-      const namespace = ConfigManagerV2.getInstance().getNamespace(namespaceId);
-      if (!namespace) throw new Error(`no ${namespaceId} namespace`);
-      inMemory = readSubmitModeValue(namespace.get('submitMode'));
-      try {
-        const body = yaml.load(fs.readFileSync(namespace.configurationPath, 'utf8'));
-        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not a mapping');
-        inFile = readSubmitModeValue((body as Record<string, unknown>).submitMode);
-      } catch (error) {
-        inFile = { text: `unreadable (${error instanceof Error ? error.message : String(error)})` };
-      }
-    } catch (error) {
-      inMemory = { text: `unreadable (${error instanceof Error ? error.message : String(error)})` };
-      inFile = { text: 'not read' };
-    }
-    if (inMemory.mode === this.submitMode && inFile.mode === this.submitMode) return { mode: this.submitMode };
-    return {
-      mismatch: new ErgoSubmitModeMismatchError(this.network, {
-        running: this.submitMode,
-        inMemory: inMemory.text,
-        inFile: inFile.text,
-      }),
-    };
+  private submitModeCheck(): { mode?: SubmitModeState; mismatch?: ErgoSubmitModeMismatchError } {
+    if (this.latchedMismatch) return { mismatch: this.latchedMismatch };
+    if (!this.configFromManager) return { mode: this.submitModeState };
+    const mismatch = this.findSubmitModeMismatch();
+    if (!mismatch) return { mode: this.submitModeState };
+    this.latchedMismatch = mismatch;
+    return { mismatch };
   }
 
-  /** The submit mode in force (see submitModeCheck); throws ErgoSubmitModeMismatchError when it is in doubt. */
+  /** The doubt about the submit mode found now (see submitModeCheck), or undefined when there is none. */
+  private findSubmitModeMismatch(): ErgoSubmitModeMismatchError | undefined {
+    const namespaceId = `ergo-${this.network}`;
+    let inMemory: { mode?: SubmitModeState; text: string };
+    let inFile: { mode?: SubmitModeState; text: string };
+    try {
+      const namespace = ConfigManagerV2.getInstance().getNamespace(namespaceId);
+      if (!namespace) {
+        inMemory = { text: `unreadable (no ${namespaceId} namespace)` };
+        inFile = { text: 'not read' };
+      } else {
+        inMemory = readSubmitModeValue(namespace.get('submitMode'));
+        let body: unknown;
+        let readFailure: string | undefined;
+        try {
+          body = yaml.load(fs.readFileSync(namespace.configurationPath, 'utf8'));
+        } catch (error) {
+          // the error's code or class only: a parser's message quotes lines of the file
+          readFailure = errorKind(error);
+        }
+        if (readFailure !== undefined) {
+          inFile = { text: `unreadable (${readFailure})` };
+        } else if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          inFile = { text: 'unreadable (not a mapping)' };
+        } else {
+          const keyProblem = findSubmitModeLookalike(namespaceId, body);
+          if (keyProblem) return new ErgoSubmitModeMismatchError(this.network, { keyProblem });
+          inFile = readSubmitModeValue((body as Record<string, unknown>).submitMode);
+        }
+      }
+    } catch (error) {
+      inMemory = { text: `unreadable (${errorKind(error)})` };
+      inFile = { text: 'not read' };
+    }
+    const running = this.submitModeState;
+    if (inMemory.mode === running && inFile.mode === running) return undefined;
+    return new ErgoSubmitModeMismatchError(this.network, { running, inMemory: inMemory.text, inFile: inFile.text });
+  }
+
+  /**
+   * The submit mode in force (see submitModeCheck). Throws ErgoSubmitModeMismatchError when
+   * it is in doubt, and ErgoSubmitModeNotSetError when it is not set.
+   */
   private submitModeInForce(): ErgoSubmitMode {
     const { mode, mismatch } = this.submitModeCheck();
     if (mismatch || mode === undefined) throw mismatch;
+    if (mode === 'not set') throw new ErgoSubmitModeNotSetError(this.network);
     return mode;
+  }
+
+  /**
+   * Refuse, before any box is selected and before a wallet's key is loaded, a swap or a
+   * transfer this network cannot carry out: its submitMode is not set
+   * (ErgoSubmitModeNotSetError), or it has already seen its submit mode in doubt
+   * (ErgoSubmitModeMismatchError; see submitModeCheck). Callers that load a key run this
+   * first.
+   */
+  assertSubmitModeSet(): void {
+    if (this.latchedMismatch) throw this.latchedMismatch;
+    if (this.submitMode === undefined) throw new ErgoSubmitModeNotSetError(this.network);
   }
 
   get nativeTokenSymbol(): string {
@@ -724,13 +825,15 @@ export class Ergo {
    * the node's check endpoint only, and the answer is always an error (see checkSigned).
    * The mode is read again here, before anything is recorded or posted (see
    * submitModeCheck): when it is in doubt, nothing is recorded or posted and the answer is
-   * ErgoSubmitModeMismatchError.
+   * ErgoSubmitModeMismatchError. With submitMode not set, nothing is checked or submitted
+   * and the answer is ErgoSubmitModeNotSetError, given at the start, before anything else.
    *
    * A transaction with fixed inputs (a contract box such as a pool) must go through
    * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
    * two wallets cannot race each other for the same box inside this process.
    */
   async submitTransaction(signed: SignedErgoTransaction, built: BuiltErgoTransaction): Promise<string> {
+    this.assertSubmitModeSet();
     if (built.fixedInputCount > 0) {
       throw new ErgoBuildError(
         'A transaction with fixed inputs must be sent with sendTransaction, which holds the wallet and input locks',
@@ -756,6 +859,7 @@ export class Ergo {
     // the ids that stay readable in the node's text
     const ownIds = [signed.id, ...inputBoxIds];
     // the mode in force: throws, before anything is recorded or posted, when it is in doubt
+    // or not set
     const mode = this.submitModeInForce();
     // check mode: checked by the node and never recorded, so the signed transaction is kept
     // nowhere and no later post can send it
@@ -860,7 +964,7 @@ export class Ergo {
    */
   private async postToSubmit(json: string): Promise<string> {
     if (this.submitMode !== 'send') {
-      throw new Error(`ergo-${this.network}.submitMode is ${this.submitMode}: nothing is sent to the node`);
+      throw new Error(`ergo-${this.network}.submitMode is ${this.submitModeState}: nothing is sent to the node`);
     }
     return this.node.submitTransaction(json);
   }
@@ -924,6 +1028,7 @@ export class Ergo {
     signer: ErgoSigner,
     options: ErgoSendOptions = {},
   ): Promise<{ txId: string; built: BuiltErgoTransaction }> {
+    this.assertSubmitModeSet();
     const keys = [
       `tree:${this.addressToErgoTree(request.changeAddress)}`,
       ...(request.inputs ?? []).map((spec) => `box:${spec.box.boxId}`),
@@ -983,6 +1088,20 @@ export class Ergo {
     });
   }
 
+  /**
+   * A token as a check answer names it (see tokenForMessage): its symbol from the token
+   * list or the node, and the start of its id. A lookup that fails leaves the id alone.
+   */
+  private async tokenNameForMessage(tokenId: string): Promise<string> {
+    let symbol = tokenId;
+    try {
+      symbol = (await this.getTokenById(tokenId))?.symbol ?? tokenId;
+    } catch {
+      // named by its id only
+    }
+    return tokenForMessage(symbol, tokenId.toLowerCase());
+  }
+
   /** Send ERG and tokens from a stored wallet. Internal: upstream has no transfer route. */
   async transfer(
     fromAddress: string,
@@ -990,6 +1109,7 @@ export class Ergo {
     nanoErgs: bigint,
     tokens: ErgoTokenAmount[] = [],
   ): Promise<string> {
+    this.assertSubmitModeSet();
     return this.withLock(`tree:${this.addressToErgoTree(fromAddress)}`, async () => {
       const wallet = await this.getWallet(fromAddress);
       try {
@@ -1000,7 +1120,8 @@ export class Ergo {
         } catch (error) {
           if (error instanceof ErgoCheckOnlyError) {
             const symbol = symbolForMessage(this.config.nativeCurrencySymbol, null);
-            const tokenText = tokens.map((t) => `, ${t.amount} of token ${t.tokenId} (in its smallest unit)`).join('');
+            const names = await Promise.all(tokens.map((t) => this.tokenNameForMessage(t.tokenId)));
+            const tokenText = tokens.map((t, i) => `, ${t.amount} of ${names[i]} (in its smallest unit)`).join('');
             throw error.withMoves(
               `${formatUnits(nanoErgs, this.config.nativeDecimals)} ${symbol}${tokenText} to ${toAddress}, ` +
                 `miner fee ${formatUnits(built.fee, this.config.nativeDecimals)} ${symbol}`,
@@ -1120,8 +1241,8 @@ export class Ergo {
           },
         };
       }
-      if (mode === 'check') {
-        // a transaction sent before the mode was check: kept, its inputs hidden, not posted
+      if (mode !== 'send') {
+        // a transaction sent before the mode was check or not set: kept, its inputs hidden, not posted
         return {
           ...base,
           txBlock: null,
@@ -1129,7 +1250,7 @@ export class Ergo {
           txData: {
             note:
               'the node holds it nowhere and its inputs are unspent; it is kept, and not posted again while ' +
-              'submitMode is check',
+              `submitMode is ${mode}`,
           },
         };
       }
@@ -1152,7 +1273,7 @@ export class Ergo {
     // is posted again here, so polling only this one still moves its parent.
     if (tracked && inputs!.waitingOn.length > 0 && inputs!.unknown.length === 0) {
       const parents = [...new Set(inputs!.waitingOn)];
-      // in check mode no parent is posted again either, nor while the mode is in doubt
+      // in check mode or with the mode not set no parent is posted again either, nor while the mode is in doubt
       const { mode, mismatch } = this.submitModeCheck();
       if (mismatch) {
         logger.warn(`Ergo ${this.network}: the transactions ${id} waits for are not posted again: ${mismatch.message}`);
@@ -1390,10 +1511,10 @@ export class Ergo {
         );
         return;
       }
-      if (mode === 'check') {
+      if (mode !== 'send') {
         logger.warn(
           `Ergo ${this.network}: pending transaction ${id} is held nowhere by the node and its inputs are unspent; ` +
-            'it is kept, and not posted again while submitMode is check',
+            `it is kept, and not posted again while submitMode is ${mode}`,
         );
         return;
       }

@@ -6,6 +6,7 @@ import {
   ErgoInputSpentError,
   ErgoNotSubmittedError,
   ErgoSubmitModeMismatchError,
+  ErgoSubmitModeNotSetError,
   ErgoTransactionRejectedError,
 } from '../ergo';
 import { ErgoNodeError, ErgoSubmitRefusedError } from '../ergo.node-client';
@@ -27,6 +28,7 @@ import { ErgoBuildError } from '../ergo.tx-builder';
  *
  * A submit mode in doubt (the running instance, the config in memory and the config file do
  * not all say the same) is a 503 that says nothing was sent and Gateway must be restarted.
+ * So is a submit mode not set: nothing was signed or sent, and the answer says how to set it.
  */
 export function toHttpError(error: unknown, action: string): Error {
   if (error && typeof error === 'object' && 'statusCode' in error) {
@@ -38,7 +40,11 @@ export function toHttpError(error: unknown, action: string): Error {
   if (error instanceof ErgoCheckIncompleteError) {
     return httpErrors.serviceUnavailable(`${action}: ${error.message}`);
   }
-  if (error instanceof ErgoSubmitModeMismatchError || error instanceof ErgoSubmitRefusedError) {
+  if (
+    error instanceof ErgoSubmitModeMismatchError ||
+    error instanceof ErgoSubmitModeNotSetError ||
+    error instanceof ErgoSubmitRefusedError
+  ) {
     return httpErrors.serviceUnavailable(`${action}: ${error.message}`);
   }
   // a contract box someone spent first: retry after reading its successor

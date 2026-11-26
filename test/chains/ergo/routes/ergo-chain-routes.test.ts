@@ -94,6 +94,36 @@ describe('/chains/ergo routes', () => {
       .mockResolvedValue([{ address: SIGUSD, symbol: 'SigUSD', name: 'SigUSD', decimals: 2 }]);
   });
 
+  it('this config has no submitMode key: the mode is not set, and status, balances and poll answer as before', async () => {
+    expect((await Ergo.getInstance('mainnet')).submitMode).toBeUndefined();
+    route = (method, path) => {
+      if (method === 'POST' && path.startsWith('/blockchain/box/unspent/byAddress'))
+        return { body: [nodeBoxJson(box)] };
+      if (path.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (path === `/blockchain/transaction/byId/${TX}`) {
+        return { body: { id: TX, inputs: [], outputs: [], inclusionHeight: TIP, numConfirmations: 0 } };
+      }
+      return undefined;
+    };
+    const status = await fastify.inject({ method: 'GET', url: '/chains/ergo/status?network=mainnet' });
+    expect(status.statusCode).toBe(200);
+    const balances = await fastify.inject({
+      method: 'POST',
+      url: '/chains/ergo/balances',
+      payload: { network: 'mainnet', address: ME },
+    });
+    expect(balances.statusCode).toBe(200);
+    expect(JSON.parse(balances.body).balances.ERG).toBe(2.5);
+    const poll = await fastify.inject({
+      method: 'POST',
+      url: '/chains/ergo/poll',
+      payload: { network: 'mainnet', signature: TX },
+    });
+    expect(poll.statusCode).toBe(200);
+    expect(JSON.parse(poll.body).txStatus).toBe(TransactionStatusCode.CONFIRMED);
+    expect(node.calls.filter((c) => c.method === 'POST' && c.path.startsWith('/transactions'))).toEqual([]);
+  });
+
   it('GET /chains/ergo/status', async () => {
     const res = await fastify.inject({ method: 'GET', url: '/chains/ergo/status?network=mainnet' });
     expect(res.statusCode).toBe(200);

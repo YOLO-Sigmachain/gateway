@@ -21,8 +21,10 @@ import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
 
 import {
+  checkTestConfig,
   ERG,
   makeDex,
+  n2tPool,
   ME,
   ME_TREE,
   MNEMONIC_A,
@@ -35,6 +37,7 @@ import {
   ROOT,
   TOKENS,
   RSN,
+  withoutSubmitMode,
 } from './ergodex-test-helpers';
 import {
   LIT,
@@ -85,7 +88,7 @@ describe('ergodex execute-swap with submitMode check', () => {
   let dir: string;
   let file: string;
 
-  const checkConfig = (): ErgoNetworkConfig => testConfig({ submitMode: 'check', pendingStateFile: file });
+  const checkConfig = (): ErgoNetworkConfig => checkTestConfig({ pendingStateFile: file });
 
   beforeAll(async () => {
     app = fastifyWithTypeProvider();
@@ -133,8 +136,8 @@ describe('ergodex execute-swap with submitMode check', () => {
     const id = signed.id;
     expect(body.message).toBe(
       `Check only: the node accepted transaction ${id} as valid; nothing was sent. If it were sent, it would move ` +
-        `1 ERG in and 23.693 RSN out on spectrum:n2t pool ${NFT} box ${RSN_POOL.boxId} (confirmed), miner fee ` +
-        '0.0011 ERG; the wallet would change by -1.0011 ERG and 23.693 RSN',
+        `1 ERG in and 23.693 RSN (${RSN.slice(0, 8)}…) out on spectrum:n2t pool ${NFT} box ${RSN_POOL.boxId} ` +
+        `(confirmed), miner fee 0.0011 ERG; the wallet would change by -1.0011 ERG and 23.693 RSN (${RSN.slice(0, 8)}…)`,
     );
     expect(body.message).not.toContain('TRANSACTION_TIMEOUT');
 
@@ -272,7 +275,26 @@ describe('ergodex execute-swap with submitMode check', () => {
     const message: string = JSON.parse(res.body).message;
     expect(message).not.toContain('TRANSACTION_TIMEOUT');
     expect(message).not.toContain(lookalike);
-    expect(message).toContain(`23.693 ${RSN.slice(0, 8)}… out`);
+    expect(message).toContain(`23.693 ${RSN.slice(0, 8)}… (${RSN.slice(0, 8)}…) out`);
+    expect(transactionPosts(state)).toEqual(['/transactions/check']);
+  });
+
+  it('an unlisted token whose on-chain name is a listed symbol is told apart by the start of its id', async () => {
+    const UNLISTED = 'c7'.repeat(32);
+    const nft = 'fc'.repeat(32);
+    state.pools.set(nft, [n2tPool({ x: 1000n * ERG, y: 5000000n, fee: 997, token: UNLISTED, nft })]);
+    state.emission.set(UNLISTED, 1000000000n);
+    state.tokenNames = new Map([[UNLISTED, 'RSN']]);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ quoteToken: UNLISTED, poolAddress: nft }),
+    });
+    expect(res.statusCode).toBe(409);
+    const message: string = JSON.parse(res.body).message;
+    expect(message).toContain(` RSN (${UNLISTED.slice(0, 8)}…) out on `);
+    expect(message).not.toContain(`RSN (${RSN.slice(0, 8)}…)`);
+    expect(message).toContain('1 ERG in');
     expect(transactionPosts(state)).toEqual(['/transactions/check']);
   });
 
@@ -320,8 +342,97 @@ describe('ergodex execute-swap with submitMode check', () => {
     expect(tx.inputs[0].boxId).toBe(LIT_POOL.boxId);
     const message: string = JSON.parse(res.body).message;
     expect(message).toContain(`Check only: the node accepted transaction ${tx.id} as valid; nothing was sent`);
-    expect(message).toContain('1 ERG in and 241.428628025 LIT out on lithos:');
+    expect(message).toContain(`1 ERG in and 241.428628025 LIT (${LIT.slice(0, 8)}…) out on lithos:`);
     expect(lDex.ergo.pending.spentBoxIds().size).toBe(0);
     expect(fs.existsSync(file)).toBe(false);
+  });
+});
+
+describe('ergodex with submitMode not set', () => {
+  let app: ReturnType<typeof fastifyWithTypeProvider>;
+  let state: NodeState;
+  let dex: Ergodex;
+
+  beforeAll(async () => {
+    app = fastifyWithTypeProvider();
+    await app.register(require('@fastify/sensible'));
+    await app.register(tradingAmmRoutes, { prefix: '/trading/amm' });
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(() => {
+    state = newNodeState();
+    state.pools.set(NFT, [RSN_POOL]);
+    state.wallet = [walletBox(5n * ERG)];
+    dex = makeDex(state, dexConfig(), ROOT, TOKENS, withoutSubmitMode(testConfig()));
+    jest.spyOn(Ergodex, 'getInstance').mockImplementation(async () => dex);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('execute-swap answers 503 that says how to set it: no node request, no key loaded, nothing signed', async () => {
+    const getWallet = jest.spyOn(dex.ergo, 'getWallet');
+    const sign = jest.spyOn(dex.ergo, 'signTransaction');
+    const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: execBody() });
+    expect(res.statusCode).toBe(503);
+    const body = JSON.parse(res.body);
+    expect(body.message).toBe(
+      'Failed to execute ergodex swap: ergo-mainnet.submitMode is not set. Add "submitMode: send" to send ' +
+        'transactions, or "submitMode: check" to have the node only check them, to the network\'s config file, ' +
+        'then restart Gateway. Nothing was signed or sent.',
+    );
+    expect(body).not.toHaveProperty('signature');
+    expect(body.code).toBeUndefined();
+    expect(state.calls).toEqual([]);
+    expect(transactionPosts(state)).toEqual([]);
+    expect(getWallet).not.toHaveBeenCalled();
+    expect(sign).not.toHaveBeenCalled();
+    expect(dex.ergo.pending.spentBoxIds().size).toBe(0);
+  });
+
+  it('a LithosDex execute-swap answers the same, and nothing is loaded', async () => {
+    const lState = newNodeState();
+    putPools(lState, [[LIT_POOL, LIT_VAULT]]);
+    const lDex = makeLithosDex(lState, undefined, withoutSubmitMode(testConfig()));
+    const getWallet = jest.spyOn(lDex.ergo, 'getWallet');
+    (Ergodex.getInstance as jest.Mock).mockImplementation(async () => lDex);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ quoteToken: 'LIT', poolAddress: LIT_NFT }),
+    });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).message).toContain('ergo-mainnet.submitMode is not set.');
+    expect(lState.calls).toEqual([]);
+    expect(getWallet).not.toHaveBeenCalled();
+  });
+
+  it('quote-swap and pool-info answer as before', async () => {
+    const quote = await app.inject({
+      method: 'GET',
+      url:
+        '/trading/amm/quote-swap?' +
+        new URLSearchParams({
+          chainNetwork: 'ergo-mainnet',
+          connector: 'ergodex',
+          baseToken: 'ERG',
+          quoteToken: 'RSN',
+          amount: '1',
+          side: 'SELL',
+          poolAddress: NFT,
+        }),
+    });
+    expect(quote.statusCode).toBe(200);
+    expect(JSON.parse(quote.body).amountOut).toBe('23.693');
+    const info = await app.inject({
+      method: 'GET',
+      url: `/trading/amm/pool-info?connector=ergodex&chainNetwork=ergo-mainnet&poolAddress=${NFT}`,
+    });
+    expect(info.statusCode).toBe(200);
+    expect(transactionPosts(state)).toEqual([]);
   });
 });

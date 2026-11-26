@@ -18,9 +18,18 @@ import { ErgoBox, ErgoTokenInfo, NodeHeaderJson } from '../../../src/chains/ergo
 import { addressFromPublicKey } from '../../../src/chains/ergo/ergo.utils';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexNetworkConfig, ErgodexRootConfig } from '../../../src/connectors/ergodex/ergodex.config';
-import { makeBox, MNEMONIC_A, nodeBoxJson, p2pk, testConfig, tokenId } from '../../chains/ergo/ergo-test-helpers';
+import {
+  checkTestConfig,
+  makeBox,
+  MNEMONIC_A,
+  nodeBoxJson,
+  p2pk,
+  testConfig,
+  tokenId,
+  withoutSubmitMode,
+} from '../../chains/ergo/ergo-test-helpers';
 
-export { makeBox, nodeBoxJson, p2pk, tokenId, MNEMONIC_A, testConfig };
+export { checkTestConfig, makeBox, nodeBoxJson, p2pk, tokenId, MNEMONIC_A, testConfig, withoutSubmitMode };
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -167,6 +176,8 @@ export interface NodeState {
   emission: Map<string, bigint>;
   /** The node's state type in /info; unset: utxo. */
   stateType?: string;
+  /** On-chain token names by token id, for `/blockchain/token/byId`; unset: an empty name. */
+  tokenNames?: Map<string, string>;
 }
 
 export function newNodeState(): NodeState {
@@ -277,7 +288,14 @@ export function stateNode(state: NodeState): FetchLike {
       const emission = state.emission.get(m[1]) ?? (isPoolNft(state, m[1]) ? 1n : undefined);
       if (emission === undefined) return send(notFound);
       return send({
-        body: { id: m[1], boxId: m[1], emissionAmount: emission, name: '', description: '', decimals: 0 },
+        body: {
+          id: m[1],
+          boxId: m[1],
+          emissionAmount: emission,
+          name: state.tokenNames?.get(m[1]) ?? '',
+          description: '',
+          decimals: 0,
+        },
       });
     }
     throw new Error(`unrouted node request ${method} ${p}${url.search}`);

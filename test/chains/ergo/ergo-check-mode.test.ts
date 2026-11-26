@@ -1,11 +1,13 @@
 /**
- * The network's submitMode: `send` (the default, also when the key is absent) submits a
- * signed transaction; `check` posts it to the node's check endpoint only, keeps nothing,
- * and answers with an error that cannot be read as a submitted transaction. A transaction
- * tracked from an earlier run in `send` mode is never posted again while the mode is
- * `check`: not by poll, not by the overdue check, not as the parent of a chained one. Also
- * the config key, its schema entry and the shipped templates. Built with real fleet, signed
- * with real wasm, posted to a node stand-in.
+ * The network's submitMode: `send` submits a signed transaction; `check` posts it to the
+ * node's check endpoint only, keeps nothing, and answers with an error that cannot be read
+ * as a submitted transaction; not set (no key) refuses every swap and transfer before
+ * anything is selected, loaded or signed. A transaction tracked from an earlier run in
+ * `send` mode is never posted again while the mode is `check` or not set: not by poll, not
+ * by the overdue check, not as the parent of a chained one. Check mode needs a node on this
+ * machine unless the config accepts a remote one. The node client refuses any post to the
+ * submit endpoint unless the mode is send. Also the config key, its schema entry and the
+ * shipped templates. Built with real fleet, signed with real wasm, posted to a node stand-in.
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -19,18 +21,20 @@ import {
   ErgoCheckIncompleteError,
   ErgoCheckOnlyError,
   ErgoCheckRejectedError,
+  ErgoSubmitModeNotSetError,
   ErgoTransactionRejectedError,
 } from '../../../src/chains/ergo/ergo';
 import { getErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
 import { ErgoSubmitRefusedError } from '../../../src/chains/ergo/ergo.node-client';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
-import { addressFromPublicKey, sanitizeNodeText } from '../../../src/chains/ergo/ergo.utils';
+import { addressFromPublicKey, isLoopbackUrl, sanitizeNodeText } from '../../../src/chains/ergo/ergo.utils';
 import { toHttpError } from '../../../src/chains/ergo/routes/errors';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
 import { logger } from '../../../src/services/logger';
 
 import {
+  checkTestConfig,
   fakeNode,
   FakeResponse,
   FEE_TREE,
@@ -44,6 +48,8 @@ import {
   p2pk,
   testConfig,
   TIP,
+  tokenId,
+  withoutSubmitMode,
 } from './ergo-test-helpers';
 
 const signer = WasmErgoSigner.fromMnemonic(MNEMONIC_A);
@@ -75,9 +81,18 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+type ModeState = 'send' | 'check' | 'not set';
+
+/** The test network config in one of the three states, with the test's own pending file. */
+function modeConfig(mode: ModeState, overrides: Parameters<typeof testConfig>[0] = {}) {
+  if (mode === 'check') return checkTestConfig({ pendingStateFile: file, ...overrides });
+  const config = testConfig({ pendingStateFile: file, ...overrides });
+  return mode === 'send' ? config : withoutSubmitMode(config);
+}
+
 /** A wallet on a node stand-in; the check endpoint answers with `check`. */
 function setup(opts: {
-  submitMode?: 'send' | 'check';
+  submitMode: ModeState;
   check?: (body: string) => FakeResponse | 'throw';
   submit?: (body: string) => FakeResponse;
   info?: () => FakeResponse;
@@ -100,14 +115,13 @@ function setup(opts: {
     }
     return undefined;
   });
-  const config = testConfig({ pendingStateFile: file, ...(opts.submitMode ? { submitMode: opts.submitMode } : {}) });
-  const ergo = new Ergo('mainnet', { config, fetch: node.fetch });
-  jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+  const ergo = new Ergo('mainnet', { config: modeConfig(opts.submitMode), fetch: node.fetch });
+  const getWallet = jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
     address: ME,
     ergoTree: ME_TREE,
     signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
   }));
-  return { ergo, posted, checked, node };
+  return { ergo, posted, checked, node, getWallet };
 }
 
 describe('Ergo.transfer with submitMode check', () => {
@@ -324,11 +338,8 @@ describe('the text of a node refusal, as placed in a message or a log line', () 
 });
 
 describe('Ergo.transfer with submitMode send', () => {
-  it.each([
-    ['the key absent', undefined],
-    ['the key send', 'send' as const],
-  ])('with %s: submitted to /transactions, tracked, the check path never used', async (_name, submitMode) => {
-    const { ergo, posted, checked } = setup({ submitMode });
+  it('submitted to /transactions, tracked, the check path never used', async () => {
+    const { ergo, posted, checked } = setup({ submitMode: 'send' });
     expect(ergo.submitMode).toBe('send');
     const txId = await ergo.transfer(ME, OTHER, ERG);
     expect(posted).toHaveLength(1);
@@ -348,7 +359,7 @@ describe('a transaction tracked from an earlier run in send mode, read from the 
   const json2 = JSON.stringify({ id: TX2, inputs: [{ boxId: change.boxId }], dataInputs: [], outputs: [] });
 
   /** The node holds neither transaction anywhere; `input` is indexed and unspent. */
-  function restart(submitMode: 'send' | 'check', now?: () => number) {
+  function restart(submitMode: ModeState, now?: () => number) {
     const posted: string[] = [];
     const node = fakeNode((method, p, body) => {
       if (method === 'GET' && p === '/info') return { body: infoBody() };
@@ -364,11 +375,7 @@ describe('a transaction tracked from an earlier run in send mode, read from the 
       }
       return undefined;
     });
-    const ergo = new Ergo('mainnet', {
-      config: testConfig({ pendingStateFile: file, submitMode }),
-      fetch: node.fetch,
-      now,
-    });
+    const ergo = new Ergo('mainnet', { config: modeConfig(submitMode), fetch: node.fetch, now });
     return { ergo, posted };
   }
 
@@ -440,6 +447,54 @@ describe('a transaction tracked from an earlier run in send mode, read from the 
         'kept, and not posted again while submitMode is check',
     );
   });
+
+  describe('with submitMode not set', () => {
+    it('poll does not post it again: NOT_FOUND, kept, with a note that says why', async () => {
+      recordInSendMode();
+      const { ergo, posted } = restart('not set');
+      const r = await ergo.pollTransaction(TX1);
+      expect(r.txStatus).toBe(TransactionStatusCode.NOT_FOUND);
+      expect(r.txData).toEqual({
+        note:
+          'the node holds it nowhere and its inputs are unspent; it is kept, and not posted again while ' +
+          'submitMode is not set',
+      });
+      expect(posted).toEqual([]);
+      expect(ergo.pending.isSpent(input.boxId)).toBe(true);
+    });
+
+    it('poll of a chained transaction does not post its parent again; the answer stays PENDING', async () => {
+      recordInSendMode(true);
+      const { ergo, posted } = restart('not set');
+      const r = await ergo.pollTransaction(TX2);
+      expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+      expect(posted).toEqual([]);
+    });
+
+    it('the overdue check does not post it again; it is kept, and a warning says so', async () => {
+      recordInSendMode();
+      const later = () => Date.now() + 16 * 120 * 1000;
+      const warn = jest.spyOn(logger, 'warn');
+      const { ergo, posted } = restart('not set', later);
+      await ergo.getSpendableBoxes(ME);
+      expect(posted).toEqual([]);
+      expect(ergo.pending.get(TX1)).toBeDefined();
+      expect(warn.mock.calls.map((c) => String(c[0]))).toContain(
+        `Ergo mainnet: pending transaction ${TX1} is held nowhere by the node and its inputs are unspent; it is ` +
+          'kept, and not posted again while submitMode is not set',
+      );
+    });
+
+    it('the one path to the submit endpoint refuses to post, if anything ever reached it', async () => {
+      recordInSendMode();
+      const { ergo, posted } = restart('not set');
+      const postAgain = (ergo as unknown as { postAgain: (tx: unknown) => Promise<unknown> }).postAgain.bind(ergo);
+      await expect(postAgain(ergo.pending.get(TX1))).rejects.toThrow(
+        'ergo-mainnet.submitMode is not set: nothing is sent to the node',
+      );
+      expect(posted).toEqual([]);
+    });
+  });
 });
 
 describe('the submitMode config key', () => {
@@ -464,8 +519,8 @@ describe('the submitMode config key', () => {
     } as unknown as ConfigManagerV2);
   });
 
-  it('absent is send; send and check are read as they are; any other value is refused', () => {
-    expect(getErgoNetworkConfig('mainnet').submitMode).toBe('send');
+  it('absent is not set; send and check are read as they are; any other value is refused', () => {
+    expect(getErgoNetworkConfig('mainnet').submitMode).toBeUndefined();
     mockConfigStorage['ergo-mainnet.submitMode'] = 'send';
     expect(getErgoNetworkConfig('mainnet').submitMode).toBe('send');
     mockConfigStorage['ergo-mainnet.submitMode'] = 'check';
@@ -482,7 +537,7 @@ describe('the submitMode config key', () => {
     );
   });
 
-  it('a network states its mode when it starts: an info line in send mode, a warning in check mode', () => {
+  it('a network states its mode when it starts: an info line in send mode, a warning in check mode and when not set', () => {
     const warn = jest.spyOn(logger, 'warn');
     const info = jest.spyOn(logger, 'info');
     const modeLines = (spy: jest.SpyInstance) => spy.mock.calls.filter((c) => String(c[0]).includes('submitMode'));
@@ -491,11 +546,17 @@ describe('the submitMode config key', () => {
     expect(modeLines(warn)).toHaveLength(0);
     const sendLine = ['ergo-mainnet.submitMode is send: signed transactions are sent to the node'];
     expect(modeLines(info)).toEqual([sendLine, sendLine]);
-    new Ergo('mainnet', { config: testConfig({ submitMode: 'check' }) });
+    new Ergo('mainnet', { config: checkTestConfig() });
+    new Ergo('mainnet', { config: withoutSubmitMode(testConfig()) });
     expect(modeLines(warn)).toEqual([
       [
         'ergo-mainnet.submitMode is check: signed transactions are only checked by the node, never sent; no swap ' +
           'or transfer from this network is carried out',
+      ],
+      [
+        'ergo-mainnet.submitMode is not set: no swap or transfer is carried out until it is set; nothing is ' +
+          'signed, sent or checked. Add "submitMode: send" or "submitMode: check" to the network\'s config file, ' +
+          'then restart Gateway',
       ],
     ]);
     expect(modeLines(info)).toHaveLength(2);
@@ -525,4 +586,230 @@ describe('submitMode in the schema and the shipped templates', () => {
       expect(schema.required).not.toContain('submitMode');
     },
   );
+
+  it.each(['mainnet', 'testnet'])(
+    '%s explains the three states, and that a fresh config sends nothing until the key is set',
+    (net) => {
+      const comment = text(net).replace(/\n# ?/g, ' ').replace(/ +/g, ' ');
+      expect(comment).toContain('Three states:');
+      expect(comment).toContain('- submitMode: send.');
+      expect(comment).toContain('- submitMode: check.');
+      expect(comment).toContain('- not set (no submitMode line). Nothing is signed, sent or checked');
+      expect(comment).toContain('A fresh config sends nothing until this key is set.');
+    },
+  );
+
+  it.each(['mainnet', 'testnet'])(
+    '%s ships checkAllowsRemoteNode only as a commented line with its reason; the schema takes a boolean',
+    (net) => {
+      const validate = new Ajv({ strict: false }).compile(schema);
+      expect(load(net)).not.toHaveProperty('checkAllowsRemoteNode');
+      expect(text(net)).toMatch(/^# checkAllowsRemoteNode: true$/m);
+      expect(text(net)).toContain('whoever runs or can watch a remote node could broadcast');
+      expect(schema.properties.checkAllowsRemoteNode.type).toBe('boolean');
+      expect(schema.required).not.toContain('checkAllowsRemoteNode');
+      expect(validate({ ...load(net), checkAllowsRemoteNode: true })).toBe(true);
+      expect(validate({ ...load(net), checkAllowsRemoteNode: 'true' })).toBe(false);
+    },
+  );
+});
+
+const NOT_SET_MESSAGE =
+  'ergo-mainnet.submitMode is not set. Add "submitMode: send" to send transactions, or "submitMode: check" to ' +
+  "have the node only check them, to the network's config file, then restart Gateway. Nothing was signed or sent.";
+
+describe('with submitMode not set: nothing is selected, loaded, signed, checked or sent', () => {
+  const transactionPosts = (calls: Array<{ method: string; path: string }>) =>
+    calls.filter((c) => c.method === 'POST' && c.path.startsWith('/transactions'));
+
+  it('transfer answers the 503 at once: no node request, no key loaded, nothing signed', async () => {
+    const { ergo, posted, checked, node, getWallet } = setup({ submitMode: 'not set' });
+    const sign = jest.spyOn(ergo, 'signTransaction');
+    expect(ergo.submitMode).toBeUndefined();
+    const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoSubmitModeNotSetError);
+    expect(error.message).toBe(NOT_SET_MESSAGE);
+    const http = toHttpError(error, 'Failed to transfer') as Error & { statusCode: number };
+    expect(http.statusCode).toBe(503);
+    expect(http.message).toBe(`Failed to transfer: ${NOT_SET_MESSAGE}`);
+    expect(node.calls).toEqual([]);
+    expect(getWallet).not.toHaveBeenCalled();
+    expect(sign).not.toHaveBeenCalled();
+    expect(posted).toEqual([]);
+    expect(checked).toEqual([]);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('sendTransaction answers the same before any box is selected or anything signed', async () => {
+    const { ergo, node } = setup({ submitMode: 'not set' });
+    const used = WasmErgoSigner.fromMnemonic(MNEMONIC_A);
+    const signerSign = jest.spyOn(used, 'signTransaction');
+    const build = jest.spyOn(ergo, 'buildTransaction');
+    const error = await errorOf(ergo.sendTransaction({ changeAddress: ME, outputs: [] }, used));
+    expect(error).toBeInstanceOf(ErgoSubmitModeNotSetError);
+    expect(build).not.toHaveBeenCalled();
+    expect(signerSign).not.toHaveBeenCalled();
+    expect(node.calls).toEqual([]);
+  });
+
+  it('submitTransaction of a transaction signed elsewhere answers the same; nothing is posted', async () => {
+    const { ergo, node } = setup({ submitMode: 'not set' });
+    const built = await ergo.buildTransfer(ME, OTHER, ERG);
+    const signed = await ergo.signTransaction(built, signer);
+    await expect(ergo.submitTransaction(signed, built)).rejects.toThrow(NOT_SET_MESSAGE);
+    expect(transactionPosts(node.calls)).toEqual([]);
+    expect(ergo.pending.spentBoxIds().size).toBe(0);
+  });
+
+  it('balances are read as before', async () => {
+    const { ergo } = setup({ submitMode: 'not set' });
+    jest.spyOn(ergo, 'getTokenList').mockResolvedValue([]);
+    const balances = await ergo.getBalances(ME);
+    expect(balances).toEqual([{ key: 'ERG', symbol: 'ERG', address: null, balance: 5 }]);
+  });
+});
+
+describe('check mode needs the node on this machine, unless the config accepts a remote one', () => {
+  const build = (nodeURL: string, more: Parameters<typeof testConfig>[0] = {}) =>
+    new Ergo('mainnet', { config: testConfig({ submitMode: 'check', nodeURL, ...more }) });
+
+  it.each([
+    'http://localhost:9053',
+    'http://LOCALHOST:9053',
+    'http://127.0.0.1:9053',
+    'http://127.1.2.3:9053',
+    'http://127.1:9053',
+    'http://[::1]:9053',
+    'http://[0:0:0:0:0:0:0:1]:9053',
+    'https://user:pass@127.0.0.1/node',
+  ])('%s: the network starts in check mode', (nodeURL) => {
+    expect(isLoopbackUrl(nodeURL)).toBe(true);
+    expect(build(nodeURL).submitMode).toBe('check');
+  });
+
+  it.each([
+    ['http://node.test:9053', 'node.test'],
+    ['http://192.168.1.5:9053', '192.168.1.5'],
+    ['http://localhost.example.com:9053', 'localhost.example.com'],
+    ['http://128.0.0.1:9053', '128.0.0.1'],
+    ['http://[::ffff:127.0.0.1]:9053', '[::ffff:7f00:1]'],
+    ['http://user:secret@node.example:9053', 'node.example'],
+  ])('%s: the network does not start, and the error says why', (nodeURL, host) => {
+    expect(isLoopbackUrl(nodeURL)).toBe(false);
+    let error: unknown;
+    try {
+      build(nodeURL);
+    } catch (e) {
+      error = e;
+    }
+    expect((error as Error).message).toBe(
+      `ergo-mainnet.submitMode is check and nodeURL names the host ${host}, which is not this machine. In check ` +
+        'mode the node receives every signed transaction in full, and whoever runs or can watch that node could ' +
+        'broadcast it. Point nodeURL at a node on this machine (localhost, 127.0.0.0/8 or ::1), or set ' +
+        'ergo-mainnet.checkAllowsRemoteNode: true to accept that; this network does not start until then',
+    );
+    expect((error as Error).message).not.toContain('secret');
+  });
+
+  it('a remote node with checkAllowsRemoteNode true: the network starts in check mode', () => {
+    expect(build('http://node.test:9053', { checkAllowsRemoteNode: true }).submitMode).toBe('check');
+  });
+
+  it('a remote node in send mode or with the mode not set starts as before', () => {
+    expect(new Ergo('mainnet', { config: testConfig({ nodeURL: 'http://node.test:9053' }) }).submitMode).toBe('send');
+    expect(new Ergo('mainnet', { config: withoutSubmitMode(testConfig()) }).submitMode).toBeUndefined();
+  });
+});
+
+describe("the node client's general request method refuses a post to the submit endpoint", () => {
+  it.each([['check' as const], ['not set' as const]])(
+    'with the mode %s: every spelling of the submit path throws and nothing is posted',
+    async (mode) => {
+      const { ergo, node } = setup({ submitMode: mode });
+      for (const p of [
+        '/transactions',
+        '/transactions/',
+        '/transactions?x=1',
+        '//transactions',
+        '/%74ransactions',
+        '/Transactions',
+        '/transactions/check/..',
+      ]) {
+        await expect(ergo.node.request('POST', p, { body: '{}' })).rejects.toBeInstanceOf(ErgoSubmitRefusedError);
+      }
+      expect(node.calls).toEqual([]);
+    },
+  );
+
+  it('with the mode check, the check path and other posts are not refused', async () => {
+    const { ergo, checked } = setup({ submitMode: 'check' });
+    await expect(
+      ergo.node.request('POST', '/transactions/check', {
+        body: JSON.stringify({ id: 'ab'.repeat(32) }),
+        plainTextOk: true,
+      }),
+    ).resolves.toBe('ab'.repeat(32));
+    expect(checked).toHaveLength(1);
+  });
+
+  it('with the mode send, it posts as before', async () => {
+    const { ergo, posted } = setup({ submitMode: 'send' });
+    await ergo.node.request('POST', '/transactions', {
+      body: JSON.stringify({ id: 'ab'.repeat(32) }),
+      plainTextOk: true,
+    });
+    expect(posted).toHaveLength(1);
+  });
+});
+
+describe('a checked transfer names each token by its symbol and the start of its id', () => {
+  it('a listed token and an unlisted one whose on-chain name is the same symbol are told apart', async () => {
+    const LISTED = tokenId(0x31);
+    const UNLISTED = tokenId(0x32);
+    const withTokens = makeBox({
+      ergoTree: ME_TREE,
+      value: 5n * ERG,
+      creationHeight: TIP - 30,
+      assets: [
+        { tokenId: LISTED, amount: 1000n },
+        { tokenId: UNLISTED, amount: 1000n },
+      ],
+    });
+    const checked: string[] = [];
+    const node = fakeNode((method, p, body) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody() };
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress'))
+        return { body: [nodeBoxJson(withTokens)] };
+      if (method === 'GET' && p === '/blocks/lastHeaders/10') return { body: HEADERS };
+      if (method === 'GET' && p === `/blockchain/token/byId/${UNLISTED}`) {
+        return { body: { id: UNLISTED, name: 'SigUSD', decimals: 2, emissionAmount: 100000 } };
+      }
+      if (method === 'POST' && p === '/transactions/check') {
+        checked.push(body!);
+        return acceptWithId(body!);
+      }
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { config: checkTestConfig({ pendingStateFile: file }), fetch: node.fetch });
+    jest
+      .spyOn(ergo, 'getTokenList')
+      .mockResolvedValue([{ address: LISTED, symbol: 'SigUSD', name: 'SigUSD', decimals: 2 }]);
+    jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({
+      address: ME,
+      ergoTree: ME_TREE,
+      signer: WasmErgoSigner.fromMnemonic(MNEMONIC_A),
+    }));
+    const error = await errorOf(
+      ergo.transfer(ME, OTHER, ERG, [
+        { tokenId: LISTED, amount: 5n },
+        { tokenId: UNLISTED, amount: 7n },
+      ]),
+    );
+    expect(error).toBeInstanceOf(ErgoCheckOnlyError);
+    expect(error.message).toContain(
+      `would move 1 ERG, 5 of SigUSD (${LISTED.slice(0, 8)}…) (in its smallest unit), 7 of SigUSD ` +
+        `(${UNLISTED.slice(0, 8)}…) (in its smallest unit) to ${OTHER}`,
+    );
+    expect(checked).toHaveLength(1);
+  });
 });

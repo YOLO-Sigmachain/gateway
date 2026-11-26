@@ -24,16 +24,17 @@
  * confirmed swap's `data`. It carries no `data`: that means confirmed. Whether it
  * confirmed is reported only by poll. No order box is ever placed, before or after.
  *
- * With the network's submitMode `check`, everything up to and including signing runs as
- * above, and the signed transaction then goes to the node's check endpoint only. The answer
- * is never PENDING: a 409 that says the node found transaction <id> valid, that nothing was
- * sent, and what it would move; a 400 with the node's text when the check refuses it; a 503
- * when the check gives no verdict.
+ * With the network's submitMode not set, the answer is a 503 before anything is read,
+ * loaded or signed. With the network's submitMode `check`, everything up to and including
+ * signing runs as above, and the signed transaction then goes to the node's check endpoint
+ * only. The answer is never PENDING: a 409 that says the node found transaction <id>
+ * valid, that nothing was sent, and what it would move; a 400 with the node's text when the
+ * check refuses it; a 503 when the check gives no verdict.
  */
 import { ErgoCheckOnlyError, ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
-import { symbolForMessage } from '../../../chains/ergo/ergo.utils';
+import { symbolForMessage, tokenForMessage } from '../../../chains/ergo/ergo.utils';
 import { ErgoWalletAccount } from '../../../chains/ergo/ergo.wallet';
 import { ChainExecuteSwapResponseType, TransactionStatusCode } from '../../../schemas/chain-schema';
 import { httpErrors } from '../../../services/error-handler';
@@ -142,13 +143,17 @@ export function fixedSwapData(
   };
 }
 
-/** What a checked (not sent) swap would move, in words, from the same amounts as `pendingData`. */
+/**
+ * What a checked (not sent) swap would move, in words, from the same amounts as
+ * `pendingData`. Each token is named by its symbol and the start of its id, so a token
+ * named like another can be told apart; the native coin by its symbol.
+ */
 export function describeCheckedSwap(
   plan: SwapPlan,
   data: NonNullable<ChainExecuteSwapResponseType['data']>,
   nativeSymbol: string,
 ): string {
-  const sym = (token: SwapPlan['base']) => symbolForMessage(token.symbol, token.tokenId);
+  const sym = (token: SwapPlan['base']) => tokenForMessage(token.symbol, token.tokenId);
   return (
     `${data.amountIn} ${sym(plan.tokenIn)} in and ${data.amountOut} ${sym(plan.tokenOut)} out on ` +
     `${describeRoute(plan)}, miner fee ${data.fee} ${symbolForMessage(nativeSymbol, null)}; the wallet would ` +
@@ -188,6 +193,8 @@ export async function executeSwap(
     }
     const dex = await Ergodex.getInstance(network);
     const ergo = dex.ergo;
+    // before any pool or box is read and before the wallet's key is loaded
+    ergo.assertSubmitModeSet();
     const appliedSlippagePct = slippagePct ?? dex.root.slippagePct;
     const slip = pctToScaled(appliedSlippagePct);
     wallet = await ergo.getWallet(walletAddress);

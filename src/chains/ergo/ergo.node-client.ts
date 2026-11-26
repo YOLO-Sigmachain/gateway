@@ -123,8 +123,8 @@ export function normalizeNodeBox(raw: Record<string, unknown>): ErgoBox {
 }
 
 /**
- * submitTransaction was called while the network's submit mode is not `send`: nothing was
- * posted to the node.
+ * A post to the node's submit endpoint (through submitTransaction or request) was asked for
+ * while the network's submit mode is not `send`: nothing was posted to the node.
  */
 export class ErgoSubmitRefusedError extends Error {
   constructor() {
@@ -162,6 +162,8 @@ export class ErgoNodeClient {
     options: { body?: string; contentType?: string; notFoundIsNull?: boolean; plainTextOk?: boolean } = {},
   ): Promise<T | null> {
     const url = `${this.baseUrl}${path}`;
+    // whoever the caller, nothing is posted to the submit endpoint unless the mode is send
+    if (method === 'POST' && this.isSubmitPath(url) && !this.canSubmit()) throw new ErgoSubmitRefusedError();
     let response: Awaited<ReturnType<FetchLike>>;
     try {
       response = await this.fetchImpl(url, {
@@ -202,6 +204,31 @@ export class ErgoNodeClient {
     } catch (error) {
       if (options.plainTextOk) return text.trim() as unknown as T;
       throw new ErgoNodeError(response.status, `Ergo node sent unreadable JSON for ${method} ${path}`);
+    }
+  }
+
+  /**
+   * Whether a URL is the node's submit endpoint (`/transactions` under the node's base URL),
+   * as the node would read it: dot segments resolved, percent escapes decoded, repeated and
+   * trailing slashes dropped, case ignored. A URL that cannot be read counts as one.
+   */
+  private isSubmitPath(url: string): boolean {
+    const normalize = (pathname: string) => {
+      let decoded = pathname;
+      try {
+        decoded = decodeURIComponent(pathname);
+      } catch {
+        // kept as it is
+      }
+      return decoded
+        .replace(/\/{2,}/g, '/')
+        .replace(/\/+$/, '')
+        .toLowerCase();
+    };
+    try {
+      return normalize(new URL(url).pathname) === normalize(`${new URL(`${this.baseUrl}/`).pathname}transactions`);
+    } catch {
+      return true;
     }
   }
 

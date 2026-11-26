@@ -1,3 +1,9 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
+import yaml from 'js-yaml';
+
+import { rootPath } from '../../paths';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
 
 import { toAmount } from './ergo.json';
@@ -40,19 +46,126 @@ export interface ErgoNetworkConfig {
   /**
    * What happens to a signed transaction. `send`: it is submitted to the node, which relays
    * it. `check`: it is only checked by the node's /transactions/check endpoint, and nothing
-   * is sent or tracked. Unset: `send`.
+   * is sent or tracked. Unset: nothing is signed, sent or checked; every swap and transfer
+   * is refused until it is set.
    */
   submitMode?: ErgoSubmitMode;
+  /**
+   * In check mode the node at nodeURL receives every signed transaction in full, so a
+   * network in check mode starts only when nodeURL is on this machine, unless this is true.
+   */
+  checkAllowsRemoteNode?: boolean;
 }
 
 export const SUBMIT_MODES = ['send', 'check'] as const;
 export type ErgoSubmitMode = (typeof SUBMIT_MODES)[number];
 
-/** The submit mode a config value names; unset is `send`, anything else is refused. */
-export function parseSubmitMode(value: unknown, key: string): ErgoSubmitMode {
-  if (value === undefined || value === null || value === '') return 'send';
+/** The submit mode a config value names; unset is undefined (not set), anything else is refused. */
+export function parseSubmitMode(value: unknown, key: string): ErgoSubmitMode | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
   if (typeof value === 'string' && (SUBMIT_MODES as readonly string[]).includes(value)) return value as ErgoSubmitMode;
   throw new Error(`${key} must be one of ${SUBMIT_MODES.join(', ')}; got ${String(value)}`);
+}
+
+/** The one key the submit mode is read from, at the top level of the network's config file. */
+export const SUBMIT_MODE_KEY = 'submitMode';
+const SUBMIT_MODE_FOLDED = 'submitmode';
+
+/** Edit distance (insertions, deletions, substitutions) between two strings, by code point. */
+function editDistance(a: string, b: string): number {
+  const x = Array.from(a);
+  const y = Array.from(b);
+  let previous = Array.from({ length: y.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= x.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= y.length; j++) {
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[y.length];
+}
+
+/**
+ * Whether a config key looks like submitMode: after Unicode NFKC normalisation, lower-casing
+ * and removing every character that is not a letter or a digit, it is `submitmode` or within
+ * two edits of it (`sumbitMode`, `submitMod`, `submit_mode`, `submit.mode`, a lookalike
+ * letter from another alphabet, an invisible character). The exact key matches too.
+ */
+export function isSubmitModeLookalike(key: string): boolean {
+  const folded = key
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '');
+  return folded === SUBMIT_MODE_FOLDED || editDistance(folded, SUBMIT_MODE_FOLDED) <= 2;
+}
+
+/** A key as it is shown in a message: quoted, cut at 60 characters, with every character outside printable ASCII escaped. */
+function shownKey(key: string): string {
+  const chars = Array.from(key);
+  const cut = chars.slice(0, 60).join('');
+  const escaped = cut.replace(/[^\x20-\x7e]|["\\]/gu, (c) =>
+    c === '"' || c === '\\'
+      ? `\\${c}`
+      : Array.from(c)
+          .map((p) => `\\u{${p.codePointAt(0)!.toString(16)}}`)
+          .join(''),
+  );
+  return `"${escaped}"${chars.length > 60 ? '…' : ''}`;
+}
+
+/** A config file's path as it is shown in a message: relative to the Gateway folder when it is inside it. */
+export function shownConfigPath(file: string): string {
+  const relative = path.relative(rootPath(), file);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : file;
+}
+
+/** What an error that stopped a read is, by its code or its class; never its message, which may quote the file. */
+export function errorKind(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && /^[A-Z0-9_]{1,40}$/.test(code)) return code;
+  return error instanceof Error ? error.name : typeof error;
+}
+
+const isMapping = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * A key that looks like submitMode and is not the one key the mode is read from, in words,
+ * or undefined when there is none. Looked for in the network's config file as read
+ * (`fileBody`: its top-level keys, and the keys of each mapping one level down), in the
+ * network's config held in memory, and in the chain's config held in memory (where no key
+ * like it belongs at all). Such a key is not read, so the mode would not be what it seems
+ * to say.
+ */
+export function findSubmitModeLookalike(namespaceId: string, fileBody: unknown): string | undefined {
+  const manager = ConfigManagerV2.getInstance();
+  const namespace = manager.getNamespace(namespaceId);
+  const file = namespace ? shownConfigPath(namespace.configurationPath) : `the ${namespaceId} config file`;
+  const found = (key: string, where: string) =>
+    `the key ${shownKey(key)} ${where} is not read: the submit mode is set only by the key "${SUBMIT_MODE_KEY}" ` +
+    `at the top level of ${file}`;
+  if (isMapping(fileBody)) {
+    for (const [key, value] of Object.entries(fileBody)) {
+      if (key !== SUBMIT_MODE_KEY && isSubmitModeLookalike(key)) return found(key, `in ${file}`);
+      if (!isMapping(value)) continue;
+      for (const inner of Object.keys(value)) {
+        if (isSubmitModeLookalike(inner)) return found(inner, `under ${shownKey(key)} in ${file}`);
+      }
+    }
+  }
+  for (const key of Object.keys(namespace?.configuration ?? {})) {
+    if (key !== SUBMIT_MODE_KEY && isSubmitModeLookalike(key)) {
+      return found(key, `in the ${namespaceId} config held in memory`);
+    }
+  }
+  const chain = manager.getNamespace('ergo');
+  for (const key of Object.keys(chain?.configuration ?? {})) {
+    if (isSubmitModeLookalike(key)) {
+      return found(key, `in the ergo chain config${chain ? ` (${shownConfigPath(chain.configurationPath)})` : ''}`);
+    }
+  }
+  return undefined;
 }
 
 export interface ErgoChainConfig {
@@ -82,19 +195,27 @@ function optional<T>(namespaceId: string, key: string): T | undefined {
 }
 
 /**
- * Refuse a key that is a misspelling of submitMode (`submitmode`, `submit_mode`,
- * `SubmitMode`, `submit-mode`, ...): it would not be read, and the network would send while
- * the file seems to say check.
+ * Refuse to start a network whose config has a key that looks like submitMode but is not
+ * the one key read (see findSubmitModeLookalike): the mode would not be what the file seems
+ * to say. The network's config file is read from disk for this; a file that cannot be read
+ * stops the network too.
  */
 function refuseSubmitModeLookalikes(namespaceId: string): void {
-  const configuration = ConfigManagerV2.getInstance().getNamespace(namespaceId)?.configuration ?? {};
-  for (const key of Object.keys(configuration)) {
-    if (key !== 'submitMode' && key.toLowerCase().replace(/[_\- ]/g, '') === 'submitmode') {
+  const namespace = ConfigManagerV2.getInstance().getNamespace(namespaceId);
+  let fileBody: unknown;
+  if (namespace) {
+    try {
+      fileBody = yaml.load(fs.readFileSync(namespace.configurationPath, 'utf8'));
+    } catch (error) {
       throw new Error(
-        `${namespaceId} has the key "${key}", which is not read: the key is spelled submitMode. ` +
-          'Correct it in the config file; this network does not start until then',
+        `${namespaceId}: the config file ${shownConfigPath(namespace.configurationPath)} cannot be read ` +
+          `(${errorKind(error)}); this network does not start until it can`,
       );
     }
+  }
+  const problem = findSubmitModeLookalike(namespaceId, fileBody);
+  if (problem) {
+    throw new Error(`${namespaceId}: ${problem}. Correct it; this network does not start until then`);
   }
 }
 
@@ -137,6 +258,7 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
     swapProvider: optional<string>(namespaceId, 'swapProvider'),
     pendingStateFile: optional<string>(namespaceId, 'pendingStateFile'),
     submitMode: parseSubmitMode(optional(namespaceId, 'submitMode'), `${namespaceId}.submitMode`),
+    ...(optional(namespaceId, 'checkAllowsRemoteNode') === true ? { checkAllowsRemoteNode: true } : {}),
   };
 }
 

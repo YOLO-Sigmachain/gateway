@@ -62,7 +62,11 @@
     "submitMode": {
       "type": "string",
       "enum": ["send", "check"],
-      "description": "send: signed transactions are submitted to the node, which relays them. check: they are only checked by the node's /transactions/check endpoint and never sent; a swap or transfer then answers an error that names the transaction id and says nothing was sent. Unset: send"
+      "description": "send: signed transactions are submitted to the node, which relays them. check: they are only checked by the node's /transactions/check endpoint and never sent; a swap or transfer then answers an error that names the transaction id and says nothing was sent. Unset: nothing is signed, sent or checked, and every swap and transfer is refused until it is set"
+    },
+    "checkAllowsRemoteNode": {
+      "type": "boolean",
+      "description": "In check mode the node at nodeURL receives every signed transaction in full, so a network in check mode starts only when nodeURL is on this machine (localhost, 127.0.0.0/8 or ::1). True: start in check mode with a remote node too. Unset: false"
     },
     "swapProvider": {
       "type": "string",

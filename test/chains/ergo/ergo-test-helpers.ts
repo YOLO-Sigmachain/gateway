@@ -103,8 +103,14 @@ export function fixtureText(name: string): string {
 export const HEADERS = loadHeaders();
 export const TIP = Math.max(...HEADERS.map((h) => h.height));
 
+/**
+ * A network config for tests. It says `submitMode: send`: a network sends only when its
+ * config says so. A test of check mode overrides it, and a test of the mode not set leaves
+ * the key out (see withoutSubmitMode).
+ */
 export function testConfig(overrides: Partial<ErgoNetworkConfig> = {}): ErgoNetworkConfig {
   return {
+    submitMode: 'send',
     nodeURL: 'http://node.test:9053',
     addressPrefix: 0,
     nativeCurrencySymbol: 'ERG',
@@ -120,6 +126,21 @@ export function testConfig(overrides: Partial<ErgoNetworkConfig> = {}): ErgoNetw
     boxPageSize: 100,
     ...overrides,
   };
+}
+
+/** The same config with no submitMode key at all: the mode not set. */
+export function withoutSubmitMode(config: ErgoNetworkConfig): ErgoNetworkConfig {
+  const { submitMode: _left, ...rest } = config;
+  return rest;
+}
+
+/**
+ * A check-mode network config for tests. Its node stand-in is reached through an injected
+ * fetch, never over the network; nodeURL keeps the test host, so the config says
+ * checkAllowsRemoteNode (check mode otherwise needs a node on this machine).
+ */
+export function checkTestConfig(overrides: Partial<ErgoNetworkConfig> = {}): ErgoNetworkConfig {
+  return testConfig({ submitMode: 'check', checkAllowsRemoteNode: true, ...overrides });
 }
 
 export interface FakeResponse {
