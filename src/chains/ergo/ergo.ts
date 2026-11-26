@@ -499,7 +499,21 @@ export class Ergo {
       throw new ErgoTransactionAssertionError("change goes to a tree that is not the signer's address");
     }
     const headers = await this.node.getLastHeaders(10);
-    const signed = await signer.signTransaction(built.unsigned, built.unsigned.inputs, built.unsigned.dataInputs, {
+    // The second signer is an unreleased alpha build of the signing library
+    // (ergo-lib-wasm-nodejs 0.29.0-alpha-2f840d3). It is used only for a transaction with an
+    // input or data input whose ErgoTree is version 3, which 0.28.0 cannot read; every other
+    // transaction (transfers, Spectrum swaps) signs on 0.28.0 as before.
+    let chosen = signer;
+    if (spendsTreeVersion3(built)) {
+      if (!signer.forTreeVersion3) {
+        throw new ErgoTransactionAssertionError('an input is at ErgoTree version 3 and this signer cannot sign it');
+      }
+      chosen = await signer.forTreeVersion3();
+      if (chosen.publicKeys.join(',') !== signer.publicKeys.join(',')) {
+        throw new ErgoTransactionAssertionError('the version-3 signer holds other keys');
+      }
+    }
+    const signed = await chosen.signTransaction(built.unsigned, built.unsigned.inputs, built.unsigned.dataInputs, {
       headers,
     });
     assertSignedMatches(built, signed);
@@ -1095,6 +1109,22 @@ function summarize(tx: NodeTransaction, confirmations: number): Record<string, u
     dataInputs: (tx.dataInputs ?? []).map((d) => d.boxId),
     outputs: (tx.outputs ?? []).map((o) => o.boxId),
   }) as Record<string, unknown>;
+}
+
+/** The version an ErgoTree's header byte states (its low three bits). */
+export function ergoTreeVersion(ergoTree: string): number {
+  return parseInt(ergoTree.slice(0, 2), 16) & 0x07;
+}
+
+/**
+ * Whether a transaction spends or reads a box at an ErgoTree of version 3. A version above
+ * 3 is refused: no signer here is known to read it.
+ */
+export function spendsTreeVersion3(built: BuiltErgoTransaction): boolean {
+  const versions = [...built.inputBoxes, ...built.dataInputBoxes].map((b) => ergoTreeVersion(b.ergoTree));
+  if (versions.some((v) => v > 3))
+    throw new ErgoTransactionAssertionError('an input is at an ErgoTree version above 3');
+  return versions.includes(3);
 }
 
 /**

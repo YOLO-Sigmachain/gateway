@@ -9,6 +9,17 @@
       ]
     },
     "tree": { "type": "string", "pattern": "^([0-9a-fA-F]{2})+$" },
+    "id": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "lithosKind": {
+      "type": "object",
+      "properties": {
+        "poolTree": { "$ref": "#/definitions/tree" },
+        "feeVaultTree": { "$ref": "#/definitions/tree" },
+        "provisionLogicValue": { "$ref": "#/definitions/tree" }
+      },
+      "required": ["poolTree", "feeVaultTree", "provisionLogicValue"],
+      "additionalProperties": false
+    },
     "network": {
       "type": "object",
       "properties": {
@@ -33,6 +44,50 @@
             "feeDenominator": { "$ref": "#/definitions/amount" },
             "n2tMinSuccessorValue": { "$ref": "#/definitions/amount" }
           },
+          "additionalProperties": false
+        },
+        "lithos": {
+          "type": "object",
+          "description": "LithosDex pools: operator allowlist, contract constants and pinned contract templates",
+          "properties": {
+            "poolAllowlist": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+              "description": "Pool NFT ids of LithosDex pools the operator has checked; only these are offered, and only if they pass the deployment check"
+            },
+            "feeDenominator": { "$ref": "#/definitions/amount" },
+            "accumulatorScale": { "$ref": "#/definitions/amount" },
+            "lockedLiquidity": { "$ref": "#/definitions/amount" },
+            "n2tMinSuccessorValue": { "$ref": "#/definitions/amount" },
+            "swapOperation": { "type": "integer", "minimum": 0, "maximum": 127 },
+            "sentinels": {
+              "type": "object",
+              "properties": {
+                "poolNft": { "$ref": "#/definitions/id" },
+                "vaultNft": { "$ref": "#/definitions/id" },
+                "provisionToken": { "$ref": "#/definitions/id" },
+                "provisionLogicHash": { "$ref": "#/definitions/id" },
+                "provisionGuardHash": { "$ref": "#/definitions/id" }
+              },
+              "required": ["poolNft", "vaultNft", "provisionToken", "provisionLogicHash", "provisionGuardHash"],
+              "additionalProperties": false
+            },
+            "provisionGuardTree": { "$ref": "#/definitions/tree" },
+            "n2t": { "$ref": "#/definitions/lithosKind" },
+            "t2t": { "$ref": "#/definitions/lithosKind" }
+          },
+          "required": [
+            "poolAllowlist",
+            "feeDenominator",
+            "accumulatorScale",
+            "lockedLiquidity",
+            "n2tMinSuccessorValue",
+            "swapOperation",
+            "sentinels",
+            "provisionGuardTree",
+            "n2t",
+            "t2t"
+          ],
           "additionalProperties": false
         }
       },

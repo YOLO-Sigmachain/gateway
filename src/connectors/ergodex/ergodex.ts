@@ -1,6 +1,6 @@
 /**
- * Connector `ergodex`: AMM trading on Ergo through venue modules (`venues/`). Spectrum-style
- * pools are the first venue; LithosDex and Dexy are to follow as further modules.
+ * Connector `ergodex`: AMM trading on Ergo through venue modules (`venues/`): Spectrum-style
+ * pools and LithosDex pools; Dexy is to follow as a further module.
  *
  * What this file holds, and nothing more: finding a pool box by its pool NFT on the node,
  * picking the venue by the box's exact ErgoTree, the guards from config (fee ceiling,
@@ -20,6 +20,7 @@ import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
 import { ErgodexConfig, ErgodexNetworkConfig, ErgodexRootConfig } from './ergodex.config';
+import { LithosVenue } from './venues/lithos/lithos.venue';
 import { SpectrumVenue } from './venues/spectrum/spectrum.venue';
 import { PoolSwap, SideName, Venue, VenuePool, VenueRuleError } from './venues/venue';
 
@@ -125,6 +126,7 @@ export class Ergodex {
     this.root = root;
     this.spectrum = new SpectrumVenue(config.spectrum);
     this.venues = this.spectrum.configured ? [this.spectrum] : [];
+    if (config.lithos) this.venues.push(new LithosVenue(config.lithos));
   }
 
   /** A connector for a network, with config read now (so a config update takes effect). */
@@ -238,13 +240,21 @@ export class Ergodex {
     );
   }
 
-  /** The pool, fresh from the node, with its venue. No guards applied. */
+  /**
+   * The pool, fresh from the node, with its venue. Only the venue's own admission applies
+   * (for LithosDex: the operator allowlist and the deployment check); the connector's
+   * guards do not.
+   */
   async getFreshPool(poolId: string, options: { confirmedOnly?: boolean } = {}): Promise<FreshPool> {
     const { box, source } = await this.fetchPoolBox(poolId, options);
     const venue = this.venueForTree(box.ergoTree)!;
     const pool = venue.parsePool(box);
     if (!pool) {
       throw httpErrors.badRequest(`Box ${box.boxId} holds pool NFT ${poolId} but is not a valid ${venue.name} pool`);
+    }
+    if (venue.admit) {
+      const refused = await venue.admit(pool, this.ergo.node);
+      if (refused) throw httpErrors.badRequest(`Refusing pool: ${refused}`);
     }
     await this.assertSingleNft(pool.poolId);
     return { pool, venue, source };
@@ -271,6 +281,8 @@ export class Ergodex {
 
   /** The reason a pool may not be traded, or null when every guard passes. */
   guardFailure(pool: VenuePool): string | null {
+    const venueFailure = this.venues.find((v) => v.name === pool.venue)?.guardFailure?.(pool);
+    if (venueFailure) return venueFailure;
     const allow = this.config.poolAllowlist;
     if (allow.length > 0 && !allow.includes(pool.poolId)) return `pool ${pool.poolId} is not on the allowlist`;
     const maxScaled = pctToScaled(this.config.maxPoolFeePct);
@@ -433,10 +445,18 @@ export class Ergodex {
     const base = await this.resolveToken(baseName);
     const quote = await this.resolveToken(quoteName);
     const raw = toRaw(amount, base);
+    // Pools found by tree (Spectrum-style), and the pools a venue offers by id (LithosDex:
+    // its allowlist, since its pool tree differs per deployment). Every candidate is read
+    // live and must hold the pair.
     const ids =
       this.config.poolAllowlist.length > 0
         ? this.config.poolAllowlist
-        : (await this.discoverPools()).filter((p) => holdsPairIds(p.tokenIds, base, quote)).map((p) => p.poolId);
+        : [
+            ...(this.spectrum.configured ? await this.discoverPools() : [])
+              .filter((p) => holdsPairIds(p.tokenIds, base, quote))
+              .map((p) => p.poolId),
+            ...this.venues.flatMap((v) => v.candidatePoolIds?.() ?? []),
+          ];
     const candidates = await this.livePools(ids);
     let best: { poolId: string; score: bigint } | null = null;
     for (const fresh of candidates) {

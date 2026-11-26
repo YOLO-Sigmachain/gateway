@@ -4,14 +4,25 @@
  * must create) and nothing else; box reads, selection, change, signing and submit are the
  * chain layer's.
  */
+import { ErgoNodeClient } from '../../../chains/ergo/ergo.node-client';
 import { ErgoOutputSpec } from '../../../chains/ergo/ergo.tx-builder';
-import { Eip12BoxCandidate, ErgoBox } from '../../../chains/ergo/ergo.types';
+import { Eip12BoxCandidate, ErgoBox, ErgoContextExtension, RegisterId } from '../../../chains/ergo/ergo.types';
 
 /** One side of a pool. `tokenId` null means the chain's native coin (the box value). */
 export interface PoolSide {
   tokenId: string | null;
+  /** What the pool trades with on this side. */
   reserve: bigint;
+  /**
+   * What the box holds on this side (its value, or its token amount), when that differs
+   * from `reserve` (a pool that keeps owed fees in the box apart from its reserves).
+   * Absent: the box holds exactly `reserve`.
+   */
+  held?: bigint;
 }
+
+/** The node reads a venue may make to admit a pool. */
+export type VenueNodeReader = Pick<ErgoNodeClient, 'getUnspentBoxesByTokenId'>;
 
 export type SideName = 'x' | 'y';
 
@@ -25,6 +36,11 @@ export interface VenuePool {
   box: ErgoBox;
   x: PoolSide;
   y: PoolSide;
+  /**
+   * The fraction of the input that reaches the curve, as feeNum / feeDenom. A venue whose
+   * fee differs by direction reports its costlier direction here, so the fee ceiling
+   * guard judges the worst case.
+   */
   feeNum: bigint;
   feeDenom: bigint;
 }
@@ -57,7 +73,34 @@ export interface Venue {
   successor(pool: VenuePool, swap: PoolSwap): ErgoOutputSpec;
   /**
    * The pool contract's own rule, evaluated in bigint on a built transaction's output:
-   * true when `candidate` is a successor the contract accepts for `pool.box`.
+   * true when `candidate` is a successor the contract accepts for `pool.box`. With
+   * `inputs` (the built transaction's input boxes, in order), the rules the contract
+   * places on the other inputs are checked too.
    */
-  contractAccepts(pool: VenuePool, candidate: Eip12BoxCandidate): boolean;
+  contractAccepts(pool: VenuePool, candidate: Eip12BoxCandidate, inputs?: ErgoBox[]): boolean;
+  /**
+   * Context variables the pool input must carry for a swap. Absent: none. The chain layer
+   * attaches them to the pool input, which is always input 0.
+   */
+  swapInputExtension?(pool: VenuePool): ErgoContextExtension;
+  /**
+   * Registers the successor must hold byte for byte as the pool box holds them. Absent:
+   * every register of the pool box.
+   */
+  unchangedRegisters?(pool: VenuePool): RegisterId[];
+  /**
+   * Token indexes (after the pool NFT) whose amount a swap leaves unchanged. Absent: [1]
+   * (the LP reserve of a Spectrum-style pool).
+   */
+  unchangedTokenIndexes?(pool: VenuePool): number[];
+  /**
+   * Whether this pool may be offered at all, read from the node if need be (for example a
+   * deployment check and an operator allowlist): null when it may, else the reason.
+   * Absent: every parsed pool may be offered.
+   */
+  admit?(pool: VenuePool, node: VenueNodeReader): Promise<string | null>;
+  /** A venue's own guard on a parsed pool, beside the connector's: null, or the reason to refuse. */
+  guardFailure?(pool: VenuePool): string | null;
+  /** Pool ids this venue offers when a pool is chosen by pair (beside discovery by tree). */
+  candidatePoolIds?(): string[];
 }

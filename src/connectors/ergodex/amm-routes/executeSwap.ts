@@ -37,9 +37,11 @@ import { describeRoute } from './quoteSwap';
 
 /**
  * Checks on the built transaction, run inside the chain layer's lock before signing: the
- * pool is the only fixed input and is input 0; output 0 is exactly the planned successor
- * (tree, registers byte for byte, token ids and order, LP amount); the venue's contract
- * rule holds for it in bigint; and the pool moves by exactly the planned amounts.
+ * pool is the only fixed input and is input 0, carrying exactly the context variables
+ * the venue asks for; output 0 is exactly the planned successor (tree, value, registers
+ * and token amounts byte for byte), with the registers and token amounts a swap leaves
+ * alone equal to the pool box's; the venue's contract rule holds for it in bigint, with
+ * the built inputs; and the pool moves by exactly the planned amounts.
  */
 export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransaction): void {
   const fail = (message: string): never => {
@@ -48,13 +50,21 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
   const { pool, venue, successor, swap } = plan;
   if (built.fixedInputCount !== 1 || built.inputBoxes[0]?.boxId !== pool.box.boxId) fail('the pool must be input 0');
   if (built.inputBoxes.slice(1).some((b) => b.boxId === pool.box.boxId)) fail('the pool box is spent twice');
+  const wantExt: Record<string, string> = { ...(venue.swapInputExtension?.(pool) ?? {}) };
+  const gotExt: Record<string, string> = built.unsigned.inputs[0].extension ?? {};
+  for (const k of new Set([...Object.keys(wantExt), ...Object.keys(gotExt)])) {
+    if ((wantExt[k] ?? '').toLowerCase() !== (gotExt[k] ?? '').toLowerCase()) fail(`pool input context variable ${k}`);
+  }
   const out0: Eip12BoxCandidate | undefined = built.unsigned.outputs[0];
   if (!out0) fail('no successor at output 0');
   if (out0.ergoTree.toLowerCase() !== pool.box.ergoTree.toLowerCase()) fail('successor tree differs from the pool');
   const regs0 = pool.box.additionalRegisters as Record<string, string>;
   const regs1 = (out0.additionalRegisters ?? {}) as Record<string, string>;
-  const keys = new Set([...Object.keys(regs0), ...Object.keys(regs1)]);
-  for (const k of keys) {
+  const planned = (successor.additionalRegisters ?? {}) as Record<string, string>;
+  for (const k of new Set([...Object.keys(planned), ...Object.keys(regs1)])) {
+    if ((planned[k] ?? '').toLowerCase() !== (regs1[k] ?? '').toLowerCase()) fail(`successor register ${k} differs`);
+  }
+  for (const k of venue.unchangedRegisters?.(pool) ?? Object.keys(regs0)) {
     if ((regs0[k] ?? '').toLowerCase() !== (regs1[k] ?? '').toLowerCase()) fail(`successor register ${k} differs`);
   }
   const assets = out0.assets ?? [];
@@ -62,12 +72,19 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
   pool.box.assets.forEach((a, i) => {
     if (assets[i].tokenId.toLowerCase() !== a.tokenId.toLowerCase()) fail(`successor token ${i} differs`);
   });
-  if (BigInt(assets[1].amount) !== pool.box.assets[1].amount) fail('successor LP amount differs');
+  for (const i of venue.unchangedTokenIndexes?.(pool) ?? [1]) {
+    if (BigInt(assets[i].amount) !== pool.box.assets[i].amount) {
+      fail(
+        i === 1 && !venue.unchangedTokenIndexes ? 'successor LP amount differs' : `successor token ${i} amount differs`,
+      );
+    }
+  }
   if (BigInt(out0.value) !== successor.value) fail('successor value differs from the plan');
   successor.assets!.forEach((a, i) => {
     if (BigInt(assets[i].amount) !== a.amount) fail(`successor token ${i} amount differs from the plan`);
   });
-  if (!venue.contractAccepts(pool, out0)) fail('the pool contract rule does not hold for the successor');
+  if (!venue.contractAccepts(pool, out0, built.inputBoxes))
+    fail('the pool contract rule does not hold for the successor');
   // the planned deltas, from the successor itself
   const reserveOf = (side: 'x' | 'y') => {
     const tokenId = pool[side].tokenId;
@@ -76,8 +93,9 @@ export function verifySwapTransaction(plan: SwapPlan, built: BuiltErgoTransactio
       : BigInt(assets.find((a) => a.tokenId.toLowerCase() === tokenId.toLowerCase())!.amount);
   };
   const outSide = swap.input === 'x' ? 'y' : 'x';
-  if (reserveOf(swap.input) - pool[swap.input].reserve !== swap.amountIn) fail('the pool does not receive the input');
-  if (pool[outSide].reserve - reserveOf(outSide) !== swap.amountOut) fail('the pool does not pay the output');
+  const heldBefore = (side: 'x' | 'y') => pool[side].held ?? pool[side].reserve;
+  if (reserveOf(swap.input) - heldBefore(swap.input) !== swap.amountIn) fail('the pool does not receive the input');
+  if (heldBefore(outSide) - reserveOf(outSide) !== swap.amountOut) fail('the pool does not pay the output');
   // the wallet moves by exactly the swap and the miner fee, and by nothing else
   const expected = new Map<string | null, bigint>();
   const add = (key: string | null, amount: bigint) => expected.set(key, (expected.get(key) ?? 0n) + amount);
@@ -190,7 +208,11 @@ export async function executeSwap(
         // worked out before signing, so nothing after the submit can fail
         let pendingData: ReturnType<typeof fixedSwapData> | undefined;
         const { txId } = await ergo.sendTransaction(
-          { changeAddress: wallet.address, inputs: [{ box: current.pool.box }], outputs: [current.successor] },
+          {
+            changeAddress: wallet.address,
+            inputs: [{ box: current.pool.box, extension: current.venue.swapInputExtension?.(current.pool) }],
+            outputs: [current.successor],
+          },
           wallet.signer,
           {
             verify: (built) => {

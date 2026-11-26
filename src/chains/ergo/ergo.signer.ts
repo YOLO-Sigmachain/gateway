@@ -1,7 +1,9 @@
 /**
  * Signing, behind one small interface so the library can be replaced without touching
- * callers. Today: ergo-lib-wasm-nodejs 0.28.0. A later sigma-rust release is expected to be
- * needed for ErgoTree version 3 inputs (0.28.0 cannot parse those trees).
+ * callers. Today: ergo-lib-wasm-nodejs 0.28.0 for everything it can parse. It cannot parse
+ * ErgoTree version 3; for a transaction with such an input the chain layer asks the
+ * signer for its version-3 counterpart (`forTreeVersion3`, in `ergo.signer-alpha.ts`),
+ * which holds the same key on a second library, loaded only then.
  *
  * Nothing here logs, returns or puts into an error any part of a mnemonic or key.
  */
@@ -52,6 +54,11 @@ export interface ErgoSigner {
     dataInputBoxes: Eip12DataInput[],
     context: ErgoSigningContext,
   ): Promise<SignedErgoTransaction>;
+  /**
+   * A signer for the same keys that can sign a transaction spending or reading a box at an
+   * ErgoTree of version 3. Absent: this signer cannot.
+   */
+  forTreeVersion3?(): Promise<ErgoSigner>;
 }
 
 export class ErgoSigningError extends Error {
@@ -97,7 +104,8 @@ export function derivePublicKey(mnemonic: string, index = 0): string {
   return publicKey;
 }
 
-function headersNewestFirst(headers: NodeHeaderJson[]): NodeHeaderJson[] {
+/** The newest HEADERS_IN_CONTEXT headers, newest first; refuses a set that is not one contiguous chain. */
+export function headersNewestFirst(headers: NodeHeaderJson[]): NodeHeaderJson[] {
   const sorted = [...headers].sort((a, b) => b.height - a.height);
   if (sorted.length < HEADERS_IN_CONTEXT) {
     throw new ErgoSigningError(`Signing needs ${HEADERS_IN_CONTEXT} recent headers, got ${sorted.length}`);
@@ -115,10 +123,28 @@ function headersNewestFirst(headers: NodeHeaderJson[]): NodeHeaderJson[] {
 export class WasmErgoSigner implements ErgoSigner {
   readonly publicKeys: readonly string[];
   #wallet: Wallet;
+  /** A copy of the key, kept only so the version-3 signer can be made from it on first need. */
+  #secret: Uint8Array;
+  #v3?: Promise<ErgoSigner>;
 
-  private constructor(wallet: Wallet, publicKeys: string[]) {
+  private constructor(wallet: Wallet, publicKeys: string[], secret: Uint8Array) {
     this.#wallet = wallet;
     this.publicKeys = Object.freeze([...publicKeys]);
+    this.#secret = Uint8Array.from(secret);
+  }
+
+  /** The same key on the signing library that reads ErgoTree version 3; that library is loaded on the first call. */
+  forTreeVersion3(): Promise<ErgoSigner> {
+    if (!this.#v3) {
+      const secret = this.#secret;
+      const publicKey = this.publicKeys[0];
+      this.#v3 = import('./ergo.signer-alpha').then(({ AlphaErgoSigner }) =>
+        AlphaErgoSigner.fromSecretKeyBytes(secret, publicKey),
+      );
+      // a failed load is not kept, so a later call tries again
+      this.#v3.catch(() => (this.#v3 = undefined));
+    }
+    return this.#v3;
   }
 
   /** A signer for m/44'/429'/0'/0/index of a mnemonic. The caller validates the mnemonic. */
@@ -146,7 +172,7 @@ export class WasmErgoSigner implements ErgoSigner {
     const wallet = Wallet.from_secrets(keys);
     keys.free();
     key.free();
-    return new WasmErgoSigner(wallet, [pk]);
+    return new WasmErgoSigner(wallet, [pk], secret);
   }
 
   async signTransaction(

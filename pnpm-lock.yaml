@@ -205,6 +205,9 @@ importers:
       ergo-lib-wasm-nodejs:
         specifier: 0.28.0
         version: 0.28.0
+      ergo-lib-wasm-nodejs-alpha:
+        specifier: npm:ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3
+        version: ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3
       ethers:
         specifier: ^5.8.0
         version: 5.8.0(bufferutil@4.0.9)(utf-8-validate@5.0.10)
@@ -4898,6 +4901,10 @@ packages:
   ergo-lib-wasm-nodejs@0.28.0:
     resolution:
       { integrity: sha512-APQEac2IISTtQ/3Wi9EnyyV4rkXvC+jrovLEpt1vqJLNCK9E5bMOttZws70VTqu9CY0g5wzSTNJdOjM0GuDZbA== }
+
+  ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3:
+    resolution:
+      { integrity: sha512-XCVZsPsPXBCOsZBkHj9+9I/nPV7gQM8fYZddj5K4d82gGGEyTBPxuuU+BXRbFIuJRRmJp7EFPTnOxEB4ILWEdg== }
 
   error-ex@1.3.2:
     resolution:
@@ -14533,6 +14540,8 @@ snapshots:
   environment@1.1.0: {}
 
   ergo-lib-wasm-nodejs@0.28.0: {}
+
+  ergo-lib-wasm-nodejs@0.29.0-alpha-2f840d3: {}
 
   error-ex@1.3.2:
     dependencies:

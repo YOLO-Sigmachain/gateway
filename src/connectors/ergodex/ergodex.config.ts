@@ -1,6 +1,6 @@
 /**
  * Config for connector `ergodex`: one AMM connector on chain `ergo` holding several venues
- * (Spectrum-style pools now; LithosDex and Dexy later), each a module under `venues/`.
+ * (Spectrum-style pools and LithosDex pools now; Dexy later), each a module under `venues/`.
  *
  * Everything that differs between networks (the pool contract trees that identify a
  * venue's pools, fee denominators, storage floors, guards) is read from
@@ -24,6 +24,51 @@ export interface SpectrumVenueConfig {
   n2tMinSuccessorValue: bigint;
 }
 
+/** The pinned contract templates of one LithosDex pool kind, with sentinel ids in place of a deployment's. */
+export interface LithosKindTemplates {
+  /** The pool contract (terms: vault NFT, provision guard hash). */
+  poolTree: string;
+  /** The fee vault contract (terms: pool NFT, provision token). */
+  feeVaultTree: string;
+  /**
+   * The provision logic's expression with its constants written in place (terms: pool
+   * NFT, vault NFT): the bytes whose hash the provision guard names.
+   */
+  provisionLogicValue: string;
+}
+
+/** LithosDex pools (ERG/token "n2t" and token/token "t2t") on one network. */
+export interface LithosVenueConfig {
+  /**
+   * Pool NFT ids the operator has checked and chosen. A LithosDex pool is offered (pool info, quote,
+   * swap, pool choice) only if it is listed here and passes the deployment check. Empty:
+   * no LithosDex pool is offered.
+   */
+  poolAllowlist: string[];
+  /** The pool contracts' fee denominator (R5 holds the numerators). */
+  feeDenominator: bigint;
+  /** The scale of the fee accumulators (R7, R8). */
+  accumulatorScale: bigint;
+  /** The liquidity constant; supply is this minus R4. */
+  lockedLiquidity: bigint;
+  /** An ERG/token pool's successor must hold strictly more than this, in the smallest native unit. */
+  n2tMinSuccessorValue: bigint;
+  /** The operation byte context variable 0 of the pool input carries for a swap. */
+  swapOperation: number;
+  /** The 32-byte sentinel (hex) each template term is written as. */
+  sentinels: {
+    poolNft: string;
+    vaultNft: string;
+    provisionToken: string;
+    provisionLogicHash: string;
+    provisionGuardHash: string;
+  };
+  /** The provision guard contract, shared by both kinds (term: provision logic hash). */
+  provisionGuardTree: string;
+  n2t: LithosKindTemplates;
+  t2t: LithosKindTemplates;
+}
+
 export interface ErgodexNetworkConfig {
   /** Build on the newest unconfirmed successor of a pool box in the node's mempool (else: confirmed box only). */
   useMempoolSuccessor: boolean;
@@ -38,6 +83,8 @@ export interface ErgodexNetworkConfig {
   /** Upper bound on boxes read per pool tree when discovering pools. */
   maxDiscoveredBoxes: number;
   spectrum: SpectrumVenueConfig;
+  /** Absent: no LithosDex venue on this network. */
+  lithos?: LithosVenueConfig;
 }
 
 export interface ErgodexRootConfig {
@@ -53,6 +100,9 @@ export interface ErgodexRootConfig {
 }
 
 const DEFAULT_MAX_DISCOVERED_BOXES = 5000;
+
+const LITHOS_SENTINELS = ['poolNft', 'vaultNft', 'provisionToken', 'provisionLogicHash', 'provisionGuardHash'] as const;
+const LITHOS_KIND_TEMPLATES = ['poolTree', 'feeVaultTree', 'provisionLogicValue'] as const;
 
 function get(key: string): unknown {
   return ConfigManagerV2.getInstance().get(`ergodex.${key}`);
@@ -72,6 +122,66 @@ function amount(value: unknown, fallback: bigint, where: string): bigint {
   const v = toAmount(value, where);
   if (v < 0n) throw new Error(`${where} cannot be negative`);
   return v;
+}
+
+function tree(value: unknown, where: string): string {
+  if (!isHexBytes(value)) throw new Error(`${where} must be hex`);
+  return (value as string).toLowerCase();
+}
+
+function poolIds(value: unknown, where: string): string[] {
+  const list = value ?? [];
+  if (!Array.isArray(list) || list.some((id) => !isErgoId(id))) {
+    throw new Error(`${where} must be a list of pool NFT ids (64 hex)`);
+  }
+  return (list as string[]).map((id) => id.toLowerCase());
+}
+
+/** The `lithos` block of a network, or undefined when it has none. Every value must be set. */
+function lithos(value: unknown, where: string): LithosVenueConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${where} must be a mapping`);
+  const raw = value as Record<string, unknown>;
+  const required = (key: string): bigint => {
+    if (raw[key] === undefined || raw[key] === null || raw[key] === '') throw new Error(`${where}.${key} must be set`);
+    const v = amount(raw[key], 0n, `${where}.${key}`);
+    if (v <= 0n) throw new Error(`${where}.${key} must be positive`);
+    return v;
+  };
+  const op = Number(raw.swapOperation);
+  if (raw.swapOperation === undefined || !Number.isInteger(op) || op < 0 || op > 127) {
+    throw new Error(`${where}.swapOperation must be an integer from 0 to 127`);
+  }
+  const sentinelsRaw = (raw.sentinels ?? {}) as Record<string, unknown>;
+  const sentinels = {} as LithosVenueConfig['sentinels'];
+  for (const name of LITHOS_SENTINELS) {
+    const v = sentinelsRaw[name];
+    if (typeof v !== 'string' || !/^[0-9a-fA-F]{64}$/.test(v)) {
+      throw new Error(`${where}.sentinels.${name} must be 32 bytes of hex`);
+    }
+    sentinels[name] = v.toLowerCase();
+  }
+  if (new Set(Object.values(sentinels)).size !== LITHOS_SENTINELS.length) {
+    throw new Error(`${where}.sentinels must all differ`);
+  }
+  const kind = (k: 'n2t' | 't2t'): LithosKindTemplates => {
+    const block = (raw[k] ?? {}) as Record<string, unknown>;
+    const out = {} as LithosKindTemplates;
+    for (const name of LITHOS_KIND_TEMPLATES) out[name] = tree(block[name], `${where}.${k}.${name}`);
+    return out;
+  };
+  return {
+    poolAllowlist: poolIds(raw.poolAllowlist, `${where}.poolAllowlist`),
+    feeDenominator: required('feeDenominator'),
+    accumulatorScale: required('accumulatorScale'),
+    lockedLiquidity: required('lockedLiquidity'),
+    n2tMinSuccessorValue: required('n2tMinSuccessorValue'),
+    swapOperation: op,
+    sentinels,
+    provisionGuardTree: tree(raw.provisionGuardTree, `${where}.provisionGuardTree`),
+    n2t: kind('n2t'),
+    t2t: kind('t2t'),
+  };
 }
 
 /** A percentage as given (number or string), checked to be a plain decimal; kept as text for exact math. */
@@ -120,8 +230,9 @@ export namespace ErgodexConfig {
     const feeDenominator = amount(spectrum.feeDenominator, 0n, `${where}.spectrum.feeDenominator`);
     const n2tPoolTrees = trees(spectrum.n2tPoolTrees, `${where}.spectrum.n2tPoolTrees`);
     const t2tPoolTrees = trees(spectrum.t2tPoolTrees, `${where}.spectrum.t2tPoolTrees`);
-    const hasTrees = n2tPoolTrees.length > 0 || t2tPoolTrees.length > 0;
-    if (hasTrees && feeDenominator <= 0n) {
+    const lithosConfig = lithos(raw.lithos, `${where}.lithos`);
+    const hasTrees = n2tPoolTrees.length > 0 || t2tPoolTrees.length > 0 || lithosConfig !== undefined;
+    if ((n2tPoolTrees.length > 0 || t2tPoolTrees.length > 0) && feeDenominator <= 0n) {
       throw new Error(`${where}.spectrum.feeDenominator must be set and positive when pool trees are configured`);
     }
     // The guards fail closed: a network that can trade must state its fee ceiling and size floor.
@@ -149,6 +260,7 @@ export namespace ErgodexConfig {
         feeDenominator,
         n2tMinSuccessorValue: amount(spectrum.n2tMinSuccessorValue, 0n, `${where}.spectrum.n2tMinSuccessorValue`),
       },
+      ...(lithosConfig ? { lithos: lithosConfig } : {}),
     };
   }
 }
