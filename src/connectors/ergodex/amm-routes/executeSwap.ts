@@ -33,6 +33,7 @@
 import { ErgoCheckOnlyError, ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
+import { symbolForMessage } from '../../../chains/ergo/ergo.utils';
 import { ErgoWalletAccount } from '../../../chains/ergo/ergo.wallet';
 import { ChainExecuteSwapResponseType, TransactionStatusCode } from '../../../schemas/chain-schema';
 import { httpErrors } from '../../../services/error-handler';
@@ -147,10 +148,11 @@ export function describeCheckedSwap(
   data: NonNullable<ChainExecuteSwapResponseType['data']>,
   nativeSymbol: string,
 ): string {
+  const sym = (token: SwapPlan['base']) => symbolForMessage(token.symbol, token.tokenId);
   return (
-    `${data.amountIn} ${plan.tokenIn.symbol} in and ${data.amountOut} ${plan.tokenOut.symbol} out on ` +
-    `${describeRoute(plan)}, miner fee ${data.fee} ${nativeSymbol}; the wallet would change by ` +
-    `${data.baseTokenBalanceChange} ${plan.base.symbol} and ${data.quoteTokenBalanceChange} ${plan.quote.symbol}`
+    `${data.amountIn} ${sym(plan.tokenIn)} in and ${data.amountOut} ${sym(plan.tokenOut)} out on ` +
+    `${describeRoute(plan)}, miner fee ${data.fee} ${symbolForMessage(nativeSymbol, null)}; the wallet would ` +
+    `change by ${data.baseTokenBalanceChange} ${sym(plan.base)} and ${data.quoteTokenBalanceChange} ${sym(plan.quote)}`
   );
 }
 
@@ -213,8 +215,8 @@ export async function executeSwap(
     }
     const boundText =
       side === 'SELL'
-        ? `at least ${units(bound.minOut!, plan.tokenOut.decimals)} ${plan.tokenOut.symbol} out`
-        : `at most ${units(bound.maxIn!, plan.tokenIn.decimals)} ${plan.tokenIn.symbol} in`;
+        ? `at least ${units(bound.minOut!, plan.tokenOut.decimals)} ${symbolForMessage(plan.tokenOut.symbol, plan.tokenOut.tokenId)} out`
+        : `at most ${units(bound.maxIn!, plan.tokenIn.decimals)} ${symbolForMessage(plan.tokenIn.symbol, plan.tokenIn.tokenId)} in`;
 
     for (let attempt = 0; ; attempt++) {
       if (attempt > 0) plan = await dex.freshPlan(poolAddress, base, side, raw);
@@ -222,7 +224,8 @@ export async function executeSwap(
         throw httpErrors.createError(
           409,
           `The pool moved: ${describeRoute(plan)} now gives ${units(plan.swap.amountOut, plan.tokenOut.decimals)} ` +
-            `${plan.tokenOut.symbol} for ${units(plan.swap.amountIn, plan.tokenIn.decimals)} ${plan.tokenIn.symbol}, ` +
+            `${symbolForMessage(plan.tokenOut.symbol, plan.tokenOut.tokenId)} for ` +
+            `${units(plan.swap.amountIn, plan.tokenIn.decimals)} ${symbolForMessage(plan.tokenIn.symbol, plan.tokenIn.tokenId)}, ` +
             `outside the bound (${boundText}). Nothing that can still execute was submitted; retry with a fresh quote.`,
         );
       }

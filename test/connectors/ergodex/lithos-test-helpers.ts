@@ -117,6 +117,7 @@ export function lithosNode(state: NodeState): FetchLike {
         fullHeight: L_TIP,
         headersHeight: L_TIP,
         network: 'mainnet',
+        stateType: 'utxo',
         parameters: { minValuePerByte: 360 },
       });
     }

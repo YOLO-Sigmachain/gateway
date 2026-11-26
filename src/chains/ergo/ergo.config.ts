@@ -81,8 +81,26 @@ function optional<T>(namespaceId: string, key: string): T | undefined {
   return value === undefined || value === null || value === '' ? undefined : (value as T);
 }
 
+/**
+ * Refuse a key that is a misspelling of submitMode (`submitmode`, `submit_mode`,
+ * `SubmitMode`, `submit-mode`, ...): it would not be read, and the network would send while
+ * the file seems to say check.
+ */
+function refuseSubmitModeLookalikes(namespaceId: string): void {
+  const configuration = ConfigManagerV2.getInstance().getNamespace(namespaceId)?.configuration ?? {};
+  for (const key of Object.keys(configuration)) {
+    if (key !== 'submitMode' && key.toLowerCase().replace(/[_\- ]/g, '') === 'submitmode') {
+      throw new Error(
+        `${namespaceId} has the key "${key}", which is not read: the key is spelled submitMode. ` +
+          'Correct it in the config file; this network does not start until then',
+      );
+    }
+  }
+}
+
 export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
   const namespaceId = `ergo-${network}`;
+  refuseSubmitModeLookalikes(namespaceId);
   const addressPrefix = Number(required<number>(namespaceId, 'addressPrefix'));
   if (!Number.isInteger(addressPrefix) || addressPrefix < 0 || addressPrefix > 240 || addressPrefix % 16 !== 0) {
     throw new Error(`${namespaceId}.addressPrefix must be a multiple of 16 between 0 and 240`);

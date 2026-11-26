@@ -17,7 +17,7 @@ import { Ergo } from '../../chains/ergo/ergo';
 import { ErgoNodeError } from '../../chains/ergo/ergo.node-client';
 import { ErgoOutputSpec } from '../../chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../chains/ergo/ergo.types';
-import { formatUnits, isErgoId, NATIVE_COIN_ID, parseUnits } from '../../chains/ergo/ergo.utils';
+import { formatUnits, isErgoId, NATIVE_COIN_ID, parseUnits, symbolForMessage } from '../../chains/ergo/ergo.utils';
 import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
@@ -379,7 +379,10 @@ export class Ergodex {
     const baseSide: SideName = pool.x.tokenId === base.tokenId ? 'x' : 'y';
     const quoteSide: SideName = baseSide === 'x' ? 'y' : 'x';
     if (pool[baseSide].tokenId !== base.tokenId || pool[quoteSide].tokenId !== quote.tokenId) {
-      throw httpErrors.badRequest(`Pool ${pool.poolId} does not trade ${base.symbol}/${quote.symbol}`);
+      throw httpErrors.badRequest(
+        `Pool ${pool.poolId} does not trade ` +
+          `${symbolForMessage(base.symbol, base.tokenId)}/${symbolForMessage(quote.symbol, quote.tokenId)}`,
+      );
     }
     if (amount <= 0n) throw httpErrors.badRequest('amount must be greater than zero');
     let swap: PoolSwap;
@@ -387,7 +390,8 @@ export class Ergodex {
       const out = venue.amountOut(pool, baseSide, amount);
       if (out <= 0n) {
         throw httpErrors.badRequest(
-          `Selling ${formatUnits(amount, base.decimals)} ${base.symbol} into pool ${pool.poolId} gives nothing (rounds to zero)`,
+          `Selling ${formatUnits(amount, base.decimals)} ${symbolForMessage(base.symbol, base.tokenId)} into pool ` +
+            `${pool.poolId} gives nothing (rounds to zero)`,
         );
       }
       swap = { input: baseSide, amountIn: amount, amountOut: out };
@@ -395,7 +399,8 @@ export class Ergodex {
       const needed = venue.amountInFor(pool, quoteSide, amount);
       if (needed === null) {
         throw httpErrors.badRequest(
-          `Pool ${pool.poolId} cannot pay ${formatUnits(amount, base.decimals)} ${base.symbol}: it holds ${formatUnits(pool[baseSide].reserve, base.decimals)}`,
+          `Pool ${pool.poolId} cannot pay ${formatUnits(amount, base.decimals)} ${symbolForMessage(base.symbol, base.tokenId)}: ` +
+            `it holds ${formatUnits(pool[baseSide].reserve, base.decimals)}`,
         );
       }
       swap = { input: quoteSide, amountIn: needed, amountOut: amount };
@@ -407,7 +412,8 @@ export class Ergodex {
       // fee% = num * 100 / den; compare without division, so a fee at the ceiling passes
       if (tradeFee.num * HUNDRED_PCT > maxScaled * tradeFee.den) {
         throw httpErrors.badRequest(
-          `This swap of ${formatUnits(swap.amountIn, tokenIn.decimals)} ${tokenIn.symbol} into pool ${pool.poolId} ` +
+          `This swap of ${formatUnits(swap.amountIn, tokenIn.decimals)} ${symbolForMessage(tokenIn.symbol, tokenIn.tokenId)} ` +
+            `into pool ${pool.poolId} ` +
             `pays ${ratio(tradeFee.num * 100n, tradeFee.den)}% of its input in fees, above maxPoolFeePct ` +
             `${this.config.maxPoolFeePct}%; trade a larger amount`,
         );
@@ -416,7 +422,7 @@ export class Ergodex {
     const outSide: SideName = swap.input === 'x' ? 'y' : 'x';
     const minerFee = this.ergo.config.minerFee;
     if (pool[outSide].tokenId === null && swap.amountOut <= minerFee) {
-      const native = this.ergo.config.nativeCurrencySymbol;
+      const native = symbolForMessage(this.ergo.config.nativeCurrencySymbol, null);
       const decimals = this.ergo.config.nativeDecimals;
       throw httpErrors.badRequest(
         `The output of ${formatUnits(swap.amountOut, decimals)} ${native} from pool ${pool.poolId} does not cover ` +
@@ -437,7 +443,9 @@ export class Ergodex {
   async counterToken(pool: VenuePool, base: TokenRef): Promise<TokenRef> {
     if (pool.x.tokenId === base.tokenId) return this.tokenOfSide(pool.y.tokenId);
     if (pool.y.tokenId === base.tokenId) return this.tokenOfSide(pool.x.tokenId);
-    throw httpErrors.badRequest(`Base token ${base.symbol} is not in pool ${pool.poolId}`);
+    throw httpErrors.badRequest(
+      `Base token ${symbolForMessage(base.symbol, base.tokenId)} is not in pool ${pool.poolId}`,
+    );
   }
 
   /** Read the pool fresh, apply the guards, and price the swap. */
@@ -498,7 +506,7 @@ export class Ergodex {
     if (!best) {
       throw httpErrors.notFound(
         `No allowed ergodex pool on ${this.network} can ${side === 'SELL' ? 'sell' : 'buy'} ` +
-          `${amount} ${base.symbol} for ${quote.symbol}`,
+          `${amount} ${symbolForMessage(base.symbol, base.tokenId)} for ${symbolForMessage(quote.symbol, quote.tokenId)}`,
       );
     }
     return best.poolId;

@@ -9,8 +9,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+import yaml from 'js-yaml';
+
 import { rootPath } from '../../paths';
 import { TransactionStatusCode } from '../../schemas/chain-schema';
+import { ConfigManagerV2 } from '../../services/config-manager-v2';
 import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 import { WalletTokenBalance } from '../wallet-balances';
@@ -24,7 +27,14 @@ import {
   parseSubmitMode,
 } from './ergo.config';
 import { bigintsToStrings, parseNodeJson, toAmount } from './ergo.json';
-import { ErgoNodeClient, ErgoNodeError, FetchLike, normalizeNodeBox, NodeTransaction } from './ergo.node-client';
+import {
+  ErgoNodeClient,
+  ErgoNodeError,
+  ErgoSubmitRefusedError,
+  FetchLike,
+  normalizeNodeBox,
+  NodeTransaction,
+} from './ergo.node-client';
 import { ErgoPendingTracker, PendingTransaction } from './ergo.pending';
 import { ErgoPendingFile } from './ergo.pending-file';
 import { ErgoSigner, SignedErgoTransaction } from './ergo.signer';
@@ -45,6 +55,8 @@ import {
   formatUnits,
   isErgoId,
   NATIVE_COIN_ID,
+  sanitizeNodeText,
+  symbolForMessage,
   toDecimalNumber,
 } from './ergo.utils';
 import { ErgoWalletAccount, loadErgoWallet } from './ergo.wallet';
@@ -85,14 +97,16 @@ export class AmbiguousTokenError extends Error {
 export class ErgoSubmitOutcomeUnknownError extends ErgoNodeError {
   readonly txId: string;
 
-  constructor(txId: string, cause: unknown) {
+  /** `keepIds`: ids that stay readable in the node's text (see sanitizeNodeText); the id is always kept. */
+  constructor(txId: string, cause: unknown, keepIds: string[] = []) {
     const nodeError = cause instanceof ErgoNodeError ? cause : undefined;
     const causeText = cause instanceof Error ? cause.message : String(cause);
+    const keep = [txId, ...keepIds];
     super(
       nodeError?.status ?? 0,
       `Submit outcome unknown for ${txId}; poll it before retrying`,
-      nodeError?.reason,
-      nodeError?.detail ?? causeText,
+      nodeError?.reason === undefined ? undefined : sanitizeNodeText(nodeError.reason, keep),
+      sanitizeNodeText(nodeError?.detail ?? causeText, keep),
     );
     this.name = 'ErgoSubmitOutcomeUnknownError';
     this.txId = txId;
@@ -146,6 +160,24 @@ function nodeText(error: ErgoNodeError): string {
   return error.detail ?? error.reason ?? error.message;
 }
 
+/** The node's words for a rejection, made safe for a message or a log line (see sanitizeNodeText). */
+function safeNodeText(error: ErgoNodeError, keepIds: Iterable<string>): string {
+  return sanitizeNodeText(nodeText(error), keepIds);
+}
+
+/** The same node error with its texts made safe for a message or a log line. */
+function sanitizedNodeError(error: ErgoNodeError, keepIds: string[]): ErgoNodeError {
+  const safe = (text?: string) => (text === undefined ? undefined : sanitizeNodeText(text, keepIds));
+  return new ErgoNodeError(error.status, safe(error.message)!, safe(error.reason), safe(error.detail), {
+    cause: error.cause,
+  });
+}
+
+/** An error's message, made safe for a log line (see sanitizeNodeText). */
+function safeErrorText(error: unknown, keepIds: Iterable<string>): string {
+  return sanitizeNodeText(error instanceof Error ? error.message : String(error), keepIds);
+}
+
 /**
  * A fixed input of the transaction (a contract box such as a pool) is already spent: by
  * one of our own pending transactions, or, on the node's evidence, by someone else. The
@@ -171,8 +203,10 @@ export class ErgoInputSpentError extends Error {
  * Carries the node's own reason and detail.
  */
 export class ErgoTransactionRejectedError extends ErgoNodeError {
-  constructor(cause: ErgoNodeError) {
-    super(cause.status, cause.message, cause.reason, cause.detail);
+  /** The node's texts are kept only as sanitizeNodeText leaves them; `keepIds` stay readable. */
+  constructor(cause: ErgoNodeError, keepIds: string[] = []) {
+    const safe = sanitizedNodeError(cause, keepIds);
+    super(safe.status, safe.message, safe.reason, safe.detail);
     this.name = 'ErgoTransactionRejectedError';
   }
 }
@@ -207,10 +241,10 @@ export class ErgoCheckOnlyError extends Error {
  * 400). Nothing was sent. Answered like a refusal at a first submit, with the node's text.
  */
 export class ErgoCheckRejectedError extends ErgoTransactionRejectedError {
-  constructor(cause: ErgoNodeError) {
-    super(cause);
+  constructor(cause: ErgoNodeError, keepIds: string[] = []) {
+    super(cause, keepIds);
     this.name = 'ErgoCheckRejectedError';
-    this.message = `Check only, nothing was sent: ${cause.message}`;
+    this.message = `Check only, nothing was sent: ${sanitizeNodeText(cause.message, keepIds)}`;
   }
 }
 
@@ -223,8 +257,9 @@ export class ErgoCheckRejectedError extends ErgoTransactionRejectedError {
 export class ErgoCheckIncompleteError extends Error {
   readonly txId: string;
 
-  constructor(txId: string, cause: unknown) {
-    const causeText = cause instanceof Error ? cause.message : String(cause);
+  /** `keepIds`: ids that stay readable in the node's text (see sanitizeNodeText); the id is always kept. */
+  constructor(txId: string, cause: unknown, keepIds: string[] = []) {
+    const causeText = sanitizeNodeText(cause instanceof Error ? cause.message : String(cause), [txId, ...keepIds]);
     super(
       `Check only: the check of transaction ${txId} could not be completed (${causeText}); nothing was sent. ` +
         'Retry once the node answers',
@@ -232,6 +267,30 @@ export class ErgoCheckIncompleteError extends Error {
     this.name = 'ErgoCheckIncompleteError';
     this.txId = txId;
   }
+}
+
+/**
+ * The submit mode differs between the running instance, the config held in memory and the
+ * config file (or one of them cannot be read, or is neither `send` nor `check`). Nothing was
+ * recorded or sent. Answered as a 503: Gateway must be restarted to use the mode in its config.
+ */
+export class ErgoSubmitModeMismatchError extends Error {
+  constructor(network: string, values: { running: string; inMemory: string; inFile: string }) {
+    super(
+      `The submit mode differs between the running Gateway and its config for ergo-${network}: ` +
+        `running ${values.running}, config in memory ${values.inMemory}, config file ${values.inFile}. ` +
+        'Nothing was sent. Restart Gateway to use the mode in its config',
+    );
+    this.name = 'ErgoSubmitModeMismatchError';
+  }
+}
+
+/** A submitMode value as read: the mode it names, or why it names none. Absent is `send`. */
+function readSubmitModeValue(value: unknown): { mode?: ErgoSubmitMode; text: string } {
+  if (value === undefined) return { mode: 'send', text: 'send (not set)' };
+  if (value === 'send' || value === 'check') return { mode: value, text: value };
+  const shown = JSON.stringify(value) ?? String(value);
+  return { text: `${shown.length > 40 ? `${shown.slice(0, 40)}…` : shown} (neither send nor check)` };
 }
 
 /** Node rejection text that means an input is not (or no longer) in the UTXO set. */
@@ -252,6 +311,12 @@ export class Ergo {
   readonly pending: ErgoPendingTracker;
   /** `send`: signed transactions are submitted. `check`: only checked by the node; nothing is sent. */
   readonly submitMode: ErgoSubmitMode;
+  /**
+   * Whether this instance's config was read from the config manager (no `options.config`
+   * given), as every instance getInstance makes is. Only then is there a config in memory
+   * and a config file to compare the mode with at each submit decision.
+   */
+  private readonly configFromManager: boolean;
   private readonly tokenInfoCache = new Map<string, ErgoTokenInfo>();
   /** A token's total emission never changes once it is minted. */
   private readonly tokenEmissionCache = new Map<string, bigint>();
@@ -260,6 +325,7 @@ export class Ergo {
 
   constructor(network: string, options: { config?: ErgoNetworkConfig; fetch?: FetchLike; now?: () => number } = {}) {
     this.network = network;
+    this.configFromManager = options.config === undefined;
     this.config = options.config ?? getErgoNetworkConfig(network);
     this.submitMode = parseSubmitMode(this.config.submitMode, `ergo-${network}.submitMode`);
     if (this.submitMode === 'check') {
@@ -267,11 +333,14 @@ export class Ergo {
         `ergo-${network}.submitMode is check: signed transactions are only checked by the node, never sent; ` +
           'no swap or transfer from this network is carried out',
       );
+    } else {
+      logger.info(`ergo-${network}.submitMode is send: signed transactions are sent to the node`);
     }
     this.node = new ErgoNodeClient(this.config.nodeURL, {
       timeoutMs: this.config.nodeTimeoutMs,
       pageSize: this.config.boxPageSize,
       fetch: options.fetch,
+      canSubmit: () => this.submitModeCheck().mode === 'send',
     });
     const timeoutMs = this.config.pendingTxTimeoutBlocks * this.config.blockTimeSeconds * 1000;
     const stateFile = this.config.pendingStateFile;
@@ -298,6 +367,53 @@ export class Ergo {
   /** For tests: drop cached instances. */
   public static clearInstances(): void {
     Ergo._instances = {};
+  }
+
+  /**
+   * The submit mode in force, read at each submit decision. Three values are compared: the
+   * mode this instance was built with, the mode in the config manager's namespace held in
+   * memory (a /config/update changes it), and the mode in that namespace's config file on
+   * disk, read now (a hand edit changes it). An absent key is `send` in each. All three
+   * agreeing gives that mode; any disagreement, a value that cannot be read, or one that is
+   * neither `send` nor `check` gives `mismatch`, and then nothing may be recorded or posted.
+   * An instance built from an explicit config (`options.config`) has no namespace or file
+   * behind it: only its own mode exists, and that is the answer.
+   */
+  private submitModeCheck(): { mode?: ErgoSubmitMode; mismatch?: ErgoSubmitModeMismatchError } {
+    if (!this.configFromManager) return { mode: this.submitMode };
+    const namespaceId = `ergo-${this.network}`;
+    let inMemory: { mode?: ErgoSubmitMode; text: string };
+    let inFile: { mode?: ErgoSubmitMode; text: string };
+    try {
+      const namespace = ConfigManagerV2.getInstance().getNamespace(namespaceId);
+      if (!namespace) throw new Error(`no ${namespaceId} namespace`);
+      inMemory = readSubmitModeValue(namespace.get('submitMode'));
+      try {
+        const body = yaml.load(fs.readFileSync(namespace.configurationPath, 'utf8'));
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not a mapping');
+        inFile = readSubmitModeValue((body as Record<string, unknown>).submitMode);
+      } catch (error) {
+        inFile = { text: `unreadable (${error instanceof Error ? error.message : String(error)})` };
+      }
+    } catch (error) {
+      inMemory = { text: `unreadable (${error instanceof Error ? error.message : String(error)})` };
+      inFile = { text: 'not read' };
+    }
+    if (inMemory.mode === this.submitMode && inFile.mode === this.submitMode) return { mode: this.submitMode };
+    return {
+      mismatch: new ErgoSubmitModeMismatchError(this.network, {
+        running: this.submitMode,
+        inMemory: inMemory.text,
+        inFile: inFile.text,
+      }),
+    };
+  }
+
+  /** The submit mode in force (see submitModeCheck); throws ErgoSubmitModeMismatchError when it is in doubt. */
+  private submitModeInForce(): ErgoSubmitMode {
+    const { mode, mismatch } = this.submitModeCheck();
+    if (mismatch || mode === undefined) throw mismatch;
+    return mode;
   }
 
   get nativeTokenSymbol(): string {
@@ -606,6 +722,9 @@ export class Ergo {
    *
    * With submitMode `check`, nothing is recorded or submitted: the transaction is posted to
    * the node's check endpoint only, and the answer is always an error (see checkSigned).
+   * The mode is read again here, before anything is recorded or posted (see
+   * submitModeCheck): when it is in doubt, nothing is recorded or posted and the answer is
+   * ErgoSubmitModeMismatchError.
    *
    * A transaction with fixed inputs (a contract box such as a pool) must go through
    * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
@@ -634,14 +753,24 @@ export class Ergo {
     const outputs = posted.outputs.map((o, index) =>
       normalizeNodeBox({ ...o, transactionId: posted.id, index } as Record<string, unknown>),
     );
+    // the ids that stay readable in the node's text
+    const ownIds = [signed.id, ...inputBoxIds];
+    // the mode in force: throws, before anything is recorded or posted, when it is in doubt
+    const mode = this.submitModeInForce();
     // check mode: checked by the node and never recorded, so the signed transaction is kept
     // nowhere and no later post can send it
-    if (this.submitMode === 'check') return this.checkSigned(signed);
+    if (mode === 'check') return this.checkSigned(signed, ownIds);
     this.pending.record(signed.id, inputBoxIds, outputs, signed.json, fixedInputs);
     let txId: string;
     try {
       txId = await this.postToSubmit(signed.json);
     } catch (error) {
+      if (error instanceof ErgoSubmitRefusedError) {
+        // the node client refused to post (the mode changed in the moment since it was
+        // read above): nothing was sent
+        this.releaseBeforeDefiniteAnswer(signed.id, error);
+        throw this.submitModeCheck().mismatch ?? error;
+      }
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
         this.releaseBeforeDefiniteAnswer(signed.id, error);
         const fixed = built.inputBoxes.slice(0, built.fixedInputCount).map((b) => b.boxId);
@@ -650,17 +779,17 @@ export class Ergo {
           throw new ErgoInputSpentError(
             `The node rejected the transaction: fixed input ${gone.join(', ')} is already spent`,
             gone,
-            error.detail ?? error.reason ?? error.message,
+            safeNodeText(error, ownIds),
           );
         }
-        throw new ErgoTransactionRejectedError(error);
+        throw new ErgoTransactionRejectedError(error, ownIds);
       }
       if (error instanceof ErgoNodeError && error.status === 0 && failedBeforeConnecting(error)) {
         // no byte reached the node: nothing from this submit can confirm
         this.releaseBeforeDefiniteAnswer(signed.id, error);
         throw new ErgoNotSubmittedError(signed.id, error);
       }
-      throw new ErgoSubmitOutcomeUnknownError(signed.id, error);
+      throw new ErgoSubmitOutcomeUnknownError(signed.id, error, inputBoxIds);
     }
     if (txId !== signed.id) {
       // The node's id is the one that will confirm. The outputs' box ids derive from our id,
@@ -679,9 +808,30 @@ export class Ergo {
    * submit endpoint. Always throws: ErgoCheckOnlyError when the node found it valid,
    * ErgoCheckRejectedError when the node answered 400 (its verdict that the transaction is
    * invalid), ErgoCheckIncompleteError for anything else (no connection, a timeout, a 5xx,
-   * another status, no id, another id). Nothing is recorded in any case.
+   * another status, no id, another id), and also, without posting anything, when the node's
+   * /info cannot be read or says it keeps no UTXO state. Nothing is recorded in any case.
+   * The node's text is made safe (sanitizeNodeText) before it is logged or answered.
    */
-  private async checkSigned(signed: SignedErgoTransaction): Promise<never> {
+  private async checkSigned(signed: SignedErgoTransaction, ownIds: string[]): Promise<never> {
+    const incompleteBecause = (cause: unknown): ErgoCheckIncompleteError => {
+      const incomplete = new ErgoCheckIncompleteError(signed.id, cause, ownIds);
+      logger.info(`Ergo ${this.network}: ${incomplete.message}`);
+      return incomplete;
+    };
+    // Only a node that keeps the UTXO set runs the scripts; any other checks the syntax
+    // only, and its "valid" would mean little.
+    let stateType: unknown;
+    try {
+      stateType = (await this.node.getInfo()).stateType;
+    } catch (error) {
+      throw incompleteBecause(error);
+    }
+    if (stateType !== 'utxo') {
+      const shown = JSON.stringify(stateType ?? null).slice(0, 40);
+      throw incompleteBecause(
+        `this node keeps no UTXO state, its stateType is ${shown}, so it cannot validate scripts`,
+      );
+    }
     let id: string;
     try {
       id = await this.node.checkTransaction(signed.json);
@@ -689,16 +839,14 @@ export class Ergo {
       if (error instanceof ErgoNodeError && error.status === 400) {
         logger.info(
           `Ergo ${this.network}: check only: the node refused transaction ${signed.id}; nothing was sent: ` +
-            nodeText(error),
+            safeNodeText(error, ownIds),
         );
-        throw new ErgoCheckRejectedError(error);
+        throw new ErgoCheckRejectedError(error, ownIds);
       }
-      const incomplete = new ErgoCheckIncompleteError(signed.id, error);
-      logger.info(`Ergo ${this.network}: ${incomplete.message}`);
-      throw incomplete;
+      throw incompleteBecause(error);
     }
     if (id !== signed.id) {
-      const incomplete = new ErgoCheckIncompleteError(signed.id, `the node answered with id ${id}`);
+      const incomplete = new ErgoCheckIncompleteError(signed.id, `the node answered with id ${id}`, ownIds);
       logger.info(`Ergo ${this.network}: ${incomplete.message}`);
       throw incomplete;
     }
@@ -723,7 +871,7 @@ export class Ergo {
    * outcome: a restart would read the entry back and post it again, so "not taken" would
    * not hold.
    */
-  private releaseBeforeDefiniteAnswer(txId: string, cause: ErgoNodeError): void {
+  private releaseBeforeDefiniteAnswer(txId: string, cause: unknown): void {
     try {
       this.pending.release(txId, { mustPersist: true });
     } catch (writeError) {
@@ -851,7 +999,7 @@ export class Ergo {
           return await this.submitSigned(signed, built);
         } catch (error) {
           if (error instanceof ErgoCheckOnlyError) {
-            const symbol = this.config.nativeCurrencySymbol;
+            const symbol = symbolForMessage(this.config.nativeCurrencySymbol, null);
             const tokenText = tokens.map((t) => `, ${t.amount} of token ${t.tokenId} (in its smallest unit)`).join('');
             throw error.withMoves(
               `${formatUnits(nanoErgs, this.config.nativeDecimals)} ${symbol}${tokenText} to ${toAddress}, ` +
@@ -959,7 +1107,20 @@ export class Ergo {
     // it nowhere: it was dropped. Post it once more rather than forget it, since releasing
     // would let a rebuild execute twice if the dropped one resurfaces.
     if (tracked && inputs!.allUnspent) {
-      if (this.submitMode === 'check') {
+      const { mode, mismatch } = this.submitModeCheck();
+      if (mismatch) {
+        // the mode is in doubt: kept, its inputs hidden, not posted
+        logger.warn(`Ergo ${this.network}: transaction ${id} is not posted again: ${mismatch.message}`);
+        return {
+          ...base,
+          txBlock: null,
+          txStatus: TransactionStatusCode.NOT_FOUND,
+          txData: {
+            note: `the node holds it nowhere and its inputs are unspent; it is kept, and not posted again: ${mismatch.message}`,
+          },
+        };
+      }
+      if (mode === 'check') {
         // a transaction sent before the mode was check: kept, its inputs hidden, not posted
         return {
           ...base,
@@ -991,8 +1152,12 @@ export class Ergo {
     // is posted again here, so polling only this one still moves its parent.
     if (tracked && inputs!.waitingOn.length > 0 && inputs!.unknown.length === 0) {
       const parents = [...new Set(inputs!.waitingOn)];
-      // in check mode no parent is posted again either
-      for (const parent of this.submitMode === 'check' ? [] : parents) {
+      // in check mode no parent is posted again either, nor while the mode is in doubt
+      const { mode, mismatch } = this.submitModeCheck();
+      if (mismatch) {
+        logger.warn(`Ergo ${this.network}: the transactions ${id} waits for are not posted again: ${mismatch.message}`);
+      }
+      for (const parent of mode === 'send' ? parents : []) {
         const parentTx = this.pending.get(parent);
         if (!parentTx) continue;
         try {
@@ -1000,7 +1165,7 @@ export class Ergo {
         } catch (error) {
           logger.warn(
             `Ergo ${this.network}: could not check transaction ${parent}, which ${id} waits for: ` +
-              `${error instanceof Error ? error.message : String(error)}`,
+              safeErrorText(error, [parent, ...parentTx.inputBoxIds]),
           );
         }
       }
@@ -1023,17 +1188,20 @@ export class Ergo {
    * until a later post is taken. Any other failure throws, and the entry is kept as it is.
    */
   private async postAgain(tx: PendingTransaction): Promise<ErgoNodeError | undefined> {
+    const ownIds = [tx.txId, ...tx.inputBoxIds];
     try {
       await this.postToSubmit(tx.json);
     } catch (error) {
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
         this.pending.markRefused(tx.txId, true);
         logger.warn(
-          `Ergo ${this.network}: transaction ${tx.txId} was refused when posted again, and is kept: ${nodeText(error)}`,
+          `Ergo ${this.network}: transaction ${tx.txId} was refused when posted again, and is kept: ` +
+            safeNodeText(error, ownIds),
         );
         return error;
       }
-      throw error;
+      // the node's text goes on to a log line or an answer: made safe first
+      throw error instanceof ErgoNodeError ? sanitizedNodeError(error, ownIds) : error;
     }
     this.pending.markRefused(tx.txId, false);
     logger.info(`Ergo ${this.network}: transaction ${tx.txId}, which the node had dropped, was posted again and taken`);
@@ -1050,7 +1218,7 @@ export class Ergo {
     tx: PendingTransaction,
     refusal: ErgoNodeError,
   ): Promise<Pick<ErgoPollResult, 'txStatus' | 'txData'>> {
-    const said = nodeText(refusal);
+    const said = safeNodeText(refusal, [tx.txId, ...tx.inputBoxIds]);
     if (await this.node.getUnconfirmedTransaction(tx.txId)) {
       this.pending.markRefused(tx.txId, false);
       return {
@@ -1164,7 +1332,7 @@ export class Ergo {
       } catch (error) {
         logger.warn(
           `Ergo ${this.network}: could not check pending transaction ${tx.txId}, kept: ` +
-            `${error instanceof Error ? error.message : String(error)}`,
+            safeErrorText(error, [tx.txId, ...tx.inputBoxIds]),
         );
       }
     }
@@ -1214,7 +1382,15 @@ export class Ergo {
     // (posted by a poll at the same moment, or relayed back by a peer), and then it is not
     // marked refused.
     if (inputs.allUnspent) {
-      if (this.submitMode === 'check') {
+      const { mode, mismatch } = this.submitModeCheck();
+      if (mismatch) {
+        logger.warn(
+          `Ergo ${this.network}: pending transaction ${id} is held nowhere by the node and its inputs are unspent; ` +
+            `it is kept, and not posted again: ${mismatch.message}`,
+        );
+        return;
+      }
+      if (mode === 'check') {
         logger.warn(
           `Ergo ${this.network}: pending transaction ${id} is held nowhere by the node and its inputs are unspent; ` +
             'it is kept, and not posted again while submitMode is check',

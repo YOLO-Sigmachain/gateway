@@ -22,8 +22,9 @@ import {
   ErgoTransactionRejectedError,
 } from '../../../src/chains/ergo/ergo';
 import { getErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
+import { ErgoSubmitRefusedError } from '../../../src/chains/ergo/ergo.node-client';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
-import { addressFromPublicKey } from '../../../src/chains/ergo/ergo.utils';
+import { addressFromPublicKey, sanitizeNodeText } from '../../../src/chains/ergo/ergo.utils';
 import { toHttpError } from '../../../src/chains/ergo/routes/errors';
 import { TransactionStatusCode } from '../../../src/schemas/chain-schema';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
@@ -79,11 +80,12 @@ function setup(opts: {
   submitMode?: 'send' | 'check';
   check?: (body: string) => FakeResponse | 'throw';
   submit?: (body: string) => FakeResponse;
+  info?: () => FakeResponse;
 }) {
   const posted: string[] = [];
   const checked: string[] = [];
   const node = fakeNode((method, p, body) => {
-    if (method === 'GET' && p === '/info') return { body: infoBody() };
+    if (method === 'GET' && p === '/info') return opts.info ? opts.info() : { body: infoBody() };
     if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [nodeBoxJson(big)] };
     if (method === 'GET' && p === '/blocks/lastHeaders/10') return { body: HEADERS };
     if (method === 'POST' && p === '/transactions') {
@@ -193,6 +195,131 @@ describe('Ergo.transfer with submitMode check', () => {
     await expect(ergo.submitTransaction(signed, built)).rejects.toBeInstanceOf(ErgoCheckOnlyError);
     expect(checked).toEqual([signed.json]);
     expect(posted).toEqual([]);
+  });
+});
+
+describe('a node that keeps no UTXO state cannot validate scripts: nothing is checked there', () => {
+  it.each([
+    ['digest', { body: infoBody(TIP, 360, 'digest') }, '"digest"'],
+    ['no stateType at all', { body: { fullHeight: TIP, parameters: { minValuePerByte: 360 } } }, 'null'],
+  ])('%s: the check could not be completed (a 503); nothing was posted to any endpoint', async (_name, info, shown) => {
+    let calls = 0;
+    // the build reads /info first with the real answer; the read before the check gets `info`
+    const { ergo, posted, checked } = setup({
+      submitMode: 'check',
+      info: () => (++calls === 1 ? { body: infoBody() } : (info as FakeResponse)),
+    });
+    const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+    expect(error).toBeInstanceOf(ErgoCheckIncompleteError);
+    expect(error.message).toContain(
+      `could not be completed (this node keeps no UTXO state, its stateType is ${shown}, so it cannot validate ` +
+        'scripts); nothing was sent',
+    );
+    expect((toHttpError(error, 'Failed to transfer') as Error & { statusCode: number }).statusCode).toBe(503);
+    expect(checked).toEqual([]);
+    expect(posted).toEqual([]);
+  });
+
+  it('utxo: the check is posted', async () => {
+    const { ergo, checked } = setup({ submitMode: 'check' });
+    await expect(ergo.transfer(ME, OTHER, ERG)).rejects.toBeInstanceOf(ErgoCheckOnlyError);
+    expect(checked).toHaveLength(1);
+  });
+});
+
+describe("the node client's own submit, called directly", () => {
+  it('on a check-mode network throws and posts nothing', async () => {
+    const { ergo, posted, node } = setup({ submitMode: 'check' });
+    const built = await ergo.buildTransfer(ME, OTHER, ERG);
+    const signed = await ergo.signTransaction(built, signer);
+    await expect(ergo.node.submitTransaction(signed.json)).rejects.toBeInstanceOf(ErgoSubmitRefusedError);
+    expect(posted).toEqual([]);
+    expect(node.calls.filter((c) => c.method === 'POST' && c.path.startsWith('/transactions'))).toEqual([]);
+  });
+
+  it('on a send-mode network posts', async () => {
+    const { ergo, posted } = setup({ submitMode: 'send' });
+    const built = await ergo.buildTransfer(ME, OTHER, ERG);
+    const signed = await ergo.signTransaction(built, signer);
+    await expect(ergo.node.submitTransaction(signed.json)).resolves.toBe(signed.id);
+    expect(posted).toEqual([signed.json]);
+  });
+});
+
+/**
+ * A node refusal shaped like the node's own for a transaction above the cost limit: the
+ * text repeats the transaction, its inputs with their spending proofs and its outputs.
+ */
+function costRefusal(body: string): FakeResponse {
+  const tx = JSON.parse(body);
+  const printed =
+    `ErgoTransaction(id: ${tx.id}, inputs: [${tx.inputs.map((i: unknown) => JSON.stringify(i)).join(',')}], ` +
+    `dataInputs: [], outputs: [${tx.outputs.map((o: unknown) => JSON.stringify(o)).join(',')}], size: 400)`;
+  return {
+    status: 400,
+    body: {
+      error: 400,
+      reason: 'bad.request',
+      detail: `Malformed transaction: Transaction ${printed} has too high cost 1000001 (limit 1000000)`,
+    },
+  };
+}
+
+describe('a node refusal that repeats the signed transaction: no signature reaches an answer or a log', () => {
+  const proofsOf = (json: string): string[] =>
+    JSON.parse(json).inputs.map((i: { spendingProof: { proofBytes: string } }) => i.spendingProof.proofBytes);
+  const logged = (spies: jest.SpyInstance[]) => spies.flatMap((s) => s.mock.calls.map((c) => c.map(String).join(' ')));
+
+  it.each([['check' as const], ['send' as const]])('in %s mode', async (submitMode) => {
+    const spies = [jest.spyOn(logger, 'info'), jest.spyOn(logger, 'warn'), jest.spyOn(logger, 'error')];
+    const sign = jest.spyOn(Ergo.prototype, 'signTransaction');
+    const { ergo, posted, checked } = setup({ submitMode, check: costRefusal, submit: costRefusal });
+    const error = await errorOf(ergo.transfer(ME, OTHER, ERG));
+    const signed = await sign.mock.results[0].value;
+    expect(submitMode === 'check' ? checked : posted).toEqual([signed.json]);
+    expect(error).toBeInstanceOf(submitMode === 'check' ? ErgoCheckRejectedError : ErgoTransactionRejectedError);
+    const http = toHttpError(error, 'Failed to transfer') as Error & { statusCode: number };
+    expect(http.statusCode).toBe(400);
+    const proofs = proofsOf(signed.json);
+    expect(proofs[0].length).toBeGreaterThan(64);
+    const texts = [http.message, error.message, String(error.detail), String(error.reason), ...logged(spies)];
+    for (const text of texts) {
+      for (const proof of proofs) expect(text).not.toContain(proof);
+      expect(text).not.toMatch(/proofBytes"\s*:\s*"[0-9a-f]/i);
+      expect(text.length).toBeLessThan(800);
+    }
+    // the transaction's own id and its input box ids stay readable, and the node's words are kept
+    expect(http.message).toContain(`Malformed transaction: Transaction ErgoTransaction(id: ${signed.id}`);
+    expect(http.message).toContain(big.boxId);
+    expect(http.message).toContain('"spendingProof":<redacted>');
+  });
+});
+
+describe('the text of a node refusal, as placed in a message or a log line', () => {
+  const ID = 'ab'.repeat(32);
+
+  it('an ordinary short refusal is unchanged', () => {
+    for (const text of ['Malformed transaction: nope', 'Double spending attempt', `Input ${ID} not found`]) {
+      expect(sanitizeNodeText(text, [ID])).toBe(text);
+    }
+  });
+
+  it('a 64-hex run is kept only when it is one of the given ids; a longer run never', () => {
+    const other = 'cd'.repeat(32);
+    expect(sanitizeNodeText(`${ID} ${other} ${'ef'.repeat(40)}`, [ID])).toBe(`${ID} <redacted> <redacted>`);
+  });
+
+  it('the value after a proof key is withheld, whatever its shape', () => {
+    expect(sanitizeNodeText('{"spendingProof":{"proofBytes":"00ff","extension":{"1":"04"}},"x":1}')).toBe(
+      '{"spendingProof":<redacted>,"x":1}',
+    );
+    expect(sanitizeNodeText('proofBytes=00ff, next')).toBe('proofBytes=<redacted>, next');
+    expect(sanitizeNodeText("'proof_bytes': 'a1b2'")).toBe("'proof_bytes': <redacted>");
+  });
+
+  it('a long text is cut at 600 characters, with an ellipsis', () => {
+    const cut = sanitizeNodeText('x'.repeat(700));
+    expect(cut).toBe(`${'x'.repeat(600)}…`);
   });
 });
 
@@ -331,9 +458,10 @@ describe('the submitMode config key', () => {
       'ergo-mainnet.pendingTxTimeoutBlocks': 15,
       'ergo-mainnet.confirmations': 1,
     };
-    jest
-      .spyOn(ConfigManagerV2, 'getInstance')
-      .mockReturnValue({ get: (k: string) => mockConfigStorage[k] } as unknown as ConfigManagerV2);
+    jest.spyOn(ConfigManagerV2, 'getInstance').mockReturnValue({
+      get: (k: string) => mockConfigStorage[k],
+      getNamespace: () => undefined,
+    } as unknown as ConfigManagerV2);
   });
 
   it('absent is send; send and check are read as they are; any other value is refused', () => {
@@ -354,18 +482,23 @@ describe('the submitMode config key', () => {
     );
   });
 
-  it('a network that starts in check mode logs one warning; one in send mode none', () => {
+  it('a network states its mode when it starts: an info line in send mode, a warning in check mode', () => {
     const warn = jest.spyOn(logger, 'warn');
+    const info = jest.spyOn(logger, 'info');
+    const modeLines = (spy: jest.SpyInstance) => spy.mock.calls.filter((c) => String(c[0]).includes('submitMode'));
     new Ergo('mainnet', { config: testConfig({ submitMode: 'send' }) });
     new Ergo('mainnet', { config: testConfig() });
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('submitMode'))).toHaveLength(0);
+    expect(modeLines(warn)).toHaveLength(0);
+    const sendLine = ['ergo-mainnet.submitMode is send: signed transactions are sent to the node'];
+    expect(modeLines(info)).toEqual([sendLine, sendLine]);
     new Ergo('mainnet', { config: testConfig({ submitMode: 'check' }) });
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('submitMode'))).toEqual([
+    expect(modeLines(warn)).toEqual([
       [
         'ergo-mainnet.submitMode is check: signed transactions are only checked by the node, never sent; no swap ' +
           'or transfer from this network is carried out',
       ],
     ]);
+    expect(modeLines(info)).toHaveLength(2);
   });
 });
 
@@ -375,16 +508,21 @@ describe('submitMode in the schema and the shipped templates', () => {
   const text = (net: string) => fs.readFileSync(path.join(templates, 'chains/ergo', `${net}.yml`), 'utf8');
   const load = (net: string) => yaml.load(text(net)) as Record<string, unknown>;
 
-  it.each(['mainnet', 'testnet'])('%s ships submitMode send and validates; only send and check are taken', (net) => {
-    const validate = new Ajv({ strict: false }).compile(schema);
-    expect(text(net)).toMatch(/^submitMode: send$/m);
-    expect(load(net).submitMode).toBe('send');
-    expect(validate(load(net))).toBe(true);
-    expect(validate({ ...load(net), submitMode: 'check' })).toBe(true);
-    const { submitMode: _left, ...without } = load(net);
-    expect(validate(without)).toBe(true);
-    for (const bad of ['Check', 'dry-run', '', true, 1])
-      expect(validate({ ...load(net), submitMode: bad })).toBe(false);
-    expect(schema.required).not.toContain('submitMode');
-  });
+  it.each(['mainnet', 'testnet'])(
+    '%s ships no submitMode value, only a commented example; only send and check are taken',
+    (net) => {
+      const validate = new Ajv({ strict: false }).compile(schema);
+      // no value in the template: the loader would keep it over a value of another type
+      expect(load(net)).not.toHaveProperty('submitMode');
+      expect(text(net)).not.toMatch(/^submitMode:/m);
+      expect(text(net)).toMatch(/^# submitMode: check {4}# or: submitMode: send$/m);
+      expect(validate(load(net))).toBe(true);
+      expect(validate({ ...load(net), submitMode: 'check' })).toBe(true);
+      const { submitMode: _left, ...without } = load(net);
+      expect(validate(without)).toBe(true);
+      for (const bad of ['Check', 'dry-run', '', true, 1])
+        expect(validate({ ...load(net), submitMode: bad })).toBe(false);
+      expect(schema.required).not.toContain('submitMode');
+    },
+  );
 });

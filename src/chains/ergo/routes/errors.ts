@@ -5,9 +5,10 @@ import {
   ErgoCheckOnlyError,
   ErgoInputSpentError,
   ErgoNotSubmittedError,
+  ErgoSubmitModeMismatchError,
   ErgoTransactionRejectedError,
 } from '../ergo';
-import { ErgoNodeError } from '../ergo.node-client';
+import { ErgoNodeError, ErgoSubmitRefusedError } from '../ergo.node-client';
 import { ErgoBuildError } from '../ergo.tx-builder';
 
 /**
@@ -23,6 +24,9 @@ import { ErgoBuildError } from '../ergo.tx-builder';
  * "nothing was sent"; one the check refused is a 400, like a refusal at submit; a check
  * that gave no verdict is a 503 that says nothing was sent. None of them is a pending
  * transaction, and none carries a code a client would poll on.
+ *
+ * A submit mode in doubt (the running instance, the config in memory and the config file do
+ * not all say the same) is a 503 that says nothing was sent and Gateway must be restarted.
  */
 export function toHttpError(error: unknown, action: string): Error {
   if (error && typeof error === 'object' && 'statusCode' in error) {
@@ -32,6 +36,9 @@ export function toHttpError(error: unknown, action: string): Error {
     return httpErrors.createError(409, error.message);
   }
   if (error instanceof ErgoCheckIncompleteError) {
+    return httpErrors.serviceUnavailable(`${action}: ${error.message}`);
+  }
+  if (error instanceof ErgoSubmitModeMismatchError || error instanceof ErgoSubmitRefusedError) {
     return httpErrors.serviceUnavailable(`${action}: ${error.message}`);
   }
   // a contract box someone spent first: retry after reading its successor

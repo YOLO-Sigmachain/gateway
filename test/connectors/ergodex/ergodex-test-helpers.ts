@@ -165,6 +165,8 @@ export interface NodeState {
    * answers 1 when some pool box in this state holds it; any other token is unknown.
    */
   emission: Map<string, bigint>;
+  /** The node's state type in /info; unset: utxo. */
+  stateType?: string;
 }
 
 export function newNodeState(): NodeState {
@@ -215,7 +217,13 @@ export function stateNode(state: NodeState): FetchLike {
     let m: RegExpMatchArray | null;
     if (method === 'GET' && p === '/info') {
       return send({
-        body: { fullHeight: TIP, headersHeight: TIP, network: 'mainnet', parameters: { minValuePerByte: 360 } },
+        body: {
+          fullHeight: TIP,
+          headersHeight: TIP,
+          network: 'mainnet',
+          stateType: state.stateType ?? 'utxo',
+          parameters: { minValuePerByte: 360 },
+        },
       });
     }
     if (method === 'GET' && p === '/blocks/lastHeaders/10') return send({ body: HEADERS });

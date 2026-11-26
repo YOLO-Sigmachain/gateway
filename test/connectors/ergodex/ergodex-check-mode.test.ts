@@ -14,7 +14,9 @@ import * as path from 'path';
 import { ErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
+import { symbolForMessage } from '../../../src/chains/ergo/ergo.utils';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
+import { logger } from '../../../src/services/logger';
 import { tradingAmmRoutes } from '../../../src/trading/trading.routes';
 import { fastifyWithTypeProvider } from '../../utils/testUtils';
 
@@ -207,6 +209,82 @@ describe('ergodex execute-swap with submitMode check', () => {
       expect(fs.existsSync(file)).toBe(false);
     },
   );
+
+  describe('a node refusal that repeats the signed swap, signatures included', () => {
+    /** The node's refusal for a transaction above the cost limit, which prints the transaction. */
+    const costRefusal = (body: string) => {
+      const tx = JSON.parse(body);
+      const printed =
+        `ErgoTransaction(id: ${tx.id}, inputs: [${tx.inputs.map((i: unknown) => JSON.stringify(i)).join(',')}], ` +
+        `dataInputs: [], outputs: [${tx.outputs.map((o: unknown) => JSON.stringify(o)).join(',')}], size: 400)`;
+      return {
+        status: 400,
+        body: {
+          error: 400,
+          reason: 'bad.request',
+          detail: `Malformed transaction: Transaction ${printed} has too high cost 1000001 (limit 1000000)`,
+        },
+      };
+    };
+    // the pool input's proof is empty (its contract needs no signature); the wallet's is not
+    const proofsOf = (json: string): string[] =>
+      parseNodeJson<PostedTx>(json)
+        .inputs.map((i) => i.spendingProof.proofBytes)
+        .filter((proof) => proof !== '');
+
+    it.each([['check'], ['send']])('in %s mode: the answer and the log lines carry no proof bytes', async (mode) => {
+      const spies = [jest.spyOn(logger, 'info'), jest.spyOn(logger, 'warn'), jest.spyOn(logger, 'error')];
+      if (mode === 'send') {
+        dex = makeDex(state, dexConfig(), ROOT, TOKENS, testConfig({ submitMode: 'send', pendingStateFile: file }));
+        (Ergodex.getInstance as jest.Mock).mockImplementation(async () => dex);
+      }
+      state.check = costRefusal;
+      state.submit = costRefusal;
+      const res = await execute();
+      expect(res.statusCode).toBe(400);
+      const sentJson = mode === 'check' ? state.checked : state.posted;
+      expect(sentJson).toHaveLength(1);
+      expect(transactionPosts(state)).toEqual([mode === 'check' ? '/transactions/check' : '/transactions']);
+      const message: string = JSON.parse(res.body).message;
+      expect(message).toContain('Malformed transaction: Transaction ErgoTransaction(id: ');
+      expect(message).toContain('"spendingProof":<redacted>');
+      expect(proofsOf(sentJson[0]).length).toBeGreaterThan(0);
+      const lines = spies.flatMap((spy) => spy.mock.calls.map((c) => c.map(String).join(' ')));
+      for (const text of [message, ...lines]) {
+        for (const proof of proofsOf(sentJson[0])) expect(text).not.toContain(proof);
+        expect(text).not.toMatch(/proofBytes"\s*:\s*"[0-9a-f]/i);
+      }
+    });
+  });
+
+  it('a token named like another message is written in the 409 as the start of its id', async () => {
+    const lookalike = 'ab'.repeat(32);
+    const hostile = `TRANSACTION_TIMEOUT Transaction ${lookalike} pending`;
+    const tokens = TOKENS.map((t) => (t.address === RSN ? { ...t, symbol: hostile, name: hostile } : t));
+    dex = makeDex(state, dexConfig(), ROOT, tokens, checkConfig());
+    (Ergodex.getInstance as jest.Mock).mockImplementation(async () => dex);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/trading/amm/execute-swap',
+      payload: execBody({ quoteToken: RSN }),
+    });
+    expect(res.statusCode).toBe(409);
+    const message: string = JSON.parse(res.body).message;
+    expect(message).not.toContain('TRANSACTION_TIMEOUT');
+    expect(message).not.toContain(lookalike);
+    expect(message).toContain(`23.693 ${RSN.slice(0, 8)}… out`);
+    expect(transactionPosts(state)).toEqual(['/transactions/check']);
+  });
+
+  it('a symbol is written in a message as it is only when it is short and plain', () => {
+    expect(symbolForMessage('RSN', RSN)).toBe('RSN');
+    expect(symbolForMessage('WT_ERG', RSN)).toBe('WT_ERG');
+    expect(symbolForMessage('ERG', null)).toBe('ERG');
+    expect(symbolForMessage('a b', RSN)).toBe(`${RSN.slice(0, 8)}…`);
+    expect(symbolForMessage('ABCDEFGHIJKLMNOPQ', RSN)).toBe(`${RSN.slice(0, 8)}…`);
+    expect(symbolForMessage('', RSN)).toBe(`${RSN.slice(0, 8)}…`);
+    expect(symbolForMessage('E R G', null)).toBe('native');
+  });
 
   it('a LithosDex swap is signed by the version-3 signer and goes to the check path too', async () => {
     const lState = newNodeState();

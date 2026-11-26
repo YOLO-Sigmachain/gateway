@@ -64,7 +64,7 @@ boxPageSize: 100
 # current boxes, scripts included) and nothing is sent; a swap or transfer then answers an
 # error that names the transaction id and says nothing was sent, and nothing is tracked.
 # Use check for a dry run with a real wallet before sending anything. Unset: send.
-submitMode: send
+# submitMode: check    # or: submitMode: send
 
 # Default connector for the unified trading routes when a request names none
 # (format: connector/type)

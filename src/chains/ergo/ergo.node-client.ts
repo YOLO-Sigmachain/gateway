@@ -122,17 +122,34 @@ export function normalizeNodeBox(raw: Record<string, unknown>): ErgoBox {
   };
 }
 
+/**
+ * submitTransaction was called while the network's submit mode is not `send`: nothing was
+ * posted to the node.
+ */
+export class ErgoSubmitRefusedError extends Error {
+  constructor() {
+    super('The submit mode in force is not send: the transaction was not posted to the node, and nothing was sent');
+    this.name = 'ErgoSubmitRefusedError';
+  }
+}
+
 export class ErgoNodeClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly pageSize: number;
   private readonly fetchImpl: FetchLike;
+  /** Whether the network's submit mode is `send` right now; submitTransaction posts nothing otherwise. */
+  private readonly canSubmit: () => boolean;
 
-  constructor(baseUrl: string, options: { timeoutMs: number; pageSize: number; fetch?: FetchLike }) {
+  constructor(
+    baseUrl: string,
+    options: { timeoutMs: number; pageSize: number; fetch?: FetchLike; canSubmit: () => boolean },
+  ) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.timeoutMs = options.timeoutMs;
     this.pageSize = options.pageSize;
     this.fetchImpl = options.fetch ?? ((input, init) => (globalThis.fetch as unknown as FetchLike)(input, init));
+    this.canSubmit = options.canSubmit;
   }
 
   /**
@@ -393,9 +410,12 @@ export class ErgoNodeClient {
 
   /**
    * Submit a signed transaction. `json` is sent byte for byte as the signer wrote it.
-   * Returns the id the node accepted. A rejection throws with the node's reason.
+   * Returns the id the node accepted. A rejection throws with the node's reason. Unless
+   * the network's submit mode is `send`, nothing is posted and ErgoSubmitRefusedError is
+   * thrown, whoever the caller.
    */
   async submitTransaction(json: string): Promise<string> {
+    if (!this.canSubmit()) throw new ErgoSubmitRefusedError();
     // The node answers with the id as a JSON string; a bare id is accepted too.
     const id = await this.request<string>('POST', '/transactions', {
       body: json,

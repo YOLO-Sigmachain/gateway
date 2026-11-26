@@ -46,6 +46,92 @@ export function isHexBytes(value: unknown): value is string {
 }
 
 // ---------------------------------------------------------------------------------------
+// Text from outside (the node, the token list, the chain) placed in messages and logs.
+
+/** What stands where a part of a node's text was withheld. */
+export const REDACTED = '<redacted>';
+/** Longest node text placed in a message or a log line. */
+const NODE_TEXT_LIMIT = 600;
+/** A key whose value is a signature or a part of one: proofBytes, spendingProof and the like. */
+const PROOF_KEY = /(["']?)\b(\w*proof\w*)\1\s*[:=]\s*/gi;
+const HEX_RUN = /[0-9a-fA-F]{64,}/g;
+const CLOSING: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
+
+/** Where the value that starts at `start` ends: a bracketed value with what it holds, a quoted one, or a bare word. */
+function endOfValue(text: string, start: number): number {
+  const first = text[start];
+  if (first === undefined) return start;
+  if (first === '"' || first === "'") {
+    for (let i = start + 1; i < text.length; i++) {
+      if (text[i] === '\\') i++;
+      else if (text[i] === first) return i + 1;
+    }
+    return text.length;
+  }
+  if (first in CLOSING) {
+    const stack: string[] = [];
+    let quote: string | null = null;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (c === quote) quote = null;
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (c in CLOSING) {
+        stack.push(CLOSING[c]);
+      } else if (c === stack[stack.length - 1]) {
+        stack.pop();
+        if (stack.length === 0) return i + 1;
+      }
+    }
+    return text.length; // never closed: withhold the rest
+  }
+  const end = text.slice(start).search(/[\s,;)\]}]/);
+  return end === -1 ? text.length : start + end;
+}
+
+/**
+ * A node's text made safe to place in an error message, an HTTP answer or a log line. A
+ * node may repeat a signed transaction in its refusal, signatures included, and anyone who
+ * reads those bytes could post the transaction. So: the value after any proof key
+ * (`proofBytes`, `spendingProof`, ...) is withheld; so is every run of 64 or more hex
+ * characters, except a run of exactly 64 that is one of `keepIds` (the transaction's own
+ * id and its input box ids, which stay readable); and the text is cut at 600 characters.
+ */
+export function sanitizeNodeText(text: string, keepIds: Iterable<string> = []): string {
+  const keep = new Set([...keepIds].map((id) => id.toLowerCase()));
+  let withheld = '';
+  let from = 0;
+  PROOF_KEY.lastIndex = 0;
+  for (let m = PROOF_KEY.exec(text); m !== null; m = PROOF_KEY.exec(text)) {
+    const valueStart = m.index + m[0].length;
+    const valueEnd = endOfValue(text, valueStart);
+    withheld += text.slice(from, valueStart) + REDACTED;
+    from = valueEnd;
+    PROOF_KEY.lastIndex = Math.max(valueEnd, valueStart + 1);
+  }
+  withheld += text.slice(from);
+  const safe = withheld.replace(HEX_RUN, (run) => (run.length === 64 && keep.has(run.toLowerCase()) ? run : REDACTED));
+  return safe.length > NODE_TEXT_LIMIT ? `${safe.slice(0, NODE_TEXT_LIMIT)}…` : safe;
+}
+
+/** A symbol that can stand in a message as it is: short, and only letters, digits and . _ $ - */
+const MESSAGE_SYMBOL = /^[A-Za-z0-9._$-]{1,16}$/;
+
+/**
+ * A token's symbol as it is written in an error message or a log line. A symbol or name
+ * comes from the token list or from the chain, where anyone can mint a token named like
+ * another message; one that is not a plain short symbol is written as the first 8
+ * characters of the token id and an ellipsis, or `native` for the native coin (`tokenId`
+ * null). Symbols in response fields are not messages and are left as they are.
+ */
+export function symbolForMessage(symbol: string, tokenId: string | null): string {
+  if (MESSAGE_SYMBOL.test(symbol)) return symbol;
+  return tokenId === null ? 'native' : `${tokenId.slice(0, 8)}…`;
+}
+
+// ---------------------------------------------------------------------------------------
 // Amounts. Whole-unit decimal strings are made from bigints digit by digit: no float ever
 // touches the integer part.
 

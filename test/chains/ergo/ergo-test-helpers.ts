@@ -152,6 +152,7 @@ export function fakeNode(route: FakeRoute) {
 
 export const notFound = (): FakeResponse => ({ status: 404, body: { error: 404, reason: 'not-found', detail: null } });
 
-export function infoBody(height = TIP, minValuePerByte = 360) {
-  return { fullHeight: height, headersHeight: height, network: 'mainnet', parameters: { minValuePerByte } };
+/** A node's /info; `stateType` utxo, as a node that keeps the UTXO set (and so runs scripts) answers. */
+export function infoBody(height = TIP, minValuePerByte = 360, stateType = 'utxo') {
+  return { fullHeight: height, headersHeight: height, network: 'mainnet', stateType, parameters: { minValuePerByte } };
 }

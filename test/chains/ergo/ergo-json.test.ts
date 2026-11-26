@@ -116,7 +116,12 @@ describe('bigint-safe JSON at the node boundary', () => {
         ? { body: [nodeBoxJson(box)] }
         : undefined,
     );
-    const client = new ErgoNodeClient('http://node.test', { timeoutMs: 1000, pageSize: 100, fetch: node.fetch });
+    const client = new ErgoNodeClient('http://node.test', {
+      timeoutMs: 1000,
+      pageSize: 100,
+      fetch: node.fetch,
+      canSubmit: () => false,
+    });
     const boxes = await client.getUnspentBoxesByAddress('9fSgJ7BmUxBQJ454prQDQ7fQMBkXPLaAmDnimgTtjym6FYPHjAV', {
       includeUnconfirmed: true,
       excludeMempoolSpent: true,
