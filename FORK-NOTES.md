@@ -35,7 +35,7 @@ Not built: LithosDex order mode, deposit and redeem; pool creation; Dexy; any ne
 
 ## 2. What is proven and what is not
 
-State of the code at `ed545171`.
+State of the code at `0b0f0301`.
 
 ### Proven
 
@@ -47,7 +47,7 @@ State of the code at `ed545171`.
 | Contract proof on mainnet pool boxes kept as fixtures, LithosDex | The same two results (true for ours, false one unit over; also false for a successor register one unit off), on the signing library alpha build named below. Fixtures: an ERG/LIT pool and a LIT/RSN pool. | `test/connectors/ergodex/lithos-contract-proof.test.ts` |
 | Read-only run of the server against a mainnet node | Gateway started as a server, read pool boxes from a mainnet node, answered status, tokens, balances, pool-info and quotes for ERG/RSN, ERG/SigUSD, and a poll of an unknown id. Nothing was signed or sent. | Run on 25 November 2026, on an earlier commit than `5d9480f7` (see below). |
 
-Test counts, as of commit `ed545171` and taken from its message: 213 suites pass and 1 is skipped; 2,382 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
+Test counts, as of commit `0b0f0301` and taken from its message: 213 suites pass and 1 is skipped; 2,392 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
 
 The read-only server run happened before the commits that add `pendingData`, the `failedAfterConfirmations` depth, the LithosDex venue and `submitMode`. It has not been repeated since. Its output shows a token list without ERG and a network config without `failedAfterConfirmations`, which the current templates have.
 
@@ -256,7 +256,7 @@ A deposit or redeem is one transaction, built and checked like a swap: the pool 
 - Deposit of at most X and Y: the wallet receives `LP = min(floor(X * S / x0), floor(Y * S / y0))` and pays `ceil(LP * x0 / S)` and `ceil(LP * y0 / S)`, each at most what was offered. What does not fit the pool's ratio stays in the wallet (the pool would take it for nothing). `add` needs both amounts above zero; `quote-liquidity` treats 0 as no limit on that side. A deposit that buys no LP token is a 400.
 - Redeem of LP tokens: the wallet receives `floor(LP * x0 / S)` and `floor(LP * y0 / S)`. `remove` returns `percentageToRemove` (read to 8 decimals) of the wallet's spendable LP tokens, rounded down. A side that rounds to zero is a 400.
 
-**Which box is the pool.** A box is used for liquidity or a position only if it sits at a configured pool tree, its NFT was issued once, and it holds more than half of its LP token's emission. Only one box can hold more than half, and a real pool is created holding nearly all of it. Without this, a look-alike box holding one unit of a real pool's LP token could receive a wallet's whole LP position on a `remove`; the pool contract does not prevent that.
+**Which box is the pool.** A box is used for liquidity or a position only if it sits at a configured pool tree, its NFT was issued once, and it holds more than half of its LP token's emission. Only one box can hold more than half, and a real pool is created holding nearly all of it. Without this, a look-alike box holding one unit of a real pool's LP token could receive a wallet's whole LP position on a `remove`; the pool contract does not prevent that. When another box at a pool tree holds at least the LP amount in question of the same token, `remove`, `position-info` and `positions-owned` refuse with a 409 and name both boxes: a pool whose own box holds half or less of its LP token cannot be told apart from a box planted beside it.
 
 **Entering and leaving.** `add` and `quote-liquidity` apply every pool guard and allowlist. `remove`, `position-info` and `positions-owned` do not: they keep only the checks above, so a provider can leave a pool that later falls under a reserve or fee guard or off an allowlist. A warning is logged when a guard is passed over this way. A `remove` the pool cannot pay in full (the sole provider of an ERG/token pool asking for 100%: the contract keeps a storage minimum) is a 400 that names the largest amount that can be removed.
 
@@ -274,7 +274,7 @@ The answer to `add` or `remove` is PENDING with the transaction id. The shared r
 
 4. **`openapi.json`** is regenerated to match these changes.
 
-Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `ed545171`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
+Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `0b0f0301`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
 
 ## 6. Shared upstream files this fork touches
 
@@ -344,7 +344,7 @@ The fork is additive. Ergo code lives in its own folders. The edits to shared fi
    `pnpm test` runs `GATEWAY_TEST_MODE=dev jest --verbose`. `pnpm lint` runs eslint with `--fix`, so it can edit files; review its changes.
 
    Tests need Node 22 or newer: `package.json` has `"engines": { "node": ">=22.0.0" }`. Upstream's CI workflow currently sets up Node 20, which is below that range. `package.json` has no pnpm entry under `engines`; it lists `"pnpm": "^10.10.0"` among its dependencies, and CI installs pnpm 10. Use pnpm 10.10 or newer.
-7. **Compare with the last known counts.** At `ed545171`: 213 suites pass and 1 is skipped; 2,382 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
+7. **Compare with the last known counts.** At `0b0f0301`: 213 suites pass and 1 is skipped; 2,392 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
 8. **Commit the merge** and push the branch to the fork.
 
 ## 8. Known limits and open items
