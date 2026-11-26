@@ -35,7 +35,7 @@ Not built: LithosDex order mode, deposit and redeem; pool creation; Dexy; any ne
 
 ## 2. What is proven and what is not
 
-State of the code at `b9502f24`.
+State of the code at `ed545171`.
 
 ### Proven
 
@@ -43,11 +43,11 @@ State of the code at `b9502f24`.
 |---|---|---|
 | Unit and route tests against stand-in nodes | The chain layer, the transaction builder, the pending list, the swap routes and both venues behave as written when the node is a test double. | `test/chains/ergo/`, `test/connectors/ergodex/` |
 | Contract proof on mainnet pool boxes kept as fixtures, Spectrum-style | The pool script, evaluated by the real signing library (`ergo-lib-wasm-nodejs` 0.28.0), is true for the swap this code builds and false for the same swap asking one unit more. Both directions, exact input and exact output. Fixtures: ERG/rsBTC, ERG/RSN, ERG/SigUSD, wtERG/wtADA. | `test/connectors/ergodex/ergodex-contract-proof.test.ts` |
-| Contract proof of deposit and redeem on the same Spectrum-style fixtures | The pool script, evaluated by the same library, is true for the deposit and the redeem this code builds; false for one LP unit more out or one unit less of either side in (deposit, with each side as the limiting one), and false for one unit more of either side out or one LP unit less in (redeem). Not yet in a commit. | `test/connectors/ergodex/ergodex-liquidity-proof.test.ts` |
+| Contract proof of deposit and redeem on the same Spectrum-style fixtures | The pool script, evaluated by the same library, is true for the deposit and the redeem this code builds; false for one LP unit more out or one unit less of either side in (deposit, with each side as the limiting one), and false for one unit more of either side out or one LP unit less in (redeem). | `test/connectors/ergodex/ergodex-liquidity-proof.test.ts` |
 | Contract proof on mainnet pool boxes kept as fixtures, LithosDex | The same two results (true for ours, false one unit over; also false for a successor register one unit off), on the signing library alpha build named below. Fixtures: an ERG/LIT pool and a LIT/RSN pool. | `test/connectors/ergodex/lithos-contract-proof.test.ts` |
 | Read-only run of the server against a mainnet node | Gateway started as a server, read pool boxes from a mainnet node, answered status, tokens, balances, pool-info and quotes for ERG/RSN, ERG/SigUSD, and a poll of an unknown id. Nothing was signed or sent. | Run on 25 November 2026, on an earlier commit than `5d9480f7` (see below). |
 
-Test counts, as of commit `b9502f24` and taken from its message: 209 suites pass and 1 is skipped; 2,258 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
+Test counts, as of commit `ed545171` and taken from its message: 213 suites pass and 1 is skipped; 2,382 tests pass and 4 are skipped. Section 7 has the commands to run them. Tests that need a live node are skipped unless `ERGO_LIVE_NODE=1` is set (`test/connectors/ergodex/ergodex-live.test.ts`).
 
 The read-only server run happened before the commits that add `pendingData`, the `failedAfterConfirmations` depth, the LithosDex venue and `submitMode`. It has not been repeated since. Its output shows a token list without ERG and a network config without `failedAfterConfirmations`, which the current templates have.
 
@@ -164,7 +164,7 @@ Per network, under `networks.<network>`. The pool guards are here. They fail clo
 | `spectrum.n2tPoolTrees`, `spectrum.t2tPoolTrees` | Exact ErgoTrees (hex) of ERG/token and token/token pools. A box is a Spectrum-style pool only at one of these trees. | one tree each |
 | `spectrum.feeDenominator` | The pool contracts' fee denominator. | `1000` |
 | `spectrum.n2tMinSuccessorValue` | An ERG/token pool's successor must hold more than this many nanoERG. | `10000000` |
-| `spectrum.lockedLiquidity` | The pool contracts' LP constant: a pool's LP supply is this minus the LP tokens it holds. Unset: the liquidity and position routes answer 501; swaps are unaffected. | `'9223372036854775807'` |
+| `spectrum.lockedLiquidity` | The pool contracts' LP constant: a pool's LP supply is this minus the LP tokens it holds. Must be a constant of every configured pool tree; another value is refused when the config loads (a wrong value would underpay deposits). Unset: the liquidity and position routes answer 501; swaps are unaffected. | `'9223372036854775807'` |
 | `lithos.poolAllowlist` | LithosDex pool NFT ids you have checked and chosen. See below. | `[]` |
 | `lithos.feeDenominator`, `lithos.accumulatorScale`, `lithos.lockedLiquidity`, `lithos.n2tMinSuccessorValue`, `lithos.swapOperation` | Constants of the LithosDex contracts. | `10000`, `10^27`, `9223372036854775807`, `10000000`, `0` |
 | `lithos.sentinels`, `lithos.provisionGuardTree`, `lithos.n2t.*`, `lithos.t2t.*` | The pinned LithosDex contract templates (pool, fee vault, provision logic) with placeholder ids that are replaced by each pool's own ids. Do not edit these without a reason. | pinned templates |
@@ -254,11 +254,15 @@ Routes: `GET /trading/amm/quote-liquidity`, `POST /trading/amm/add`, `POST /trad
 A deposit or redeem is one transaction, built and checked like a swap: the pool box is input 0 and its successor output 0; the wallet pays in, and what it receives comes back in its change. The pool counts its LP supply as `lockedLiquidity` minus the LP tokens it holds. Rounding, as the contract demands:
 
 - Deposit of at most X and Y: the wallet receives `LP = min(floor(X * S / x0), floor(Y * S / y0))` and pays `ceil(LP * x0 / S)` and `ceil(LP * y0 / S)`, each at most what was offered. What does not fit the pool's ratio stays in the wallet (the pool would take it for nothing). `add` needs both amounts above zero; `quote-liquidity` treats 0 as no limit on that side. A deposit that buys no LP token is a 400.
-- Redeem of LP tokens: the wallet receives `floor(LP * x0 / S)` and `floor(LP * y0 / S)`. `remove` returns `percentageToRemove` of the wallet's spendable LP tokens, rounded down. A side that rounds to zero is a 400.
+- Redeem of LP tokens: the wallet receives `floor(LP * x0 / S)` and `floor(LP * y0 / S)`. `remove` returns `percentageToRemove` (read to 8 decimals) of the wallet's spendable LP tokens, rounded down. A side that rounds to zero is a 400.
 
-Before signing, as for a swap: the fresh pool box and the mempool-successor rule; the guards and allowlist; the pool price (quote per base) at every build within `slippagePct` of the first fresh read, and of the confirmed box when someone else's unconfirmed box is used; what the wallet receives at least that read's less `slippagePct`; the check of the built transaction against its plan; the rebuild on a spent pool box; `submitMode`.
+**Which box is the pool.** A box is used for liquidity or a position only if it sits at a configured pool tree, its NFT was issued once, and it holds more than half of its LP token's emission. Only one box can hold more than half, and a real pool is created holding nearly all of it. Without this, a look-alike box holding one unit of a real pool's LP token could receive a wallet's whole LP position on a `remove`; the pool contract does not prevent that.
 
-The answer to `add` or `remove` is PENDING with the transaction id. The shared response has no place for the amounts a pending transaction fixes, so they are in the log line `ergodex: submitted deposit|redeem as <id>, PENDING; if it confirms: ...` and, with `submitMode: check`, in the 409's message. `quote-liquidity` has no field for the LP tokens a deposit pays; they are logged. Positions report confirmed balances only. The shared `add` and `remove` routes record the pool in the pool list after a submit, as they do for other connectors.
+**Entering and leaving.** `add` and `quote-liquidity` apply every pool guard and allowlist. `remove`, `position-info` and `positions-owned` do not: they keep only the checks above, so a provider can leave a pool that later falls under a reserve or fee guard or off an allowlist. A warning is logged when a guard is passed over this way. A `remove` the pool cannot pay in full (the sole provider of an ERG/token pool asking for 100%: the contract keeps a storage minimum) is a 400 that names the largest amount that can be removed.
+
+Before signing, as for a swap: the fresh pool box and the mempool-successor rule; the guards and allowlist (on entry); the pool price (quote per base) at every build within `slippagePct` of the first fresh read, and of the confirmed box when someone else's unconfirmed box is used; what the wallet receives at least that read's less `slippagePct`; the check of the built transaction against its plan; the rebuild on a spent pool box; `submitMode`.
+
+The answer to `add` or `remove` is PENDING with the transaction id. The shared response has no place for the amounts a pending transaction fixes, so they are in the log line `ergodex: submitted deposit|redeem as <id>, PENDING; if it confirms: ...` and, with `submitMode: check`, in the 409's message. `quote-liquidity` has no field for the LP tokens a deposit pays; they are logged. Positions report confirmed balances only; when several boxes hold the same LP token, the real pool is the one used. Liquidity does not write Gateway's pool list for `ergodex`.
 
 ## 5. Differences from upstream that affect everyone
 
@@ -270,7 +274,7 @@ The answer to `add` or `remove` is PENDING with the transaction id. The shared r
 
 4. **`openapi.json`** is regenerated to match these changes.
 
-Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `b9502f24`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
+Nothing else was found that changes behaviour for Solana or Ethereum. This was checked by reading the diff of every shared source file in section 6 against `72d3938b`, and upstream's own Solana and Ethereum tests are part of the suite that passes at `ed545171`. Each other change is either a new `ergo` or `ergodex` case beside the existing `ethereum` and `solana` ones, or sits behind a test for chain `ergo` or connector `ergodex`. Examples: the pool is chosen by the connector only when the connector defines `resolvePool` (only `ergodex` does), and a request's connector is defaulted from the network's `swapProvider` only on chain `ergo`.
 
 ## 6. Shared upstream files this fork touches
 
@@ -296,7 +300,7 @@ Everything outside `src/chains/ergo`, `src/connectors/ergodex`, `test/chains/erg
 | `src/trading/connector-registry.ts` | Registers `ergodex` in the AMM registry; adds an optional `resolvePool` hook; passes `minAmountOut` and `maxAmountIn` through. |
 | `src/trading/pool-swap-routes.ts` | Adds the two optional limit fields; on chain `ergo`, a request that names no connector uses the network default; lets a connector choose the pool itself. |
 | `src/trading/trading-amm-routes/pool-info.ts` | Routes `ergodex` to its pool info. |
-| `src/trading/trading-amm-routes/add.ts`, `position-info.ts`, `positions-owned.ts`, `quote-liquidity.ts`, `remove.ts` | Each gets an `ergodex` case that calls the connector's liquidity or position function. |
+| `src/trading/trading-amm-routes/add.ts`, `position-info.ts`, `positions-owned.ts`, `quote-liquidity.ts`, `remove.ts` | Each gets an `ergodex` case that calls the connector's liquidity or position function. `add.ts` and `remove.ts` skip the pool-list write for `ergodex`, as the swap route does. |
 | `src/trading/trading-amm-routes/create-pool.ts` | Gets an `ergodex` case that answers 501 "not supported yet". |
 | `src/wallet/routes/removeWallet.ts`, `src/wallet/routes/setDefault.ts` | Validate an Ergo address for chain `ergo`. |
 | `src/wallet/schemas.ts` | Adds `ergo` to the chain enums of the wallet requests. |
@@ -340,7 +344,7 @@ The fork is additive. Ergo code lives in its own folders. The edits to shared fi
    `pnpm test` runs `GATEWAY_TEST_MODE=dev jest --verbose`. `pnpm lint` runs eslint with `--fix`, so it can edit files; review its changes.
 
    Tests need Node 22 or newer: `package.json` has `"engines": { "node": ">=22.0.0" }`. Upstream's CI workflow currently sets up Node 20, which is below that range. `package.json` has no pnpm entry under `engines`; it lists `"pnpm": "^10.10.0"` among its dependencies, and CI installs pnpm 10. Use pnpm 10.10 or newer.
-7. **Compare with the last known counts.** At `b9502f24`: 209 suites pass and 1 is skipped; 2,258 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
+7. **Compare with the last known counts.** At `ed545171`: 213 suites pass and 1 is skipped; 2,382 tests pass and 4 are skipped. A different number after a merge is expected if upstream added tests. A failure in `test/chains/ergo` or `test/connectors/ergodex` is not.
 8. **Commit the merge** and push the branch to the fork.
 
 ## 8. Known limits and open items
