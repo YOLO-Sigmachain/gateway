@@ -587,6 +587,101 @@ describe('ergodex through /trading/amm', () => {
     expect(q.routePath).toContain('spectrum:n2t');
   });
 
+  describe('a named pool must hold the requested pair', () => {
+    const quoteOn = (q: Record<string, string>) =>
+      app.inject({
+        method: 'GET',
+        url:
+          '/trading/amm/quote-swap?' +
+          new URLSearchParams({
+            chainNetwork: 'ergo-mainnet',
+            connector: 'ergodex',
+            amount: '1',
+            side: 'SELL',
+            poolAddress: NFT,
+            ...q,
+          }),
+      });
+
+    it('quote: ERG/SigUSD asked of the ERG/RSN pool is a 400 naming both pairs, not a quote in RSN', async () => {
+      const res = await quoteOn({ baseToken: 'ERG', quoteToken: 'SigUSD' });
+      expect(res.statusCode).toBe(400);
+      const message = JSON.parse(res.body).message;
+      expect(message).toContain(`Pool ${NFT} holds ERG/RSN (${RSN.slice(0, 8)}…), not ERG/SigUSD (03faf2cb…)`);
+    });
+
+    it('execute: the same request is a 400 before the key is loaded; nothing signed or posted', async () => {
+      const send = jest.spyOn(dex.ergo, 'sendTransaction');
+      const res = await app.inject({
+        method: 'POST',
+        url: '/trading/amm/execute-swap',
+        payload: execBody({ quoteToken: 'SigUSD' }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).message).toContain('holds ERG/RSN');
+      expect(dex.ergo.getWallet).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(posts()).toBe(0);
+    });
+
+    it('a base the pool does not hold, or the same token twice, is refused the same way', async () => {
+      for (const [baseToken, quoteToken] of [
+        ['SigUSD', 'ERG'],
+        ['SigUSD', 'RSN'],
+        ['ERG', 'ERG'],
+        ['RSN', RSN],
+      ]) {
+        const quote = await quoteOn({ baseToken, quoteToken });
+        expect(quote.statusCode).toBe(400);
+        expect(JSON.parse(quote.body).message).toContain(`Pool ${NFT} holds ERG/RSN`);
+        const exec = await app.inject({
+          method: 'POST',
+          url: '/trading/amm/execute-swap',
+          payload: execBody({ baseToken, quoteToken }),
+        });
+        expect(exec.statusCode).toBe(400);
+        expect(JSON.parse(exec.body).message).toContain(`Pool ${NFT} holds ERG/RSN`);
+      }
+      expect(dex.ergo.getWallet).not.toHaveBeenCalled();
+      expect(posts()).toBe(0);
+    });
+
+    it('the right pair in either order, by symbol or id, quotes as before', async () => {
+      const erg = await quoteOn({ baseToken: 'ERG', quoteToken: 'RSN' });
+      expect(erg.statusCode).toBe(200);
+      expect(JSON.parse(erg.body)).toMatchObject({ tokenIn: NATIVE_TOKEN_ID, tokenOut: RSN, amountOut: '23.693' });
+      const byId = await quoteOn({ baseToken: NATIVE_TOKEN_ID, quoteToken: RSN });
+      expect(JSON.parse(byId.body)).toEqual(JSON.parse(erg.body));
+      const rsn = await quoteOn({ baseToken: 'RSN', quoteToken: 'ERG', side: 'BUY' });
+      expect(rsn.statusCode).toBe(200);
+      expect(JSON.parse(rsn.body)).toMatchObject({ tokenIn: NATIVE_TOKEN_ID, tokenOut: RSN, amountOut: '1' });
+    });
+
+    it('the right pair in the other order executes as before', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/trading/amm/execute-swap',
+        payload: execBody({ baseToken: 'RSN', quoteToken: NATIVE_TOKEN_ID, side: 'BUY', amount: 1 }),
+      });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).pendingData).toMatchObject({
+        tokenIn: NATIVE_TOKEN_ID,
+        tokenOut: RSN,
+        amountOut: '1',
+      });
+      expect(posts()).toBe(1);
+    });
+
+    it('no pool named: the pool is chosen for the pair and the swap executes, unchanged', async () => {
+      state.byTree.set(N2T_TREE, [RSN_POOL]);
+      const { poolAddress: _omitted, ...body } = execBody();
+      const res = await app.inject({ method: 'POST', url: '/trading/amm/execute-swap', payload: body });
+      expect(res.statusCode).toBe(200);
+      expect(posts()).toBe(1);
+      expect(JSON.parse(state.posted[0]).inputs[0].boxId).toBe(RSN_POOL.boxId);
+    });
+  });
+
   it('pool-info answers for ergodex', async () => {
     const url = `/trading/amm/pool-info?connector=ergodex&chainNetwork=ergo-mainnet&poolAddress=${NFT}`;
     const res = await app.inject({ method: 'GET', url });

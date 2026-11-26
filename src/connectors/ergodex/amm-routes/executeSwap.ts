@@ -182,6 +182,7 @@ export async function executeSwap(
   slippagePct?: number,
   minAmountOut?: number,
   maxAmountIn?: number,
+  quoteToken?: string,
 ): Promise<ChainExecuteSwapResponseType> {
   let wallet: ErgoWalletAccount | undefined;
   try {
@@ -197,18 +198,18 @@ export async function executeSwap(
     ergo.assertSubmitModeSet();
     const appliedSlippagePct = slippagePct ?? dex.root.slippagePct;
     const slip = pctToScaled(appliedSlippagePct);
-    wallet = await ergo.getWallet(walletAddress);
-    const signer = wallet.signer;
-    const changeAddress = wallet.address;
     const base = await dex.resolveToken(baseToken);
+    // given (the trading route always sends it): the pool must hold exactly this pair,
+    // checked on the first read below, before the wallet's key is loaded
+    const quote = quoteToken === undefined ? undefined : await dex.resolveToken(quoteToken);
     const raw = toRaw(amount, base);
 
-    let plan = await dex.freshPlan(poolAddress, base, side, raw);
+    let plan = await dex.freshPlan(poolAddress, base, side, raw, { quote });
     // The plans the slippage applies to: the first fresh quote, and the confirmed pool box
     // when that quote is on an unconfirmed box that none of our own transactions created.
     const priced = [plan];
     if (plan.source === 'mempool' && !ergo.pending.get(plan.pool.box.transactionId)) {
-      priced.push(await dex.freshPlan(poolAddress, base, side, raw, { confirmedOnly: true }));
+      priced.push(await dex.freshPlan(poolAddress, base, side, raw, { confirmedOnly: true, quote }));
     }
     const bound: SwapBound = {};
     if (side === 'SELL') {
@@ -225,8 +226,12 @@ export async function executeSwap(
         ? `at least ${units(bound.minOut!, plan.tokenOut.decimals)} ${symbolForMessage(plan.tokenOut.symbol, plan.tokenOut.tokenId)} out`
         : `at most ${units(bound.maxIn!, plan.tokenIn.decimals)} ${symbolForMessage(plan.tokenIn.symbol, plan.tokenIn.tokenId)} in`;
 
+    wallet = await ergo.getWallet(walletAddress);
+    const signer = wallet.signer;
+    const changeAddress = wallet.address;
+
     for (let attempt = 0; ; attempt++) {
-      if (attempt > 0) plan = await dex.freshPlan(poolAddress, base, side, raw);
+      if (attempt > 0) plan = await dex.freshPlan(poolAddress, base, side, raw, { quote });
       if (!meetsBound(plan, bound)) {
         throw httpErrors.createError(
           409,

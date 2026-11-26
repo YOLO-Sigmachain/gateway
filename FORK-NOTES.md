@@ -230,6 +230,8 @@ A check validates against the node's current boxes and mempool. It does not prov
 
 Route: `POST /trading/amm/execute-swap`, with `chainNetwork` `ergo-mainnet`. A request that names no connector on chain `ergo` uses the network's `swapProvider`. A request with no `poolAddress` lets `ergodex` choose; a pool NFT id pins one pool.
 
+**A pinned pool must hold the pair asked for.** With `poolAddress`, quote and execute resolve `baseToken` and `quoteToken` (symbol or token id; the native coin by its symbol or the all-zero id) and refuse with a 400 `Pool <id> holds <A>/<B>, not <base>/<quote>` unless the pool holds exactly those two tokens, in either order. Execute checks this before the wallet's key is loaded. `quoteToken` has the schema default `USDC`, so a request that pins a pool must send it.
+
 **One transaction, no price limit on chain.** The swap spends the pool box as input 0 and creates its successor as output 0. What the trader receives goes to change at the wallet's own address. The amounts are fixed in the transaction, so the chain enforces no price band. The limits are enforced by Gateway before signing:
 
 - `minAmountOut` (SELL, exact input) or `maxAmountIn` (BUY, exact output), if you send one. Sending `minAmountOut` on a BUY, or `maxAmountIn` on a SELL, is a 400.
@@ -317,8 +319,8 @@ Everything outside `src/chains/ergo`, `src/connectors/ergodex`, `test/chains/erg
 | `src/pools/pool-info-helpers.ts` | Reads Ergo AMM pool info through the shared pool-info route; resolves Ergo token symbols (all-zero id is the native coin). |
 | `src/schemas/chain-schema.ts` | Adds Ergo's networks to the accepted network names; adds optional `pendingData` to the execute-swap response. |
 | `src/trading/common.ts` | On chain `ergo`, the default connector comes from the network's `swapProvider`; text of the `poolAddress` description. |
-| `src/trading/connector-registry.ts` | Registers `ergodex` in the AMM registry; adds an optional `resolvePool` hook; passes `minAmountOut` and `maxAmountIn` through. |
-| `src/trading/pool-swap-routes.ts` | Adds the two optional limit fields; on chain `ergo`, a request that names no connector uses the network default; lets a connector choose the pool itself. |
+| `src/trading/connector-registry.ts` | Registers `ergodex` in the AMM registry; adds an optional `resolvePool` hook; passes `minAmountOut` and `maxAmountIn` through; adds an optional `quoteToken` to the pool swap arguments, passed to `ergodex` only. |
+| `src/trading/pool-swap-routes.ts` | Adds the two optional limit fields; on chain `ergo`, a request that names no connector uses the network default; lets a connector choose the pool itself; passes the request's `quoteToken` to the connector's quote and execute (only `ergodex` reads it). |
 | `src/trading/trading-amm-routes/pool-info.ts` | Routes `ergodex` to its pool info. |
 | `src/trading/trading-amm-routes/add.ts`, `position-info.ts`, `positions-owned.ts`, `quote-liquidity.ts`, `remove.ts` | Each gets an `ergodex` case that calls the connector's liquidity or position function. `add.ts` and `remove.ts` skip the pool-list write for `ergodex`, as the swap route does. `remove.ts` also takes the optional `lpTokenAmount`, makes `percentageToRemove` optional without a default (the route keeps 100% when neither is sent, except for `ergodex`), refuses both, and refuses `lpTokenAmount` for any connector but `ergodex` (section 5). |
 | `src/schemas/amm-schema.ts` | Adds optional `pendingData` to the AMM add and remove responses. |

@@ -96,6 +96,8 @@ export interface PoolQuoteArgs {
   network: string;
   poolAddress: string;
   baseToken: string;
+  /** The request's quote token. Only ergodex reads it: the pool must hold exactly this pair. */
+  quoteToken?: string;
   side: 'BUY' | 'SELL';
   amount: number;
   slippagePct?: number;
@@ -395,7 +397,8 @@ const AMM_REGISTRY: Record<string, PoolOps> = {
   },
   ergodex: {
     chain: 'ergo',
-    quoteSwap: (a) => ergodexQuoteSwap(a.network, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct),
+    quoteSwap: (a) =>
+      ergodexQuoteSwap(a.network, a.poolAddress, a.baseToken, a.side, a.amount, a.slippagePct, a.quoteToken),
     executeSwap: (a) =>
       ergodexExecuteSwap(
         a.network,
@@ -407,6 +410,7 @@ const AMM_REGISTRY: Record<string, PoolOps> = {
         a.slippagePct,
         a.minAmountOut,
         a.maxAmountIn,
+        a.quoteToken,
       ),
     resolvePool: ergodexResolvePool,
   },

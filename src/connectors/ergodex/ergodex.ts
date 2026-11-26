@@ -18,7 +18,14 @@ import { Ergo } from '../../chains/ergo/ergo';
 import { ErgoNodeError, normalizeNodeBox } from '../../chains/ergo/ergo.node-client';
 import { ErgoOutputSpec } from '../../chains/ergo/ergo.tx-builder';
 import { ErgoBox } from '../../chains/ergo/ergo.types';
-import { formatUnits, isErgoId, NATIVE_COIN_ID, parseUnits, symbolForMessage } from '../../chains/ergo/ergo.utils';
+import {
+  formatUnits,
+  isErgoId,
+  NATIVE_COIN_ID,
+  parseUnits,
+  symbolForMessage,
+  tokenForMessage,
+} from '../../chains/ergo/ergo.utils';
 import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
@@ -808,15 +815,43 @@ export class Ergodex {
     );
   }
 
-  /** Read the pool fresh, apply the guards, and price the swap. */
+  /**
+   * A 400 unless the pool holds exactly `base` and `quote` (two different tokens), in
+   * either order. For a pool the caller named: without it, a request for one pair on a
+   * pool of another would trade the pool's other token instead of `quote`.
+   */
+  async assertPoolPair(pool: VenuePool, base: TokenRef, quote: TokenRef): Promise<void> {
+    if (this.holdsPair(pool, base, quote)) return;
+    const side = async (tokenId: string | null): Promise<string> => {
+      let token: TokenRef = { tokenId, symbol: '', decimals: 0 };
+      try {
+        token = await this.tokenOfSide(tokenId);
+      } catch {
+        // the id alone names it
+      }
+      return tokenForMessage(token.symbol, token.tokenId);
+    };
+    throw httpErrors.badRequest(
+      `Pool ${pool.poolId} holds ${await side(pool.x.tokenId)}/${await side(pool.y.tokenId)}, not ` +
+        `${tokenForMessage(base.symbol, base.tokenId)}/${tokenForMessage(quote.symbol, quote.tokenId)}`,
+    );
+  }
+
+  /**
+   * Read the pool fresh, apply the guards, and price the swap. With `quote` (the caller's
+   * quote token), the pool must hold exactly base and quote; without it, the quote is the
+   * pool's other token.
+   */
   async freshPlan(
     poolId: string,
     base: TokenRef,
     side: 'BUY' | 'SELL',
     amount: bigint,
-    options: { confirmedOnly?: boolean } = {},
+    options: { confirmedOnly?: boolean; quote?: TokenRef } = {},
   ): Promise<SwapPlan> {
-    const fresh = await this.getFreshPool(poolId, options);
+    const { quote: wanted, ...read } = options;
+    const fresh = await this.getFreshPool(poolId, read);
+    if (wanted) await this.assertPoolPair(fresh.pool, base, wanted);
     this.assertAllowed(fresh.pool);
     const quote = await this.counterToken(fresh.pool, base);
     return this.plan(fresh, base, quote, side, amount);

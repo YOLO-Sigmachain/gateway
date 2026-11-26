@@ -44,12 +44,15 @@ export async function quoteSwap(
   side: 'BUY' | 'SELL',
   amount: number,
   slippagePct?: number,
+  quoteToken?: string,
 ): Promise<ChainQuoteSwapResponseType> {
   try {
     const dex = await Ergodex.getInstance(network);
     const slip = slippagePct ?? dex.root.slippagePct;
     const base = await dex.resolveToken(baseToken);
-    const plan = await dex.freshPlan(poolAddress, base, side, toRaw(amount, base));
+    // given (the trading route always sends it): the pool must hold exactly this pair
+    const quote = quoteToken === undefined ? undefined : await dex.resolveToken(quoteToken);
+    const plan = await dex.freshPlan(poolAddress, base, side, toRaw(amount, base), { quote });
     return quoteResponse(plan, slip);
   } catch (error) {
     throw ergodexError(error, 'Failed to quote ergodex swap');
