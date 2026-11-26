@@ -37,6 +37,22 @@ export interface ErgoNetworkConfig {
    * Gateway folder (or absolute). Unset: they are kept in memory only.
    */
   pendingStateFile?: string;
+  /**
+   * What happens to a signed transaction. `send`: it is submitted to the node, which relays
+   * it. `check`: it is only checked by the node's /transactions/check endpoint, and nothing
+   * is sent or tracked. Unset: `send`.
+   */
+  submitMode?: ErgoSubmitMode;
+}
+
+export const SUBMIT_MODES = ['send', 'check'] as const;
+export type ErgoSubmitMode = (typeof SUBMIT_MODES)[number];
+
+/** The submit mode a config value names; unset is `send`, anything else is refused. */
+export function parseSubmitMode(value: unknown, key: string): ErgoSubmitMode {
+  if (value === undefined || value === null || value === '') return 'send';
+  if (typeof value === 'string' && (SUBMIT_MODES as readonly string[]).includes(value)) return value as ErgoSubmitMode;
+  throw new Error(`${key} must be one of ${SUBMIT_MODES.join(', ')}; got ${String(value)}`);
 }
 
 export interface ErgoChainConfig {
@@ -102,6 +118,7 @@ export function getErgoNetworkConfig(network: string): ErgoNetworkConfig {
     boxPageSize: Number(optional<number>(namespaceId, 'boxPageSize') ?? DEFAULT_BOX_PAGE_SIZE),
     swapProvider: optional<string>(namespaceId, 'swapProvider'),
     pendingStateFile: optional<string>(namespaceId, 'pendingStateFile'),
+    submitMode: parseSubmitMode(optional(namespaceId, 'submitMode'), `${namespaceId}.submitMode`),
   };
 }
 

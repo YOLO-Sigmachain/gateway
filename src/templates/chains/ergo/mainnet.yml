@@ -59,6 +59,13 @@ failedAfterConfirmations: 3
 nodeTimeoutMs: 10000
 boxPageSize: 100
 
+# What happens to a signed transaction. send: it is submitted to the node, which relays it
+# to the network. check: the node only checks it (it must be valid against the node's
+# current boxes, scripts included) and nothing is sent; a swap or transfer then answers an
+# error that names the transaction id and says nothing was sent, and nothing is tracked.
+# Use check for a dry run with a real wallet before sending anything. Unset: send.
+submitMode: send
+
 # Default connector for the unified trading routes when a request names none
 # (format: connector/type)
 swapProvider: ergodex/amm

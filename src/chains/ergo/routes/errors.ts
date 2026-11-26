@@ -1,5 +1,12 @@
 import { httpErrors } from '../../../services/error-handler';
-import { AmbiguousTokenError, ErgoInputSpentError, ErgoNotSubmittedError, ErgoTransactionRejectedError } from '../ergo';
+import {
+  AmbiguousTokenError,
+  ErgoCheckIncompleteError,
+  ErgoCheckOnlyError,
+  ErgoInputSpentError,
+  ErgoNotSubmittedError,
+  ErgoTransactionRejectedError,
+} from '../ergo';
 import { ErgoNodeError } from '../ergo.node-client';
 import { ErgoBuildError } from '../ergo.tx-builder';
 
@@ -10,10 +17,22 @@ import { ErgoBuildError } from '../ergo.tx-builder';
  * is a 400: it was not taken, so nothing from that submit can confirm. A submit that never
  * reached the node (the connection was refused) is a 503 that says nothing was submitted.
  * An unknown submit outcome is never one of these.
+ *
+ * With submitMode `check`: a transaction the node's check found valid is a 409 (the
+ * request was understood and deliberately not carried out), with the id and the words
+ * "nothing was sent"; one the check refused is a 400, like a refusal at submit; a check
+ * that gave no verdict is a 503 that says nothing was sent. None of them is a pending
+ * transaction, and none carries a code a client would poll on.
  */
 export function toHttpError(error: unknown, action: string): Error {
   if (error && typeof error === 'object' && 'statusCode' in error) {
     return error as unknown as Error;
+  }
+  if (error instanceof ErgoCheckOnlyError) {
+    return httpErrors.createError(409, error.message);
+  }
+  if (error instanceof ErgoCheckIncompleteError) {
+    return httpErrors.serviceUnavailable(`${action}: ${error.message}`);
   }
   // a contract box someone spent first: retry after reading its successor
   if (error instanceof ErgoInputSpentError) {
@@ -23,6 +42,7 @@ export function toHttpError(error: unknown, action: string): Error {
   if (error instanceof AmbiguousTokenError || error instanceof ErgoBuildError) {
     return httpErrors.badRequest(error.message);
   }
+  // includes a refusal by the node's check (ErgoCheckRejectedError), whose text says so
   if (error instanceof ErgoTransactionRejectedError) {
     return httpErrors.badRequest(`${action}: ${error.message}`);
   }

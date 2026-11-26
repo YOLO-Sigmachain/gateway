@@ -19,6 +19,7 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 
 import { Ergo } from '../../../src/chains/ergo/ergo';
+import { ErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
 import { FetchLike } from '../../../src/chains/ergo/ergo.node-client';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
 import { ErgoBox, ErgoTokenInfo, NodeHeaderJson } from '../../../src/chains/ergo/ergo.types';
@@ -140,8 +141,9 @@ export function putPools(state: NodeState, pairs: Array<[ErgoBox, ErgoBox | Ergo
 export function makeLithosDex(
   state: NodeState,
   config: ErgodexNetworkConfig = lithosDexConfig([LIT_NFT, LIT_RSN_NFT]),
+  chainConfig: ErgoNetworkConfig = testConfig(),
 ): Ergodex {
-  const ergo = new Ergo('mainnet', { config: testConfig(), fetch: lithosNode(state) });
+  const ergo = new Ergo('mainnet', { config: chainConfig, fetch: lithosNode(state) });
   jest.spyOn(ergo, 'getTokenList').mockResolvedValue(L_TOKENS);
   // a fresh signer per load, as the chain layer gives one per request and wipes it after
   jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({

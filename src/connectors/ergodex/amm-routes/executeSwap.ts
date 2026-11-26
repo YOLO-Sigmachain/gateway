@@ -23,8 +23,14 @@
  * amounts its transaction fixes (what it moves if it confirms), in the fields of a
  * confirmed swap's `data`. It carries no `data`: that means confirmed. Whether it
  * confirmed is reported only by poll. No order box is ever placed, before or after.
+ *
+ * With the network's submitMode `check`, everything up to and including signing runs as
+ * above, and the signed transaction then goes to the node's check endpoint only. The answer
+ * is never PENDING: a 409 that says the node found transaction <id> valid, that nothing was
+ * sent, and what it would move; a 400 with the node's text when the check refuses it; a 503
+ * when the check gives no verdict.
  */
-import { ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
+import { ErgoCheckOnlyError, ErgoInputSpentError, ErgoSubmitOutcomeUnknownError } from '../../../chains/ergo/ergo';
 import { BuiltErgoTransaction, changeDelta, ErgoTransactionAssertionError } from '../../../chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate } from '../../../chains/ergo/ergo.types';
 import { ErgoWalletAccount } from '../../../chains/ergo/ergo.wallet';
@@ -135,6 +141,19 @@ export function fixedSwapData(
   };
 }
 
+/** What a checked (not sent) swap would move, in words, from the same amounts as `pendingData`. */
+export function describeCheckedSwap(
+  plan: SwapPlan,
+  data: NonNullable<ChainExecuteSwapResponseType['data']>,
+  nativeSymbol: string,
+): string {
+  return (
+    `${data.amountIn} ${plan.tokenIn.symbol} in and ${data.amountOut} ${plan.tokenOut.symbol} out on ` +
+    `${describeRoute(plan)}, miner fee ${data.fee} ${nativeSymbol}; the wallet would change by ` +
+    `${data.baseTokenBalanceChange} ${plan.base.symbol} and ${data.quoteTokenBalanceChange} ${plan.quote.symbol}`
+  );
+}
+
 interface SwapBound {
   minOut?: bigint;
   maxIn?: bigint;
@@ -207,10 +226,10 @@ export async function executeSwap(
             `outside the bound (${boundText}). Nothing that can still execute was submitted; retry with a fresh quote.`,
         );
       }
+      const current = plan;
+      // worked out before signing, so nothing after the submit can fail
+      let pendingData: ReturnType<typeof fixedSwapData> | undefined;
       try {
-        const current = plan;
-        // worked out before signing, so nothing after the submit can fail
-        let pendingData: ReturnType<typeof fixedSwapData> | undefined;
         const { txId } = await ergo.sendTransaction(
           {
             changeAddress,
@@ -228,6 +247,12 @@ export async function executeSwap(
         logger.info(`ergodex: submitted ${side} on ${describeRoute(current)} as ${txId}`);
         return { signature: txId, status: TransactionStatusCode.PENDING, pendingData };
       } catch (error) {
+        if (error instanceof ErgoCheckOnlyError) {
+          // check mode: never PENDING, never a signature; the amounts come from pendingData
+          throw pendingData
+            ? error.withMoves(describeCheckedSwap(current, pendingData, ergo.nativeTokenSymbol))
+            : error;
+        }
         if (error instanceof ErgoSubmitOutcomeUnknownError) {
           // Never rebuild here: the first transaction may still execute.
           throw httpErrors.transactionTimeout(

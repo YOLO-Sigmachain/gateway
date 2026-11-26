@@ -59,6 +59,11 @@
     },
     "nodeTimeoutMs": { "type": "integer", "minimum": 1 },
     "boxPageSize": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "submitMode": {
+      "type": "string",
+      "enum": ["send", "check"],
+      "description": "send: signed transactions are submitted to the node, which relays them. check: they are only checked by the node's /transactions/check endpoint and never sent; a swap or transfer then answers an error that names the transaction id and says nothing was sent. Unset: send"
+    },
     "swapProvider": {
       "type": "string",
       "description": "Default swap provider for the unified trading routes (format: connector/type), e.g. ergodex/amm"

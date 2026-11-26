@@ -15,7 +15,14 @@ import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 import { WalletTokenBalance } from '../wallet-balances';
 
-import { configuredAddressPrefixes, ErgoNetworkConfig, getErgoNetworkConfig, networks } from './ergo.config';
+import {
+  configuredAddressPrefixes,
+  ErgoNetworkConfig,
+  ErgoSubmitMode,
+  getErgoNetworkConfig,
+  networks,
+  parseSubmitMode,
+} from './ergo.config';
 import { bigintsToStrings, parseNodeJson, toAmount } from './ergo.json';
 import { ErgoNodeClient, ErgoNodeError, FetchLike, normalizeNodeBox, NodeTransaction } from './ergo.node-client';
 import { ErgoPendingTracker, PendingTransaction } from './ergo.pending';
@@ -35,6 +42,7 @@ import {
   assertErgoId,
   decodeErgoAddress,
   decodeErgoAddressForPrefix,
+  formatUnits,
   isErgoId,
   NATIVE_COIN_ID,
   toDecimalNumber,
@@ -169,6 +177,63 @@ export class ErgoTransactionRejectedError extends ErgoNodeError {
   }
 }
 
+/**
+ * submitMode is `check`: the node's check endpoint found the signed transaction valid, and
+ * nothing was sent. It is not a submitted transaction: nothing is tracked, and nothing can
+ * confirm from it. `moves`, when set, says what the transaction would move if it were sent.
+ */
+export class ErgoCheckOnlyError extends Error {
+  readonly txId: string;
+  readonly moves?: string;
+
+  constructor(txId: string, moves?: string) {
+    super(
+      `Check only: the node accepted transaction ${txId} as valid; nothing was sent` +
+        (moves ? `. If it were sent, it would move ${moves}` : ''),
+    );
+    this.name = 'ErgoCheckOnlyError';
+    this.txId = txId;
+    this.moves = moves;
+  }
+
+  /** The same answer, saying what the transaction would move. */
+  withMoves(moves: string): ErgoCheckOnlyError {
+    return new ErgoCheckOnlyError(this.txId, moves);
+  }
+}
+
+/**
+ * submitMode is `check` and the node's check refused the signed transaction (it answered
+ * 400). Nothing was sent. Answered like a refusal at a first submit, with the node's text.
+ */
+export class ErgoCheckRejectedError extends ErgoTransactionRejectedError {
+  constructor(cause: ErgoNodeError) {
+    super(cause);
+    this.name = 'ErgoCheckRejectedError';
+    this.message = `Check only, nothing was sent: ${cause.message}`;
+  }
+}
+
+/**
+ * submitMode is `check` and the node's check gave no verdict: the connection failed, it
+ * timed out, the node answered something other than 400 or an id, or an id other than the
+ * transaction's. Nothing was submitted, so this is not an unknown submit outcome and there
+ * is nothing to poll.
+ */
+export class ErgoCheckIncompleteError extends Error {
+  readonly txId: string;
+
+  constructor(txId: string, cause: unknown) {
+    const causeText = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `Check only: the check of transaction ${txId} could not be completed (${causeText}); nothing was sent. ` +
+        'Retry once the node answers',
+    );
+    this.name = 'ErgoCheckIncompleteError';
+    this.txId = txId;
+  }
+}
+
 /** Node rejection text that means an input is not (or no longer) in the UTXO set. */
 const INPUT_GONE_TEXT = /double.?spend|utxo|missing input|input.{0,40}(not found|spent)|already spent/i;
 
@@ -185,6 +250,8 @@ export class Ergo {
   readonly config: ErgoNetworkConfig;
   readonly node: ErgoNodeClient;
   readonly pending: ErgoPendingTracker;
+  /** `send`: signed transactions are submitted. `check`: only checked by the node; nothing is sent. */
+  readonly submitMode: ErgoSubmitMode;
   private readonly tokenInfoCache = new Map<string, ErgoTokenInfo>();
   /** A token's total emission never changes once it is minted. */
   private readonly tokenEmissionCache = new Map<string, bigint>();
@@ -194,6 +261,13 @@ export class Ergo {
   constructor(network: string, options: { config?: ErgoNetworkConfig; fetch?: FetchLike; now?: () => number } = {}) {
     this.network = network;
     this.config = options.config ?? getErgoNetworkConfig(network);
+    this.submitMode = parseSubmitMode(this.config.submitMode, `ergo-${network}.submitMode`);
+    if (this.submitMode === 'check') {
+      logger.warn(
+        `ergo-${network}.submitMode is check: signed transactions are only checked by the node, never sent; ` +
+          'no swap or transfer from this network is carried out',
+      );
+    }
     this.node = new ErgoNodeClient(this.config.nodeURL, {
       timeoutMs: this.config.nodeTimeoutMs,
       pageSize: this.config.boxPageSize,
@@ -530,6 +604,9 @@ export class Ergo {
    * that write fails, the entry stays tracked (a restart would read it back and post it
    * again) and the answer is ErgoSubmitOutcomeUnknownError, so the caller polls.
    *
+   * With submitMode `check`, nothing is recorded or submitted: the transaction is posted to
+   * the node's check endpoint only, and the answer is always an error (see checkSigned).
+   *
    * A transaction with fixed inputs (a contract box such as a pool) must go through
    * sendTransaction, which holds a lock on each fixed input as well as on the wallet, so
    * two wallets cannot race each other for the same box inside this process.
@@ -557,10 +634,13 @@ export class Ergo {
     const outputs = posted.outputs.map((o, index) =>
       normalizeNodeBox({ ...o, transactionId: posted.id, index } as Record<string, unknown>),
     );
+    // check mode: checked by the node and never recorded, so the signed transaction is kept
+    // nowhere and no later post can send it
+    if (this.submitMode === 'check') return this.checkSigned(signed);
     this.pending.record(signed.id, inputBoxIds, outputs, signed.json, fixedInputs);
     let txId: string;
     try {
-      txId = await this.node.submitTransaction(signed.json);
+      txId = await this.postToSubmit(signed.json);
     } catch (error) {
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
         this.releaseBeforeDefiniteAnswer(signed.id, error);
@@ -592,6 +672,49 @@ export class Ergo {
     }
     logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
     return txId;
+  }
+
+  /**
+   * check mode: post the signed transaction to the node's check endpoint, never to its
+   * submit endpoint. Always throws: ErgoCheckOnlyError when the node found it valid,
+   * ErgoCheckRejectedError when the node answered 400 (its verdict that the transaction is
+   * invalid), ErgoCheckIncompleteError for anything else (no connection, a timeout, a 5xx,
+   * another status, no id, another id). Nothing is recorded in any case.
+   */
+  private async checkSigned(signed: SignedErgoTransaction): Promise<never> {
+    let id: string;
+    try {
+      id = await this.node.checkTransaction(signed.json);
+    } catch (error) {
+      if (error instanceof ErgoNodeError && error.status === 400) {
+        logger.info(
+          `Ergo ${this.network}: check only: the node refused transaction ${signed.id}; nothing was sent: ` +
+            nodeText(error),
+        );
+        throw new ErgoCheckRejectedError(error);
+      }
+      const incomplete = new ErgoCheckIncompleteError(signed.id, error);
+      logger.info(`Ergo ${this.network}: ${incomplete.message}`);
+      throw incomplete;
+    }
+    if (id !== signed.id) {
+      const incomplete = new ErgoCheckIncompleteError(signed.id, `the node answered with id ${id}`);
+      logger.info(`Ergo ${this.network}: ${incomplete.message}`);
+      throw incomplete;
+    }
+    logger.info(`Ergo ${this.network}: check only: the node accepted transaction ${id} as valid; nothing was sent`);
+    throw new ErgoCheckOnlyError(id);
+  }
+
+  /**
+   * The one path to the node's submit endpoint. Never reached in check mode (every caller
+   * branches before it); refused here as well, so no path can send in that mode.
+   */
+  private async postToSubmit(json: string): Promise<string> {
+    if (this.submitMode !== 'send') {
+      throw new Error(`ergo-${this.network}.submitMode is ${this.submitMode}: nothing is sent to the node`);
+    }
+    return this.node.submitTransaction(json);
   }
 
   /**
@@ -724,7 +847,19 @@ export class Ergo {
       try {
         const built = await this.buildTransfer(fromAddress, toAddress, nanoErgs, tokens);
         const signed = await this.signTransaction(built, wallet.signer);
-        return await this.submitSigned(signed, built);
+        try {
+          return await this.submitSigned(signed, built);
+        } catch (error) {
+          if (error instanceof ErgoCheckOnlyError) {
+            const symbol = this.config.nativeCurrencySymbol;
+            const tokenText = tokens.map((t) => `, ${t.amount} of token ${t.tokenId} (in its smallest unit)`).join('');
+            throw error.withMoves(
+              `${formatUnits(nanoErgs, this.config.nativeDecimals)} ${symbol}${tokenText} to ${toAddress}, ` +
+                `miner fee ${formatUnits(built.fee, this.config.nativeDecimals)} ${symbol}`,
+            );
+          }
+          throw error;
+        }
       } finally {
         // the key is loaded for this one send; wipe it once the send has settled
         wallet.signer.dispose?.();
@@ -824,6 +959,19 @@ export class Ergo {
     // it nowhere: it was dropped. Post it once more rather than forget it, since releasing
     // would let a rebuild execute twice if the dropped one resurfaces.
     if (tracked && inputs!.allUnspent) {
+      if (this.submitMode === 'check') {
+        // a transaction sent before the mode was check: kept, its inputs hidden, not posted
+        return {
+          ...base,
+          txBlock: null,
+          txStatus: TransactionStatusCode.NOT_FOUND,
+          txData: {
+            note:
+              'the node holds it nowhere and its inputs are unspent; it is kept, and not posted again while ' +
+              'submitMode is check',
+          },
+        };
+      }
       const refusal = await this.postAgain(tracked);
       if (!refusal) {
         return {
@@ -843,7 +991,8 @@ export class Ergo {
     // is posted again here, so polling only this one still moves its parent.
     if (tracked && inputs!.waitingOn.length > 0 && inputs!.unknown.length === 0) {
       const parents = [...new Set(inputs!.waitingOn)];
-      for (const parent of parents) {
+      // in check mode no parent is posted again either
+      for (const parent of this.submitMode === 'check' ? [] : parents) {
         const parentTx = this.pending.get(parent);
         if (!parentTx) continue;
         try {
@@ -875,7 +1024,7 @@ export class Ergo {
    */
   private async postAgain(tx: PendingTransaction): Promise<ErgoNodeError | undefined> {
     try {
-      await this.node.submitTransaction(tx.json);
+      await this.postToSubmit(tx.json);
     } catch (error) {
       if (error instanceof ErgoNodeError && error.status >= 400 && error.status < 500) {
         this.pending.markRefused(tx.txId, true);
@@ -1065,6 +1214,13 @@ export class Ergo {
     // (posted by a poll at the same moment, or relayed back by a peer), and then it is not
     // marked refused.
     if (inputs.allUnspent) {
+      if (this.submitMode === 'check') {
+        logger.warn(
+          `Ergo ${this.network}: pending transaction ${id} is held nowhere by the node and its inputs are unspent; ` +
+            'it is kept, and not posted again while submitMode is check',
+        );
+        return;
+      }
       const refusal = await this.postAgain(tx);
       if (refusal) await this.refusedAnswer(tx, refusal);
     }

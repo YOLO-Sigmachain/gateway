@@ -10,6 +10,7 @@ import * as path from 'path';
 import { SInt } from '@fleet-sdk/core';
 
 import { Ergo } from '../../../src/chains/ergo/ergo';
+import { ErgoNetworkConfig } from '../../../src/chains/ergo/ergo.config';
 import { parseNodeJson } from '../../../src/chains/ergo/ergo.json';
 import { FetchLike, normalizeNodeBox } from '../../../src/chains/ergo/ergo.node-client';
 import { WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
@@ -151,6 +152,13 @@ export interface NodeState {
   /** 'throw': the connection breaks mid-request; 'refused': the connection is never made. */
   submit: (body: string) => { status?: number; body: unknown } | 'throw' | 'refused';
   posted: string[];
+  /**
+   * The node's check endpoint (POST /transactions/check): 'timeout' stands for a request
+   * aborted by its timeout.
+   */
+  check: (body: string) => { status?: number; body: unknown } | 'throw' | 'refused' | 'timeout';
+  /** Bodies posted to the check endpoint. */
+  checked: string[];
   calls: Array<{ method: string; path: string }>;
   /**
    * Total emission by token id, for `/blockchain/token/byId`. A pool NFT not listed here
@@ -169,6 +177,8 @@ export function newNodeState(): NodeState {
     boxes: new Map(),
     submit: (body) => ({ body: JSON.stringify(JSON.parse(body).id) }),
     posted: [],
+    check: (body) => ({ body: JSON.stringify(JSON.parse(body).id) }),
+    checked: [],
     calls: [],
     emission: new Map(),
   };
@@ -242,6 +252,19 @@ export function stateNode(state: NodeState): FetchLike {
       }
       return send(res);
     }
+    if (method === 'POST' && p === '/transactions/check') {
+      state.checked.push(body!);
+      const res = state.check(body!);
+      if (res === 'throw') throw new Error('socket hang up');
+      if (res === 'timeout') {
+        throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError', code: 23 });
+      }
+      if (res === 'refused') {
+        const refused = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9053'), { code: 'ECONNREFUSED' });
+        throw new TypeError('fetch failed', { cause: refused });
+      }
+      return send(res);
+    }
     if (method === 'GET' && (m = p.match(/^\/blockchain\/token\/byId\/([0-9a-f]{64})$/))) {
       const emission = state.emission.get(m[1]) ?? (isPoolNft(state, m[1]) ? 1n : undefined);
       if (emission === undefined) return send(notFound);
@@ -259,8 +282,9 @@ export function makeDex(
   config: ErgodexNetworkConfig = dexConfig(),
   root: ErgodexRootConfig = ROOT,
   tokens: ErgoTokenInfo[] = TOKENS,
+  chainConfig: ErgoNetworkConfig = testConfig(),
 ): Ergodex {
-  const ergo = new Ergo('mainnet', { config: testConfig(), fetch: stateNode(state) });
+  const ergo = new Ergo('mainnet', { config: chainConfig, fetch: stateNode(state) });
   jest.spyOn(ergo, 'getTokenList').mockResolvedValue(tokens);
   // a fresh signer per load, as the chain layer gives one per request and wipes it after
   jest.spyOn(ergo, 'getWallet').mockImplementation(async () => ({

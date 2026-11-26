@@ -407,4 +407,22 @@ export class ErgoNodeClient {
     }
     return id;
   }
+
+  /**
+   * Have the node check a signed transaction without sending it: POST /transactions/check
+   * validates it against the node's UTXO set and mempool, scripts included, and answers
+   * its id when it is valid. The node neither keeps nor relays it. `json` is sent byte for
+   * byte as the signer wrote it. A refusal throws with the node's reason.
+   */
+  async checkTransaction(json: string): Promise<string> {
+    const id = await this.request<string>('POST', '/transactions/check', {
+      body: json,
+      contentType: 'application/json',
+      plainTextOk: true,
+    });
+    if (typeof id !== 'string' || !/^[0-9a-fA-F]{64}$/.test(id)) {
+      throw new ErgoNodeError(200, `Ergo node answered the check with no transaction id: ${String(id)}`);
+    }
+    return id;
+  }
 }
