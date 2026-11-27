@@ -9,6 +9,8 @@
 
 # Hummingbot Gateway
 
+> **This is a fork.** Branch `feat/ergo` is Hummingbot Gateway v2.18.0 plus the **Ergo** chain (`ergo`) and one AMM connector, **`ergodex`**, which trades Spectrum-style pools and LithosDex pools by spending the pool box directly. [FORK-NOTES.md](./FORK-NOTES.md) says what the fork adds, how to run it for Ergo, which upstream files it touches, and what has and has not been proven. Everything below this note is the upstream README, with Ergo added to the two lists under "Supported Networks and DEXs".
+
 ## Introduction
 
 Hummingbot Gateway is a versatile API server that standardizes interactions with blockchain networks and decentralized exchanges (DEXs). It acts as a middleware layer, providing a unified interface for performing actions like checking balances, executing trades, and managing wallets across different protocols.
@@ -54,6 +56,12 @@ Gateway may be used alongside the main [Hummingbot client](https://github.com/hu
 - Solana Mainnet-Beta
 - Solana Devnet
 
+### Ergo Networks (this fork)
+- Ergo Mainnet
+- Ergo Testnet (network file only; no pool contracts are configured for it)
+
+Gateway talks to one Ergo node with the extra index enabled (the `/blockchain` API). No explorer is used. See [FORK-NOTES.md](./FORK-NOTES.md), section 3.
+
 ### RPC Provider Integration
 
 Gateway includes optimized RPC provider abstractions for improved performance and reliability:
@@ -88,6 +96,7 @@ Both RPC providers maintain full backward compatibility - networks default to st
 | PancakeSwap | Ethereum/EVM | ✅ | ✅ | ✅ | Multi-chain DEX with V2 AMM, V3 CLMM, and Smart Router |
 | Uniswap | Ethereum/EVM | ✅ | ✅ | ✅ | Complete V2 AMM, V3 CLMM, and Smart Order Router |
 | 0x | Ethereum/EVM | ✅ | ❌ | ❌ | DEX aggregator with professional market making features |
+| Ergo AMM pools (`ergodex`, this fork) | Ergo | ❌ | ✅ | ❌ | Spectrum-style and LithosDex constant-product pools. Swaps on both; add and remove liquidity on Spectrum-style pools only |
 
 #### Trading Types Explained:
 - **Router**: DEX aggregators that find optimal swap routes across multiple liquidity sources

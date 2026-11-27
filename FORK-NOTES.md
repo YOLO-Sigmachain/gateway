@@ -330,6 +330,7 @@ Everything outside `src/chains/ergo`, `src/connectors/ergodex`, `test/chains/erg
 | `src/wallet/utils.ts` | Ergo wallets are added by their own function (so the error text never echoes the start of a secret); `ergo` joins the valid wallet chains and address checks. |
 | `src/templates/root.yml` | Registers the namespaces `ergo`, `ergo-mainnet`, `ergo-testnet` and `ergodex`. |
 | `docker-compose.yml` | Mounts `./db` at `/home/gateway/db` for the pending file. |
+| `README.md` | A note at the top that this is a fork, and Ergo and `ergodex` in the lists of supported networks and DEX protocols. |
 | `package.json`, `pnpm-lock.yaml` | New dependencies (below). |
 | `openapi.json` | Regenerated. |
 | `test/app.integration.test.ts` | Allows chain `ergo` in the connector listing; checks that only `ergodex` sets `binds_price_limit`. |
