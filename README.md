@@ -9,7 +9,7 @@
 
 # Hummingbot Gateway
 
-> **This is a fork.** Branch `feat/ergo` is Hummingbot Gateway v2.18.0 plus the **Ergo** chain (`ergo`) and one AMM connector, **`ergodex`**, which trades Spectrum-style pools and LithosDex pools by spending the pool box directly. [FORK-NOTES.md](./FORK-NOTES.md) says what the fork adds, how to run it for Ergo, which upstream files it touches, and what has and has not been proven. Everything below this note is the upstream README, with Ergo added to the two lists under "Supported Networks and DEXs".
+> **This is a fork.** Branch `feat/ergo` is Hummingbot Gateway v2.18.0 plus the **Ergo** chain (`ergo`) and one AMM connector, **`ergodex`**, which trades Spectrum-style pools and LithosDex pools by spending the pool box directly. [FORK-NOTES.md](./FORK-NOTES.md) says what the fork adds, how to run it for Ergo, which upstream files it touches, and what has and has not been proven. **To try it, follow the [instructions for testers](https://github.com/YOLO-Sigmachain/hummingbot/blob/feat/ergo/TESTING.md)** in the client fork, which start with a disclaimer: this is experimental, unaudited software. Everything below this note is the upstream README, with Ergo added to the two lists under "Supported Networks and DEXs".
 
 ## Introduction
 
