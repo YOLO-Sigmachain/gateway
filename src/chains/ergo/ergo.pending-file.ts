@@ -195,6 +195,9 @@ function readEntry(raw: unknown, now: number): PendingTransaction | null {
       // a time ahead of the clock would make the entry look recent for ever
       submittedAt: Math.min(Number(e.submittedAt), now),
       ...(e.refused === true ? { refused: true } : {}),
+      ...(typeof e.walletErgoTree === 'string' && /^([0-9a-fA-F]{2})+$/.test(e.walletErgoTree)
+        ? { walletErgoTree: e.walletErgoTree.toLowerCase() }
+        : {}),
     };
   } catch {
     return null;
