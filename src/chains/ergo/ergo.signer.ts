@@ -10,6 +10,7 @@
 import {
   BlockHeader,
   BlockHeaders,
+  Constant,
   DerivationPath,
   ErgoBoxes,
   ErgoStateContext,
@@ -127,6 +128,21 @@ export function headersNewestFirst(headers: NodeHeaderJson[]): NodeHeaderJson[] 
 
 /** The error a signer gives once its key has been wiped. */
 export const DISPOSED_SIGNER_MESSAGE = 'This signer has been disposed; load the wallet again to sign';
+
+/**
+ * Whether ergo-lib-wasm 0.28.0 can parse a Sigma-serialized register value. Values
+ * introduced in Sigma v6 (such as UnsignedBigInt) or Option constants fail here cleanly
+ * rather than causing an unreachable panic inside UnsignedTransaction.from_json.
+ */
+export function canV0SignerParseRegister(hex: string): boolean {
+  try {
+    const constant = Constant.decode_from_base16(hex);
+    constant.free();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** ergo-lib-wasm 0.28.0 signer holding one key. */
 export class WasmErgoSigner implements ErgoSigner {

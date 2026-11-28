@@ -3,13 +3,23 @@
  * only when a transaction spends a box at a version-3 tree. A Spectrum swap, and a
  * transfer, sign on 0.28.0 without loading it; the first LithosDex swap loads it once.
  */
-import { Ergo, ergoTreeVersion, spendsTreeVersion3 } from '../../../src/chains/ergo/ergo';
+import { Ergo, ergoTreeVersion, spendsTreeVersion3, usesVersion3Register } from '../../../src/chains/ergo/ergo';
 import { ErgoSigningError, WasmErgoSigner } from '../../../src/chains/ergo/ergo.signer';
-import { buildUnsignedTransaction } from '../../../src/chains/ergo/ergo.tx-builder';
+import { buildUnsignedTransaction, ErgoTransactionAssertionError } from '../../../src/chains/ergo/ergo.tx-builder';
 import { Ergodex, TokenRef } from '../../../src/connectors/ergodex/ergodex';
 import { FEE_TREE, testConfig } from '../../chains/ergo/ergo-test-helpers';
 
-import { ERG, ME_TREE, MNEMONIC_A, newNodeState, RSN, RSN_POOL, signer, walletBox } from './ergodex-test-helpers';
+import {
+  ERG,
+  makeBox,
+  ME_TREE,
+  MNEMONIC_A,
+  newNodeState,
+  RSN,
+  RSN_POOL,
+  signer,
+  walletBox,
+} from './ergodex-test-helpers';
 import { L_TIP, LIT, LIT_POOL, LIT_VAULT, lithosNode, makeLithosDex, putPools } from './lithos-test-helpers';
 
 let mockAlphaLoads = 0;
@@ -188,5 +198,68 @@ describe('loading the version-3 signing library', () => {
       inputBoxes: [{ ...built.inputBoxes[0], ergoTree: '1c' + built.inputBoxes[0].ergoTree.slice(2) }],
     };
     expect(() => spendsTreeVersion3(v4)).toThrow(/above 3/);
+  });
+
+  it('a version-0 wallet input or data input carrying a Sigma v6 UnsignedBigInt register routes to the version-3 signer', async () => {
+    const poisonedBox = makeBox({
+      ergoTree: ME_TREE,
+      value: 5n * ERG,
+      creationHeight: L_TIP - 50,
+      registers: { R4: '090101' }, // SUnsignedBigInt(1)
+    });
+    const spendPoisoned = buildUnsignedTransaction({
+      height: L_TIP,
+      minValuePerByte: 360n,
+      fee: 1100000n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      walletBoxes: [poisonedBox],
+      outputs: [{ ergoTree: ME_TREE, value: ERG }],
+    });
+    expect(spendsTreeVersion3(spendPoisoned)).toBe(false);
+    expect(usesVersion3Register(spendPoisoned)).toBe(true);
+    // 0.28.0 alone cannot parse the Sigma v6 register on the v0 input box
+    await expect(
+      signer.signTransaction(spendPoisoned.unsigned, spendPoisoned.unsigned.inputs, spendPoisoned.unsigned.dataInputs, {
+        headers: (await ergo.node.getLastHeaders(10)) as never,
+      }),
+    ).rejects.toThrow(/Signing failed/);
+    const bare = { publicKeys: signer.publicKeys, signTransaction: signer.signTransaction.bind(signer) };
+    await expect(ergo.signTransaction(spendPoisoned, bare)).rejects.toThrow(
+      /register value that 0\.28\.0 cannot parse/,
+    );
+    const signedInput = await ergo.signTransaction(spendPoisoned, signer);
+    expect(signedInput.parsed.inputs[0].boxId).toBe(poisonedBox.boxId);
+
+    const withPoisonedDataInput = buildUnsignedTransaction({
+      height: L_TIP,
+      minValuePerByte: 360n,
+      fee: 1100000n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      dataInputs: [poisonedBox],
+      walletBoxes: [walletBox(5n * ERG)],
+      outputs: [{ ergoTree: ME_TREE, value: ERG }],
+    });
+    expect(spendsTreeVersion3(withPoisonedDataInput)).toBe(false);
+    expect(usesVersion3Register(withPoisonedDataInput)).toBe(true);
+    const signedData = await ergo.signTransaction(withPoisonedDataInput, signer);
+    expect(signedData.parsed.dataInputs[0].boxId).toBe(poisonedBox.boxId);
+  });
+
+  it('an output carrying an unsupported Sigma v6 or Option register is rejected cleanly before calling WASM', async () => {
+    for (const regHex of ['090101', '2800']) {
+      const built = buildUnsignedTransaction({
+        height: L_TIP,
+        minValuePerByte: 360n,
+        fee: 1100000n,
+        feeErgoTree: FEE_TREE,
+        changeErgoTree: ME_TREE,
+        walletBoxes: [walletBox(5n * ERG)],
+        outputs: [{ ergoTree: ME_TREE, value: ERG, additionalRegisters: { R4: regHex } }],
+      });
+      await expect(ergo.signTransaction(built, signer)).rejects.toBeInstanceOf(ErgoTransactionAssertionError);
+      await expect(ergo.signTransaction(built, signer)).rejects.toThrow(/output 0 register R4/);
+    }
   });
 });
