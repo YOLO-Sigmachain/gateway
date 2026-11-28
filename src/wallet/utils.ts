@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import fse from 'fs-extra';
 
 import { Ergo } from '../chains/ergo/ergo';
+import { assertErgoConfigFileUnchanged } from '../chains/ergo/ergo.config';
 import { addErgoWallet } from '../chains/ergo/ergo.wallet';
 import { Ethereum } from '../chains/ethereum/ethereum';
 import { Solana } from '../chains/solana/solana';
@@ -180,6 +181,10 @@ export async function removeWallet(fastify: FastifyInstance, req: RemoveWalletRe
     const isDefaultWallet =
       currentDefaultWallet && currentDefaultWallet.toLowerCase() === validatedAddress.toLowerCase();
 
+    if (isDefaultWallet && chainLower === 'ergo') {
+      assertErgoConfigFileUnchanged('ergo');
+    }
+
     // Create safe file path
     const safeChain = sanitizePathComponent(chainLower);
     const safeAddress = sanitizePathComponent(validatedAddress);
@@ -191,6 +196,10 @@ export async function removeWallet(fastify: FastifyInstance, req: RemoveWalletRe
     if (isDefaultWallet) {
       // Get all remaining wallet addresses (both regular and hardware)
       const remainingAddresses = await getAllWalletAddressesForChain(chainLower);
+
+      if (chainLower === 'ergo') {
+        assertErgoConfigFileUnchanged('ergo');
+      }
 
       if (remainingAddresses.length > 0) {
         // Set the first remaining wallet as the new default
@@ -204,6 +213,9 @@ export async function removeWallet(fastify: FastifyInstance, req: RemoveWalletRe
       }
     }
   } catch (error) {
+    if (error.statusCode) {
+      throw error;
+    }
     if (error.message.includes('Invalid') || error.message.includes('Unrecognized')) {
       throw fastify.httpErrors.badRequest(error.message);
     }

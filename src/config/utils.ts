@@ -177,6 +177,7 @@ export const updateDefaultWallet = (fastify: FastifyInstance, chain: string, wal
 
   try {
     // Update the default wallet configuration
+    if (chain.toLowerCase() === 'ergo') assertErgoConfigFileUnchanged('ergo');
     const configPath = `${chain}.defaultWallet`;
     ConfigManagerV2.getInstance().set(configPath, walletAddress);
     logger.info(`Successfully updated default wallet for ${chain}`);

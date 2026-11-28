@@ -17,7 +17,7 @@ import { decryptSecret, encryptSecret } from '../../services/secure-keystore';
 import { AddWalletRequest, AddWalletResponse } from '../../wallet/schemas';
 import { getSafeWalletFilePath, mkdirIfDoesNotExist, sanitizePathComponent, walletPath } from '../../wallet/utils';
 
-import { getErgoChainConfig, getErgoNetworkConfig } from './ergo.config';
+import { assertErgoConfigFileUnchanged, getErgoChainConfig, getErgoNetworkConfig } from './ergo.config';
 import { derivePublicKey, ErgoSigner, WasmErgoSigner } from './ergo.signer';
 import { addressFromPublicKey, decodeErgoAddressForPrefix } from './ergo.utils';
 
@@ -127,6 +127,10 @@ export async function addErgoWallet(
     // Config errors name keys, not secrets; derivation errors are reported without detail.
     logger.error(`Ergo wallet add: could not derive an address for network ${network}`);
     throw fastify.httpErrors.badRequest(`Unable to derive an Ergo address for network ${network}`);
+  }
+
+  if (req.setDefault) {
+    assertErgoConfigFileUnchanged('ergo');
   }
 
   const encrypted = encryptSecret(mnemonic, walletKey);
