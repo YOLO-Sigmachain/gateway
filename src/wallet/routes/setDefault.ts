@@ -94,6 +94,9 @@ export const setDefaultRoute: FastifyPluginAsync = async (fastify) => {
         };
       } catch (error) {
         logger.error(`Failed to set default wallet: ${error.message}`);
+        if (error.statusCode) {
+          throw error;
+        }
         throw fastify.httpErrors.internalServerError(`Failed to set default wallet: ${error.message}`);
       }
     },

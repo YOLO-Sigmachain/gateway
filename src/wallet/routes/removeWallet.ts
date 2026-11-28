@@ -2,6 +2,7 @@ import sensible from '@fastify/sensible';
 import { FastifyPluginAsync } from 'fastify';
 
 import { Ergo } from '../../chains/ergo/ergo';
+import { assertErgoConfigFileUnchanged } from '../../chains/ergo/ergo.config';
 import { Ethereum } from '../../chains/ethereum/ethereum';
 import { Solana } from '../../chains/solana/solana';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
@@ -76,6 +77,10 @@ export const removeWalletRoute: FastifyPluginAsync = async (fastify) => {
           throw fastify.httpErrors.notFound(`Hardware wallet ${validatedAddress} not found for ${chain}`);
         }
 
+        if (isDefaultWallet && chainLower === 'ergo') {
+          assertErgoConfigFileUnchanged('ergo');
+        }
+
         wallets.splice(index, 1);
         await saveHardwareWallets(chain, wallets);
 
@@ -83,6 +88,10 @@ export const removeWalletRoute: FastifyPluginAsync = async (fastify) => {
         if (isDefaultWallet) {
           // Get all remaining wallet addresses (both regular and hardware)
           const remainingAddresses = await getAllWalletAddressesForChain(chain);
+
+          if (chainLower === 'ergo') {
+            assertErgoConfigFileUnchanged('ergo');
+          }
 
           if (remainingAddresses.length > 0) {
             // Set the first remaining wallet as the new default
