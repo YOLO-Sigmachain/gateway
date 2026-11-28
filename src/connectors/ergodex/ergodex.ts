@@ -292,11 +292,26 @@ export class Ergodex {
       throw httpErrors.createError(409, `${confirmed.length} unspent boxes hold pool NFT ${id}; refusing to guess`);
     }
     if (this.config.useMempoolSuccessor && !options.confirmedOnly) {
-      const pending = (await node.getUnconfirmedOutputsByTokenId(id)).filter(
-        (b) => holdsNft(b) && this.venueForTree(b.ergoTree),
-      );
+      const pendingAll = await node.getUnconfirmedOutputsByTokenId(id);
+      const pending = pendingAll.filter((b) => holdsNft(b) && this.venueForTree(b.ergoTree));
+      const spentInChain = new Set<string>();
+      if (pending.length > 0 && pendingAll.length > 1) {
+        // Ergo Node's /transactions/unconfirmed/inputs/byBoxId/{boxId} resolves against the
+        // confirmed UTXO set only and returns 404 for unconfirmed inputs, so inspect the
+        // unconfirmed transactions producing these outputs to detect chained mempool spends.
+        const txIds = new Set(pendingAll.map((b) => b.transactionId));
+        for (const txId of txIds) {
+          const tx = await node.getUnconfirmedTransaction(txId);
+          for (const input of tx?.inputs ?? []) {
+            if (typeof input.boxId === 'string') spentInChain.add(input.boxId.toLowerCase());
+          }
+        }
+      }
       const live: ErgoBox[] = [];
-      for (const box of pending) if (!(await node.isSpentInMempool(box.boxId))) live.push(box);
+      for (const box of pending) {
+        if (spentInChain.has(box.boxId.toLowerCase())) continue;
+        if (!(await node.isSpentInMempool(box.boxId))) live.push(box);
+      }
       if (live.length > 1) {
         await this.assertSingleNft(id);
         throw httpErrors.createError(

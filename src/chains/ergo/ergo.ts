@@ -66,6 +66,9 @@ import {
 } from './ergo.utils';
 import { ErgoWalletAccount, loadErgoWallet } from './ergo.wallet';
 
+/** Maximum token decimals accepted from token lists or the node index (matches nativeDecimals schema). */
+export const MAX_TOKEN_DECIMALS = 30;
+
 /** A build request as connectors send it; height, fee and the node's parameters are filled in here. */
 export type ErgoTransactionRequest = Omit<
   ErgoBuildParams,
@@ -608,7 +611,14 @@ export class Ergo {
     // The list may name the native coin under NATIVE_COIN_ID, for clients that read decimals
     // from it. It is not a token: here the native coin comes from the network config only.
     return raw
-      .filter((t) => isErgoId(t?.address) && Number.isInteger(t?.decimals) && typeof t?.symbol === 'string')
+      .filter(
+        (t) =>
+          isErgoId(t?.address) &&
+          Number.isInteger(t?.decimals) &&
+          t.decimals >= 0 &&
+          t.decimals <= MAX_TOKEN_DECIMALS &&
+          typeof t?.symbol === 'string',
+      )
       .filter((t) => String(t.address).toLowerCase() !== NATIVE_COIN_ID)
       .map((t) => ({
         address: String(t.address).toLowerCase(),
@@ -629,6 +639,15 @@ export class Ergo {
     const cached = this.tokenInfoCache.get(id);
     if (cached) return cached;
     const fromNode = await this.node.getToken(id);
+    if (
+      fromNode &&
+      fromNode.decimals !== null &&
+      (!Number.isInteger(fromNode.decimals) || fromNode.decimals < 0 || fromNode.decimals > MAX_TOKEN_DECIMALS)
+    ) {
+      throw httpErrors.badRequest(
+        `Token ${id} declares out-of-range decimals (${fromNode.decimals}); expected an integer between 0 and ${MAX_TOKEN_DECIMALS}`,
+      );
+    }
     const info =
       fromNode && fromNode.decimals !== null
         ? { address: id, symbol: fromNode.name ?? id, name: fromNode.name ?? id, decimals: fromNode.decimals }

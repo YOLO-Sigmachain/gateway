@@ -133,20 +133,19 @@ export async function getPositionsOwned(network: string, walletAddress: string):
       let chosen: { position: PositionInfo; poolId: string } | null = null;
       const errors: Array<{ poolId: string; error: unknown }> = [];
       for (const { poolId } of candidates) {
-        let fresh: FreshLiquidityPool;
         try {
-          fresh = await dex.freshLiquidityPool(poolId, { confirmedOnly: true, exit: true });
+          const fresh = await dex.freshLiquidityPool(poolId, { confirmedOnly: true, exit: true });
+          if (fresh.lpToken.tokenId !== lpTokenId) {
+            skipped(lpTokenId, poolId, `its fresh box holds LP token ${fresh.lpToken.tokenId} instead`);
+            continue;
+          }
+          chosen = { position: positionOf(fresh, walletAddress, balance), poolId };
+          break;
         } catch (error) {
           if (mustRethrow(error)) errors.push({ poolId, error });
           else skipped(lpTokenId, poolId, (error as Error).message);
           continue;
         }
-        if (fresh.lpToken.tokenId !== lpTokenId) {
-          skipped(lpTokenId, poolId, `its fresh box holds LP token ${fresh.lpToken.tokenId} instead`);
-          continue;
-        }
-        chosen = { position: positionOf(fresh, walletAddress, balance), poolId };
-        break;
       }
       if (!chosen) {
         if (errors.length > 0) {
