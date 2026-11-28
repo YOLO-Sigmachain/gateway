@@ -9,7 +9,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+import { buildUnsignedTransaction } from '../../../src/chains/ergo/ergo.tx-builder';
 import { Eip12BoxCandidate, ErgoBox } from '../../../src/chains/ergo/ergo.types';
+import { verifySwapTransaction } from '../../../src/connectors/ergodex/amm-routes/executeSwap';
 import { Ergodex } from '../../../src/connectors/ergodex/ergodex';
 import { ErgodexConfig } from '../../../src/connectors/ergodex/ergodex.config';
 import {
@@ -27,6 +29,7 @@ import {
 import { LithosPool, LithosVenue } from '../../../src/connectors/ergodex/venues/lithos/lithos.venue';
 import { VenueRuleError } from '../../../src/connectors/ergodex/venues/venue';
 import { ConfigManagerV2 } from '../../../src/services/config-manager-v2';
+import { FEE_TREE } from '../../chains/ergo/ergo-test-helpers';
 
 import { ERG, makeBox, ME_TREE, n2tPool, newNodeState, NodeState, RSN_POOL, walletBox } from './ergodex-test-helpers';
 import {
@@ -195,6 +198,57 @@ describe('the contract rule on a successor and on the other inputs', () => {
     const out = venue.amountOut(tiny, 'y', 1000000n);
     expect(out).toBeGreaterThan(0n);
     expect(() => venue.successor(tiny, { input: 'y', amountIn: 1000000n, amountOut: out })).toThrow(/storage floor/);
+  });
+
+  it('a successor of either kind writes only R4..R8 and omits an unexpected R9 from the pool box', () => {
+    const dex = makeLithosDex(newNodeState());
+    const ergRef = { tokenId: null, symbol: 'ERG', decimals: 9 };
+    const litRef = { tokenId: LIT_POOL.assets[1].tokenId, symbol: 'LIT', decimals: 9 };
+    const rsnRef = { tokenId: LIT_RSN_POOL.assets[2].tokenId, symbol: 'RSN', decimals: 3 };
+
+    const bloatedN2t = makeBox({
+      ...LIT_POOL,
+      registers: { ...LIT_POOL.additionalRegisters, R9: '0e04deadbeef' },
+    });
+    const bloatedN2tPool = venue.parsePool(bloatedN2t) as LithosPool;
+    const nextN2t = venue.successor(bloatedN2tPool, swap);
+    expect(nextN2t.additionalRegisters!.R9).toBeUndefined();
+    expect(Object.keys(nextN2t.additionalRegisters!).sort()).toEqual(['R4', 'R5', 'R6', 'R7', 'R8']);
+    expect(venue.contractAccepts(bloatedN2tPool, candidate(nextN2t))).toBe(true);
+    const n2tPlan = dex.plan({ pool: bloatedN2tPool, venue, source: 'confirmed' }, ergRef, litRef, 'SELL', ERG);
+    const n2tBuilt = buildUnsignedTransaction({
+      height: L_TIP,
+      minValuePerByte: 360n,
+      fee: 1100000n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      inputs: [{ box: bloatedN2t, extension: venue.swapInputExtension() }],
+      walletBoxes: [walletBox(5n * ERG)],
+      outputs: [n2tPlan.successor],
+    });
+    expect(() => verifySwapTransaction(n2tPlan, n2tBuilt)).not.toThrow();
+
+    const bloatedT2t = makeBox({
+      ...LIT_RSN_POOL,
+      registers: { ...LIT_RSN_POOL.additionalRegisters, R9: '0e04deadbeef' },
+    });
+    const bloatedT2tPool = venue.parsePool(bloatedT2t) as LithosPool;
+    const nextT2t = venue.successor(bloatedT2tPool, tSwap);
+    expect(nextT2t.additionalRegisters!.R9).toBeUndefined();
+    expect(Object.keys(nextT2t.additionalRegisters!).sort()).toEqual(['R4', 'R5', 'R6', 'R7', 'R8']);
+    expect(venue.contractAccepts(bloatedT2tPool, candidate(nextT2t))).toBe(true);
+    const t2tPlan = dex.plan({ pool: bloatedT2tPool, venue, source: 'confirmed' }, rsnRef, litRef, 'SELL', 1000n);
+    const t2tBuilt = buildUnsignedTransaction({
+      height: L_TIP,
+      minValuePerByte: 360n,
+      fee: 1100000n,
+      feeErgoTree: FEE_TREE,
+      changeErgoTree: ME_TREE,
+      inputs: [{ box: bloatedT2t, extension: venue.swapInputExtension() }],
+      walletBoxes: [walletBox(5n * ERG, [{ tokenId: rsnRef.tokenId, amount: 10000n }])],
+      outputs: [t2tPlan.successor],
+    });
+    expect(() => verifySwapTransaction(t2tPlan, t2tBuilt)).not.toThrow();
   });
 });
 
