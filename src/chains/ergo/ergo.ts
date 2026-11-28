@@ -886,7 +886,8 @@ export class Ergo {
     // check mode: checked by the node and never recorded, so the signed transaction is kept
     // nowhere and no later post can send it
     if (mode === 'check') return this.checkSigned(signed, ownIds);
-    this.pending.record(signed.id, inputBoxIds, outputs, signed.json, fixedInputs);
+    const walletErgoTree = built.changeErgoTree.toLowerCase();
+    this.pending.record(signed.id, inputBoxIds, outputs, signed.json, fixedInputs, { walletErgoTree });
     let txId: string;
     try {
       txId = await this.postToSubmit(signed.json);
@@ -922,7 +923,7 @@ export class Ergo {
       // so they are not offered as spendable; the inputs stay hidden under the node's id.
       // Submitted already, so a file write failure here is logged, never thrown.
       logger.error(`Ergo node returned id ${txId} for transaction ${signed.id}; tracking the node's id`);
-      this.pending.record(txId, inputBoxIds, [], signed.json, fixedInputs, { mustPersist: false });
+      this.pending.record(txId, inputBoxIds, [], signed.json, fixedInputs, { mustPersist: false, walletErgoTree });
       this.pending.release(signed.id);
     }
     logger.info(`Submitted Ergo transaction ${txId} on ${this.network}`);
@@ -1185,7 +1186,7 @@ export class Ergo {
       const inclusionHeight = typeof confirmed.inclusionHeight === 'number' ? confirmed.inclusionHeight : null;
       const confirmations = confirmationsOf(confirmed, fullHeight);
       const done = confirmations >= this.config.confirmations;
-      if (done) this.pending.release(id);
+      if (done) this.pending.releaseConfirmed(id);
       else this.pending.markRefused(id, false);
       return {
         ...base,
@@ -1300,23 +1301,22 @@ export class Ergo {
       if (mismatch) {
         logger.warn(`Ergo ${this.network}: the transactions ${id} waits for are not posted again: ${mismatch.message}`);
       }
-      for (const parent of mode === 'send' ? parents : []) {
-        const parentTx = this.pending.get(parent);
-        if (!parentTx) continue;
-        try {
-          await this.postAgainIfDropped(parentTx);
-        } catch (error) {
-          logger.warn(
-            `Ergo ${this.network}: could not check transaction ${parent}, which ${id} waits for: ` +
-              safeErrorText(error, [parent, ...parentTx.inputBoxIds]),
-          );
-        }
+      await this.settleWaitingAncestors(id, parents, fullHeight, mode === 'send');
+      const cascaded = this.pending.failedReason(id);
+      if (cascaded) {
+        return { ...base, txBlock: null, txStatus: TransactionStatusCode.FAILED, error: cascaded.reason, txData: null };
       }
+      const stillPending = parents.filter((p) => this.pending.get(p) !== undefined);
       return {
         ...base,
         txBlock: null,
         txStatus: TransactionStatusCode.PENDING,
-        txData: { note: `waits for transaction ${parents.join(', ')}, which creates its inputs and is still pending` },
+        txData: {
+          note:
+            stillPending.length > 0
+              ? `waits for transaction ${stillPending.join(', ')}, which creates its inputs and is still pending`
+              : `ancestor transaction ${parents.join(', ')} settled; re-poll to track this transaction`,
+        },
       };
     }
     return { ...base, txBlock: null, txStatus: TransactionStatusCode.NOT_FOUND, txData: null };
@@ -1388,17 +1388,65 @@ export class Ergo {
   }
 
   /**
-   * Post a tracked transaction again if the node has dropped it: in no mempool, and every
-   * input indexed and unspent. For a caller that has seen the index caught up. A refusal
-   * keeps it, as in poll.
+   * Walk tracked ancestors of a waiting child transaction: confirm/release settled ones,
+   * fail-cascade any ancestor whose input was spent by a competing transaction at
+   * `failedAfterConfirmations` (regardless of submitMode), recurse up multi-hop chains, and
+   * rebroadcast dropped root ancestors when `allowRebroadcast` is true.
    */
-  private async postAgainIfDropped(tx: PendingTransaction): Promise<void> {
-    if (await this.node.getUnconfirmedTransaction(tx.txId)) {
-      this.pending.markRefused(tx.txId, false);
-      return;
+  private async settleWaitingAncestors(
+    childId: string,
+    roots: string[],
+    fullHeight: number,
+    allowRebroadcast: boolean,
+  ): Promise<void> {
+    const queue = [...roots];
+    const visited = new Set<string>([childId]);
+    while (queue.length > 0) {
+      const ancestorId = queue.shift()!;
+      if (visited.has(ancestorId)) continue;
+      visited.add(ancestorId);
+      const ancestorTx = this.pending.get(ancestorId);
+      if (!ancestorTx) continue;
+      try {
+        if (await this.node.getUnconfirmedTransaction(ancestorId)) {
+          this.pending.markRefused(ancestorId, false);
+          continue;
+        }
+        const confirmed = await this.node.getTransaction(ancestorId);
+        if (confirmed) {
+          if (confirmationsOf(confirmed, fullHeight) >= this.config.confirmations) {
+            this.pending.releaseConfirmed(ancestorId);
+          } else {
+            this.pending.markRefused(ancestorId, false);
+          }
+          continue;
+        }
+        const aInputs = await this.readTrackedInputs(ancestorTx);
+        if (aInputs.spentElsewhere) {
+          const { boxId, by } = aInputs.spentElsewhere;
+          if ((await this.confirmationsOfTransaction(by, fullHeight)) >= this.failedAfterConfirmations) {
+            const reason = `Input ${boxId} was spent by transaction ${by}; this transaction can no longer confirm`;
+            this.pending.releaseFailed(ancestorId, reason);
+            if (this.pending.failedReason(childId)) return;
+          }
+          continue;
+        }
+        if (aInputs.waitingOn.length > 0 && aInputs.unknown.length === 0) {
+          for (const grandParent of aInputs.waitingOn) {
+            if (!visited.has(grandParent)) queue.push(grandParent);
+          }
+          continue;
+        }
+        if (aInputs.allUnspent && allowRebroadcast) {
+          await this.postAgain(ancestorTx);
+        }
+      } catch (error) {
+        logger.warn(
+          `Ergo ${this.network}: could not check transaction ${ancestorId}, which ${childId} waits for: ` +
+            safeErrorText(error, [ancestorId, ...ancestorTx.inputBoxIds]),
+        );
+      }
     }
-    const inputs = await this.readTrackedInputs(tx);
-    if (inputs.allUnspent) await this.postAgain(tx);
   }
 
   /** Blocks holding a transaction, by the index; 0 when the index does not have it. */
@@ -1490,7 +1538,7 @@ export class Ergo {
     const { fullHeight } = await this.node.getInfo();
     const confirmed = await this.node.getTransaction(id);
     if (confirmed) {
-      if (confirmationsOf(confirmed, fullHeight) >= this.config.confirmations) this.pending.release(id);
+      if (confirmationsOf(confirmed, fullHeight) >= this.config.confirmations) this.pending.releaseConfirmed(id);
       else this.pending.markRefused(id, false);
       return;
     }

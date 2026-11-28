@@ -62,6 +62,12 @@ export interface PendingTransaction {
    * until a later post is accepted, or it is seen in a mempool or confirmed.
    */
   refused?: boolean;
+  /**
+   * ErgoTree of the wallet whose boxes funded this transaction (lowercase). When set,
+   * `available()` treats a non-fixed input's absence from the node listing as evidence
+   * that the node saw the spend only while querying that same tree.
+   */
+  walletErgoTree?: string;
 }
 
 /** A transaction released because it can never confirm, and why. */
@@ -128,10 +134,11 @@ export class ErgoPendingTracker {
     outputs: ErgoBox[],
     json: string,
     fixedInputs: PendingFixedInput[] = [],
-    options: { mustPersist?: boolean } = {},
+    options: { mustPersist?: boolean; walletErgoTree?: string } = {},
   ): void {
     const wasFailed = this.failed.get(txId);
     this.failed.delete(txId);
+    const walletErgoTree = options.walletErgoTree?.toLowerCase();
     this.insert({
       txId,
       inputBoxIds: [...inputBoxIds],
@@ -139,6 +146,7 @@ export class ErgoPendingTracker {
       outputs: outputs.map((o) => ({ ...o })),
       json,
       submittedAt: this.now(),
+      ...(walletErgoTree ? { walletErgoTree } : {}),
     });
     if (options.mustPersist === false) {
       this.persist();
@@ -179,6 +187,34 @@ export class ErgoPendingTracker {
           `${error instanceof Error ? error.message : String(error)}; transaction ${txId} is still tracked`,
       );
     }
+  }
+
+  /**
+   * Release a confirmed transaction and every tracked ancestor whose output it spends
+   * (and theirs in turn): a confirmed child proves every ancestor is already confirmed at
+   * least as deep. Releasing only the child would clear its spend from `spentBy` and let
+   * the still-tracked parent's already-spent outputs reappear in `available()`.
+   */
+  releaseConfirmed(txId: string): string[] {
+    const released: string[] = [];
+    const queue: string[] = [txId];
+    const seen = new Set<string>([txId]);
+    while (queue.length > 0) {
+      const nextId = queue.shift()!;
+      const tx = this.txs.get(nextId);
+      if (!tx) continue;
+      for (const boxId of tx.inputBoxIds) {
+        const parentId = this.producerOf(boxId);
+        if (parentId !== undefined && parentId !== nextId && !seen.has(parentId)) {
+          seen.add(parentId);
+          queue.push(parentId);
+        }
+      }
+      this.remove(nextId);
+      released.push(nextId);
+    }
+    if (released.length > 0) this.persist();
+    return released;
   }
 
   /**
@@ -276,7 +312,7 @@ export class ErgoPendingTracker {
     const tree = ergoTree.toLowerCase();
     const result = nodeBoxes.filter((box) => !this.spentBy.has(box.boxId));
     const listed = new Set(nodeBoxes.map((box) => box.boxId));
-    const offered = this.offeredTransactions(new Set(listed));
+    const offered = this.offeredTransactions(new Set(listed), tree);
     for (const tx of this.txs.values()) {
       if (!offered.has(tx.txId)) continue;
       for (const output of tx.outputs) {
@@ -300,7 +336,7 @@ export class ErgoPendingTracker {
    * contract box) never counts either: `nodeListed` is the wallet's own listing, which
    * never holds a contract box, so its absence there says nothing.
    */
-  private offeredTransactions(nodeListed: Set<string>): Set<string> {
+  private offeredTransactions(nodeListed: Set<string>, queryTree: string): Set<string> {
     const producer = new Map<string, string>();
     for (const tx of this.txs.values()) for (const o of tx.outputs) producer.set(o.boxId, tx.txId);
     const memo = new Map<string, boolean>();
@@ -314,11 +350,14 @@ export class ErgoPendingTracker {
       let ok = true;
       let nodeSeesASpend = false;
       const fixed = new Set(tx.fixedInputs.map((f) => f.boxId));
+      // When the transaction records its funding wallet tree, another wallet's listing never
+      // holds its inputs, so their absence there says nothing about whether the node saw it.
+      const inputsOnQueriedTree = !tx.walletErgoTree || tx.walletErgoTree === queryTree;
       for (const boxId of tx.inputBoxIds) {
         const parent = producer.get(boxId);
         if (parent !== undefined && parent !== txId) {
           if (!visit(parent, depth + 1)) ok = false;
-        } else if (!fixed.has(boxId) && !nodeListed.has(boxId)) {
+        } else if (inputsOnQueriedTree && !fixed.has(boxId) && !nodeListed.has(boxId)) {
           nodeSeesASpend = true;
         }
       }

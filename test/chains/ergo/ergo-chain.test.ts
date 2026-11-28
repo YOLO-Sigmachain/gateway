@@ -946,6 +946,110 @@ describe('poll of a chained transaction whose input is our own unconfirmed chang
     ergo.pending.release(PARENT);
     expect((await ergo.pollTransaction(TX)).txStatus).toBe(TransactionStatusCode.NOT_FOUND);
   });
+
+  it('confirming the child releases the unpolled parent so its spent change box cannot reappear as spendable', async () => {
+    const childOut = makeBox({ ergoTree: ME_TREE, value: 2n * ERG, transactionId: TX, inclusionHeight: TIP });
+    const node = fakeNode((method, p) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody(TIP) };
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p === `/blockchain/transaction/byId/${TX}`) {
+        return {
+          body: { id: TX, inclusionHeight: TIP, inputs: [{ boxId: change.boxId }], dataInputs: [], outputs: [] },
+        };
+      }
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) {
+        return { body: [nodeBoxJson(childOut)] };
+      }
+      return notFound();
+    });
+    const ergo = new Ergo('mainnet', { config: testConfig({ confirmations: 1 }), fetch: node.fetch });
+    ergo.pending.record(PARENT, [funding.boxId], [change], PARENT_JSON, [], { walletErgoTree: ME_TREE });
+    ergo.pending.record(TX, [change.boxId], [childOut], '{}', [], { walletErgoTree: ME_TREE });
+
+    const r = await ergo.pollTransaction(TX);
+    expect(r.txStatus).toBe(TransactionStatusCode.CONFIRMED);
+    expect(ergo.pending.get(TX)).toBeUndefined();
+    expect(ergo.pending.get(PARENT)).toBeUndefined();
+
+    const spendable = await ergo.getSpendableBoxes(ME);
+    expect(spendable.map((b) => b.boxId)).toEqual([childOut.boxId]);
+  });
+
+  it('a dropped transaction funded by wallet A is not offered as a spendable output to wallet B after recentMs', async () => {
+    const otherTree = new Ergo('mainnet', { config: testConfig() }).addressToErgoTree(OTHER);
+    const toOther = makeBox({ ergoTree: otherTree, value: ERG, transactionId: PARENT, inclusionHeight: null });
+    let clock = 1_000_000;
+    const node = fakeNode((method, p) => {
+      if (method === 'POST' && p.startsWith('/blockchain/box/unspent/byAddress')) return { body: [] };
+      return notFound();
+    });
+    const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch, now: () => clock });
+    ergo.pending.record(PARENT, [funding.boxId], [toOther], PARENT_JSON, [], { walletErgoTree: ME_TREE });
+
+    // Once recentMs (60s) has passed, wallet B's empty node listing does not prove wallet A's input was spent
+    clock += 120_000;
+    expect(ergo.pending.available([], otherTree)).toEqual([]);
+  });
+
+  it('polling the child settles it as FAILED when its tracked parent lost to a final competing spend', async () => {
+    const RIVAL = 'e1'.repeat(32);
+    const node = fakeNode((method, p) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody(TIP) };
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p === `/blockchain/transaction/byId/${RIVAL}`) {
+        return { body: { id: RIVAL, inclusionHeight: TIP - 3, inputs: [], dataInputs: [], outputs: [] } };
+      }
+      if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+      if (p === `/blockchain/box/byId/${funding.boxId}`) {
+        return { body: { ...nodeBoxJson(funding), spentTransactionId: RIVAL } };
+      }
+      if (p === `/blockchain/box/byId/${change.boxId}`) return notFound();
+      return undefined;
+    });
+    // Even in check mode (no rebroadcast), a proven parent failure settles the child as FAILED
+    const ergo = new Ergo('mainnet', {
+      config: testConfig({ submitMode: 'check', nodeURL: 'http://127.0.0.1:9053' }),
+      fetch: node.fetch,
+    });
+    ergo.pending.record(PARENT, [funding.boxId], [change], PARENT_JSON);
+    ergo.pending.record(TX, [change.boxId], [], '{}');
+
+    const r = await ergo.pollTransaction(TX);
+    expect(r.txStatus).toBe(TransactionStatusCode.FAILED);
+    expect(r.error).toContain(PARENT);
+    expect(ergo.pending.get(PARENT)).toBeUndefined();
+    expect(ergo.pending.get(TX)).toBeUndefined();
+  });
+
+  it('polling the leaf of a dropped 3-tx chain walks back to and rebroadcasts the root transaction', async () => {
+    const CHILD2 = 'd2'.repeat(32);
+    const change2 = makeBox({ ergoTree: ME_TREE, value: 2n * ERG, transactionId: TX, inclusionHeight: null });
+    const posted: string[] = [];
+    const node = fakeNode((method, p, body) => {
+      if (method === 'GET' && p === '/info') return { body: infoBody(TIP) };
+      if (method === 'POST' && p === '/transactions') {
+        posted.push(body!);
+        return { body: JSON.stringify(PARENT) };
+      }
+      if (p.startsWith('/transactions/unconfirmed/byTransactionId/')) return notFound();
+      if (p.startsWith('/blockchain/transaction/byId/')) return notFound();
+      if (p === '/blockchain/indexedHeight') return { body: { indexedHeight: TIP, fullHeight: TIP } };
+      if (p === `/blockchain/box/byId/${funding.boxId}`) return { body: nodeBoxJson(funding) };
+      if (p === `/blockchain/box/byId/${change.boxId}` || p === `/blockchain/box/byId/${change2.boxId}`) {
+        return notFound();
+      }
+      return undefined;
+    });
+    const ergo = new Ergo('mainnet', { config: testConfig(), fetch: node.fetch });
+    ergo.pending.record(PARENT, [funding.boxId], [change], PARENT_JSON);
+    ergo.pending.record(TX, [change.boxId], [change2], '{"id":"mid"}');
+    ergo.pending.record(CHILD2, [change2.boxId], [], '{"id":"leaf"}');
+
+    const r = await ergo.pollTransaction(CHILD2);
+    expect(r.txStatus).toBe(TransactionStatusCode.PENDING);
+    expect(posted).toEqual([PARENT_JSON]);
+  });
 });
 
 describe('the native coin in the shipped token lists', () => {
