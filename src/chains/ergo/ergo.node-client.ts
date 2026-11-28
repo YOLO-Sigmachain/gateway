@@ -294,7 +294,7 @@ export class ErgoNodeClient {
    */
   async getUnspentBoxesByAddress(address: string, query: UnspentQuery): Promise<ErgoBox[]> {
     const boxes: ErgoBox[] = [];
-    let lastBatchLength = 0;
+    let lastConfirmedCount = 0;
     for (let page = 0; page < MAX_PAGES; page++) {
       const params = new URLSearchParams({
         offset: String(page * this.pageSize),
@@ -308,19 +308,26 @@ export class ErgoNodeClient {
         `/blockchain/box/unspent/byAddress?${params.toString()}`,
         { body: address, contentType: 'text/plain', notFoundIsNull: true },
       );
-      lastBatchLength = batch ? batch.length : 0;
-      if (!batch || batch.length === 0) break;
-      boxes.push(...batch.map(normalizeNodeBox));
-      if (batch.length < this.pageSize) break;
+      if (!batch || batch.length === 0) {
+        lastConfirmedCount = 0;
+        break;
+      }
+      const normalized = batch.map(normalizeNodeBox);
+      boxes.push(...normalized);
+      // Ergo Node paginates only confirmed boxes and appends every unconfirmed output to
+      // every page; stopping on total batch.length would loop MAX_PAGES times whenever an
+      // address has >= pageSize unconfirmed outputs.
+      lastConfirmedCount = normalized.filter((b) => b.inclusionHeight !== undefined).length;
+      if (lastConfirmedCount < this.pageSize) break;
     }
-    // The last page was full: there are more boxes than the page limit lets us read.
-    if (lastBatchLength >= this.pageSize) {
+    // The last page held a full page of confirmed boxes: more may remain past MAX_PAGES.
+    if (lastConfirmedCount >= this.pageSize) {
       throw new ErgoNodeError(
         200,
         `Address has more than ${MAX_PAGES * this.pageSize} unspent boxes; refusing to report a partial set`,
       );
     }
-    // A box can appear twice if the set moved between pages.
+    // A box can appear twice if the set moved between pages or was repeated across pages.
     const seen = new Set<string>();
     return boxes.filter((box) => (seen.has(box.boxId) ? false : (seen.add(box.boxId), true)));
   }

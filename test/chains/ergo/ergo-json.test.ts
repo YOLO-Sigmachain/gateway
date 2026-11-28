@@ -131,6 +131,40 @@ describe('bigint-safe JSON at the node boundary', () => {
     expect(node.calls[0].path).toContain('excludeMempoolSpent=true');
     expect(node.calls[0].body).toBe('9fSgJ7BmUxBQJ454prQDQ7fQMBkXPLaAmDnimgTtjym6FYPHjAV');
   });
+
+  it('stops paginating when confirmed boxes are below pageSize even when >= pageSize unconfirmed outputs appear on every page', async () => {
+    const pageSize = 2;
+    const confirmed = makeBox({ ergoTree: p2pk(GENERATOR_PK), value: 1000000000n, inclusionHeight: 1000 });
+    const unconfirmed = [0, 1, 2].map((i) =>
+      makeBox({
+        ergoTree: p2pk(GENERATOR_PK),
+        value: 1000000000n,
+        transactionId: `aa${String(i).padStart(62, '0')}`,
+        inclusionHeight: null,
+      }),
+    );
+    const node = fakeNode((method, urlPath) => {
+      if (method === 'POST' && urlPath.startsWith('/blockchain/box/unspent/byAddress')) {
+        // Mirror Ergo Node Segment.retrieveUtxos: paginate confirmed boxes only, append all unconfirmed on every page
+        const offset = Number(new URL(`http://node.test${urlPath}`).searchParams.get('offset'));
+        const confirmedPage = offset === 0 ? [confirmed] : [];
+        return { body: [...confirmedPage, ...unconfirmed].map((b) => nodeBoxJson(b)) };
+      }
+      return undefined;
+    });
+    const client = new ErgoNodeClient('http://node.test', {
+      timeoutMs: 1000,
+      pageSize,
+      fetch: node.fetch,
+      canSubmit: () => false,
+    });
+    const boxes = await client.getUnspentBoxesByAddress('9fSgJ7BmUxBQJ454prQDQ7fQMBkXPLaAmDnimgTtjym6FYPHjAV', {
+      includeUnconfirmed: true,
+      excludeMempoolSpent: true,
+    });
+    expect(node.calls).toHaveLength(1);
+    expect(boxes.map((b) => b.boxId)).toEqual([confirmed.boxId, ...unconfirmed.map((b) => b.boxId)]);
+  });
 });
 
 describe('whole-unit conversion at the edge', () => {

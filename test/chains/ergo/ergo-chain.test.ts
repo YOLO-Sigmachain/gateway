@@ -1018,4 +1018,20 @@ describe('token emission', () => {
     expect(await ergo.getTokenEmission(nft)).toBe(1n);
     expect(calls.filter((c) => c.path.startsWith('/blockchain/token/byId/')).length).toBe(2);
   });
+
+  it('rejects out-of-range on-chain token decimals with 400 and does not cache them', async () => {
+    const bad = tokenId(0x7f);
+    let decimals = 2147483647;
+    const { ergo } = chain((_m, p) => {
+      if (p === `/blockchain/token/byId/${bad}`) {
+        return { body: { id: bad, name: 'EVIL', decimals, emissionAmount: 10 } };
+      }
+      return undefined;
+    });
+    await expect(ergo.getTokenById(bad)).rejects.toMatchObject({ statusCode: 400 });
+    decimals = -1;
+    await expect(ergo.getTokenById(bad)).rejects.toMatchObject({ statusCode: 400 });
+    decimals = 6;
+    expect(await ergo.getTokenById(bad)).toMatchObject({ address: bad, decimals: 6 });
+  });
 });
