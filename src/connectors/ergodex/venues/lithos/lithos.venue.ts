@@ -209,10 +209,10 @@ export class LithosVenue implements Venue {
     return { 0: '02' + this.config.swapOperation.toString(16).padStart(2, '0') };
   }
 
-  unchangedRegisters(pool: VenuePool): RegisterId[] {
-    const regs: RegisterId[] = ['R4', 'R5'];
-    if (lithosOf(pool).kind === 't2t') regs.push('R9');
-    return regs;
+  unchangedRegisters(): RegisterId[] {
+    // R4 (liquidity) and R5 (feeParams) stay byte-for-byte equal to the pool box; R6 and one
+    // accumulator advance, and R9 is omitted by successor() (and rejected by contractAccepts on t2t).
+    return ['R4', 'R5'];
   }
 
   unchangedTokenIndexes(pool: VenuePool): number[] {
@@ -288,7 +288,12 @@ export class LithosVenue implements Venue {
       value = pool.box.value;
       assets = [nft, { tokenId: pool.x.tokenId!, amount: held.x }, { tokenId: pool.y.tokenId!, amount: held.y }, prov];
     }
-    const registers: ErgoRegisters = { ...pool.box.additionalRegisters };
+    const registers: ErgoRegisters = {
+      R4: pool.box.additionalRegisters.R4,
+      R5: pool.box.additionalRegisters.R5,
+      R7: pool.box.additionalRegisters.R7,
+      R8: pool.box.additionalRegisters.R8,
+    };
     try {
       registers.R6 = encodeCollLong([pending.x, pending.y]);
       registers[ACC_REGISTER[input]] = encodeBigInt(
