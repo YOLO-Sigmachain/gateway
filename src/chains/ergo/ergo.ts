@@ -39,7 +39,7 @@ import {
 } from './ergo.node-client';
 import { ErgoPendingTracker, PendingTransaction } from './ergo.pending';
 import { ErgoPendingFile } from './ergo.pending-file';
-import { ErgoSigner, SignedErgoTransaction } from './ergo.signer';
+import { canV0SignerParseRegister, ErgoSigner, SignedErgoTransaction } from './ergo.signer';
 import { buildTransfer } from './ergo.transfer';
 import {
   assertTransactionBalanced,
@@ -811,15 +811,23 @@ export class Ergo {
     if (changeTrees.some((tree) => typeof tree !== 'string' || !owned.has(tree.toLowerCase()))) {
       throw new ErgoTransactionAssertionError("change goes to a tree that is not the signer's address");
     }
+    assertOutputRegistersSupported(built);
     const headers = await this.node.getLastHeaders(10);
     // The second signer is an unreleased alpha build of the signing library
     // (ergo-lib-wasm-nodejs 0.29.0-alpha-2f840d3). It is used only for a transaction with an
-    // input or data input whose ErgoTree is version 3, which 0.28.0 cannot read; every other
-    // transaction (transfers, Spectrum swaps) signs on 0.28.0 as before.
+    // input or data input whose ErgoTree is version 3 or whose register value 0.28.0 cannot
+    // parse (such as Sigma v6 UnsignedBigInt or Option constants); every other transaction
+    // (transfers, Spectrum swaps) signs on 0.28.0 as before.
     let chosen = signer;
-    if (spendsTreeVersion3(built)) {
+    const needsV3Tree = spendsTreeVersion3(built);
+    const needsV3Register = !needsV3Tree && usesVersion3Register(built);
+    if (needsV3Tree || needsV3Register) {
       if (!signer.forTreeVersion3) {
-        throw new ErgoTransactionAssertionError('an input is at ErgoTree version 3 and this signer cannot sign it');
+        throw new ErgoTransactionAssertionError(
+          needsV3Tree
+            ? 'an input is at ErgoTree version 3 and this signer cannot sign it'
+            : 'an input carries a register value that 0.28.0 cannot parse and this signer cannot sign it',
+        );
       }
       chosen = await signer.forTreeVersion3();
       if (chosen.publicKeys.join(',') !== signer.publicKeys.join(',')) {
@@ -1605,6 +1613,35 @@ export function spendsTreeVersion3(built: BuiltErgoTransaction): boolean {
   if (versions.some((v) => v > 3))
     throw new ErgoTransactionAssertionError('an input is at an ErgoTree version above 3');
   return versions.includes(3);
+}
+
+/**
+ * Whether any input or data input carries a register value that ergo-lib-wasm 0.28.0 cannot
+ * parse (for example a Sigma v6 UnsignedBigInt or Option constant on a version-0 P2PK box).
+ */
+export function usesVersion3Register(built: BuiltErgoTransaction): boolean {
+  for (const box of [...built.inputBoxes, ...built.dataInputBoxes]) {
+    for (const hex of Object.values(box.additionalRegisters ?? {})) {
+      if (typeof hex === 'string' && !canV0SignerParseRegister(hex)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Reject output register values that neither pinned WASM build can serialize into an
+ * unsigned transaction (preventing a Rust/WASM unreachable panic in 0.28.0).
+ */
+function assertOutputRegistersSupported(built: BuiltErgoTransaction): void {
+  built.unsigned.outputs.forEach((output, i) => {
+    for (const [reg, hex] of Object.entries(output.additionalRegisters ?? {})) {
+      if (typeof hex !== 'string' || !canV0SignerParseRegister(hex)) {
+        throw new ErgoTransactionAssertionError(
+          `output ${i} register ${reg} carries a value the signing library cannot serialize`,
+        );
+      }
+    }
+  });
 }
 
 /**
